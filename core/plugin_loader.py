@@ -45,16 +45,21 @@ def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
             "__import__": _restricted_import,
         }
         try:
-            spec.loader.exec_module(module, restricted_globals)
-        except ImportError as exc:
-            print(f"[plugin] Blocked dangerous import in {path.name}: {exc}")
+            source = path.read_text(encoding="utf-8")
+            code = compile(source, str(path), "exec")
+            exec(code, restricted_globals)
+        except Exception as exc:
+            print(f"[plugin] Blocked dangerous import or error in {path.name}: {exc}")
             continue
-        tools = getattr(module, "PLUGIN_TOOLS", [])
+            
+        tools = restricted_globals.get("PLUGIN_TOOLS", [])
         for tool in tools:
             name = tool["name"]
             fn_name = tool.get("fn") or tool.get("function") or name
-            fn = getattr(module, fn_name)
-            schema = _resolve_schema(tool, module)
+            fn = restricted_globals.get(fn_name)
+            if not fn:
+                continue
+            schema = _resolve_schema(tool, restricted_globals)
             dispatcher.register(name, fn, schema)
         loaded.append(path.name)
     return loaded
@@ -65,7 +70,7 @@ def _resolve_schema(tool: dict[str, Any], module: Any) -> type[BaseModel]:
     if isinstance(schema, type) and issubclass(schema, BaseModel):
         return schema
     if isinstance(schema, str):
-        candidate = getattr(module, schema, None)
+        candidate = module.get(schema) if isinstance(module, dict) else getattr(module, schema, None)
         if isinstance(candidate, type) and issubclass(candidate, BaseModel):
             return candidate
 

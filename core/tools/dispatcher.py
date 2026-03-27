@@ -17,9 +17,32 @@ class ToolCall(BaseModel):
 
 
 class Dispatcher:
-    def __init__(self):
+    def __init__(self, rate_limit_rpm: int = 120):
         self.registry: dict[str, Callable[..., Any]] = {}
         self.schemas: dict[str, type[BaseModel]] = {}
+        
+        # Fix 1.7: Token bucket for rate limiting tool executions
+        self._max_tokens = rate_limit_rpm
+        self._tokens = float(rate_limit_rpm)
+        self._last_refill = time.time()
+        self._refill_rate = rate_limit_rpm / 60.0
+
+    def _consume_token(self) -> None:
+        """Fix 1.7: Consume a token, sleeping if necessary to enforce rate limit."""
+        if self._max_tokens <= 0:
+            return  # No limit
+        now = time.time()
+        elapsed = now - self._last_refill
+        self._tokens = min(self._max_tokens, self._tokens + elapsed * self._refill_rate)
+        self._last_refill = now
+        
+        if self._tokens < 1.0:
+            sleep_time = (1.0 - self._tokens) / self._refill_rate
+            time.sleep(sleep_time)
+            self._tokens = 0.0
+            self._last_refill = time.time()
+        else:
+            self._tokens -= 1.0
 
     def register(self, name: str, fn: Callable[..., Any], schema: type[BaseModel]) -> None:
         self.registry[name] = fn
@@ -95,6 +118,9 @@ class Dispatcher:
             }
             guardrails.log(tool_call, auth, result=result, status="dry_run", confirmed_by="system")
             return result
+
+        # Fix 1.7: Consume token before execution to enforce rate limit
+        self._consume_token()
 
         result = fn(**validated.model_dump())
         guardrails.log(tool_call, auth, result=result, status="ok", confirmed_by="user")
