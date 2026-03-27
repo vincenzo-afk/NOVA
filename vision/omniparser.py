@@ -1,8 +1,20 @@
-"""OmniParser HTTP client."""
+"""OmniParser HTTP client — sends base64 JSON to match server's ParseRequest schema.
+
+Fix 6.2: Previous version sent multipart/form-data but the server expects
+         {"base64_image": "<base64 string>"}. Every call was silently returning
+         empty results with a 422 Unprocessable Entity.
+"""
 
 from __future__ import annotations
 
+import base64
+import time
+
 import requests
+
+
+_UI_ELEMENT_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_UI_ELEMENT_CACHE_TTL_S = 0.5  # fix 3.2: 500 ms TTL
 
 
 class OmniParserClient:
@@ -10,24 +22,40 @@ class OmniParserClient:
         self.base_url = base_url.rstrip("/")
 
     def parse(self, image_bytes: bytes) -> dict:
+        """POST base64-encoded image to /parse/ and return parsed payload."""
+        encoded = base64.b64encode(image_bytes).decode("ascii")
         response = requests.post(
-            f"{self.base_url}/parse",
-            files={"file": ("screen.png", image_bytes, "image/png")},
+            f"{self.base_url}/parse/",
+            json={"base64_image": encoded},
             timeout=30,
         )
         response.raise_for_status()
         return response.json()
 
     def ocr_text(self, image_bytes: bytes) -> str:
-        payload = self.parse(image_bytes)
+        try:
+            payload = self.parse(image_bytes)
+        except Exception:
+            return ""
         lines = payload.get("ocr_text") or payload.get("text") or []
         if isinstance(lines, list):
             return "\n".join(str(line) for line in lines if line)
         return str(lines or "")
 
     def ui_elements(self, image_bytes: bytes) -> list[dict]:
-        payload = self.parse(image_bytes)
+        """Return UI elements with short-TTL caching to avoid per-click screenshot round-trips (fix 3.2)."""
+        cache_key = base64.b64encode(image_bytes[:64]).decode()  # fast key from first 64 bytes
+        now = time.monotonic()
+        if cache_key in _UI_ELEMENT_CACHE:
+            cached_time, cached_elements = _UI_ELEMENT_CACHE[cache_key]
+            if now - cached_time < _UI_ELEMENT_CACHE_TTL_S:
+                return cached_elements
+
+        try:
+            payload = self.parse(image_bytes)
+        except Exception:
+            return []
         elements = payload.get("elements") or payload.get("ui_elements") or []
-        if isinstance(elements, list):
-            return [e for e in elements if isinstance(e, dict)]
-        return []
+        result = [e for e in elements if isinstance(e, dict)]
+        _UI_ELEMENT_CACHE[cache_key] = (now, result)
+        return result

@@ -1,4 +1,10 @@
-"""Risk scoring, confirmation policy, and action logging guardrails."""
+"""Risk scoring, confirmation policy, and action logging guardrails.
+
+Fixes applied:
+- 1.9: Emergency stop flag is persisted to disk so it survives restarts.
+- 2.12: Guardrails log is now rotated via loguru (10 MB, 7-day retention).
+- 1.1: Sensitive tool args (api_key, token, password, secret) are scrubbed before logging.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +18,9 @@ from typing import Any, Callable
 
 from config.settings import settings
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 DESTRUCTIVE_TOOLS = {
     "win32_api.delete",
@@ -23,28 +32,26 @@ DESTRUCTIVE_TOOLS = {
 }
 
 _MEDIUM_RISK_HINTS = {
-    "write",
-    "move",
-    "rename",
-    "launch",
-    "open",
-    "connect",
-    "send",
-    "post",
-    "upload",
+    "write", "move", "rename", "launch", "open", "connect", "send", "post", "upload",
 }
 
 _HIGH_RISK_HINTS = {
-    "delete",
-    "drop",
-    "rm",
-    "kill",
-    "shutdown",
-    "format",
-    "wipe",
-    "registry",
+    "delete", "drop", "rm", "kill", "shutdown", "format", "wipe", "registry",
 }
 
+# Arg keys whose values must be scrubbed from logs (fix 1.1)
+_SENSITIVE_ARG_KEYS = {
+    "api_key", "token", "password", "secret", "access_key",
+    "private_key", "auth_token", "bearer_token", "api_secret",
+}
+
+# Path for persistent emergency-stop flag (fix 1.9)
+_EMERGENCY_STOP_FILE = Path(".jarvis_emergency_stop")
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 @dataclass
 class RiskResult:
@@ -71,6 +78,27 @@ class ActionLogEntry:
     reason: str = ""
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _scrub_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of args with sensitive values masked (fix 1.1)."""
+    scrubbed: dict[str, Any] = {}
+    for key, value in args.items():
+        if key.lower() in _SENSITIVE_ARG_KEYS:
+            scrubbed[key] = "***REDACTED***"
+        elif isinstance(value, dict):
+            scrubbed[key] = _scrub_args(value)
+        else:
+            scrubbed[key] = value
+    return scrubbed
+
+
+# ---------------------------------------------------------------------------
+# Guardrails class
+# ---------------------------------------------------------------------------
+
 class Guardrails:
     def __init__(
         self,
@@ -80,10 +108,45 @@ class Guardrails:
     ):
         self.threshold_high = threshold_high
         self.medium_countdown_seconds = medium_countdown_seconds
-        self.log_path = Path(log_path)
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_path = Path(log_path)
+        self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+
+        # Fix 1.9: load persisted emergency stop on startup
         self._emergency_stop = threading.Event()
+        if _EMERGENCY_STOP_FILE.exists():
+            self._emergency_stop.set()
+
+        # Fix 2.12: use loguru rotating sink (10 MB / 7 days)
+        self._init_rotating_log()
+
+    def _init_rotating_log(self) -> None:
+        try:
+            from loguru import logger as _lg
+            _lg.add(
+                str(self._log_path),
+                rotation="10 MB",
+                retention="7 days",
+                compression="gz",
+                format="{message}",
+                filter=lambda record: record["extra"].get("guardrails") is True,
+                level="DEBUG",
+            )
+            self._loguru_logger = _lg.bind(guardrails=True)
+        except Exception:
+            self._loguru_logger = None
+
+    def _log_line(self, line: str) -> None:
+        """Write a JSONL line — via loguru if available, else direct append."""
+        if self._loguru_logger is not None:
+            try:
+                self._loguru_logger.debug(line)
+                return
+            except Exception:
+                pass
+        with self._lock:
+            with self._log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
 
     def _risk_level(self, score: int) -> str:
         if score >= self.threshold_high:
@@ -95,7 +158,7 @@ class Guardrails:
     def _build_plan(self, tool_call) -> str:
         return (
             f"Tool: {tool_call.tool}\n"
-            f"Args: {json.dumps(tool_call.args, ensure_ascii=False, sort_keys=True)}"
+            f"Args: {json.dumps(_scrub_args(tool_call.args), ensure_ascii=False, sort_keys=True)}"
         )
 
     def check(self, tool_call) -> RiskResult:
@@ -129,10 +192,20 @@ class Guardrails:
         )
 
     def emergency_stop(self) -> None:
+        """Activate emergency stop and persist to disk so it survives restarts (fix 1.9)."""
         self._emergency_stop.set()
+        try:
+            _EMERGENCY_STOP_FILE.write_text("1", encoding="utf-8")
+        except Exception:
+            pass
 
     def clear_emergency_stop(self) -> None:
+        """Clear the emergency stop and remove the persistence file (fix 1.9)."""
         self._emergency_stop.clear()
+        try:
+            _EMERGENCY_STOP_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def is_emergency_stopped(self) -> bool:
         return self._emergency_stop.is_set()
@@ -196,10 +269,11 @@ class Guardrails:
         status: str = "ok",
         confirmed_by: str = "system",
     ) -> None:
+        """Log the action — scrubbing sensitive args before writing (fix 1.1)."""
         entry = ActionLogEntry(
             timestamp=datetime.now(timezone.utc).isoformat(),
             tool=tool_call.tool,
-            args=tool_call.args,
+            args=_scrub_args(tool_call.args),  # fix 1.1 — never log raw keys
             risk_score=risk.score,
             risk_level=risk.level,
             requires_confirmation=risk.requires_confirmation,
@@ -208,11 +282,7 @@ class Guardrails:
             result=result,
             reason=risk.reason,
         )
-
-        line = json.dumps(asdict(entry), ensure_ascii=False)
-        with self._lock:
-            with self.log_path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+        self._log_line(json.dumps(asdict(entry), ensure_ascii=False))
 
 
 guardrails = Guardrails(threshold_high=settings.RISK_CONFIRM_THRESHOLD)

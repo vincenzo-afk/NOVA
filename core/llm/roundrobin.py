@@ -1,10 +1,17 @@
-"""Round-robin key rotation with TTL cooldown and backoff recovery."""
+"""Round-robin key rotation with TTL cooldown and backoff recovery.
+
+Fixes applied:
+- 2.5: Cap backoff at MAX_BACKOFF_SECONDS (3600s = 1h) to prevent permanent dead keys.
+- 2.1: Log a warning when a pool is created with zero active keys.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable
+
+MAX_BACKOFF_SECONDS = 3600  # fix 2.5: never back off more than 1 hour
 
 
 @dataclass
@@ -21,6 +28,16 @@ class RoundRobinPool:
         self._index = 0
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
 
+        # fix 2.1: warn if pool has no usable keys
+        if not self._keys:
+            try:
+                from utils.logger import get_logger
+                get_logger(__name__).warning(
+                    "RoundRobinPool initialized with zero active keys — all LLM calls will use Ollama"
+                )
+            except Exception:
+                print("[WARNING] RoundRobinPool: no active cloud API keys configured")
+
     def _recover_due_keys(self) -> None:
         now = self._now_fn()
         for record in self._keys:
@@ -31,6 +48,7 @@ class RoundRobinPool:
             ):
                 record.status = "active"
                 record.cooldown_until = None
+                record.failures = 0  # fix 2.5: reset failure count after recovery
 
     def get_next(self) -> str | None:
         if not self._keys:
@@ -57,9 +75,21 @@ class RoundRobinPool:
     def mark_rate_limited(self, key: str, retry_after: int = 60) -> None:
         record = self._find(key)
         record.failures += 1
-        backoff = max(retry_after, 60) * (2 ** (record.failures - 1))
+        raw_backoff = max(retry_after, 60) * (2 ** (record.failures - 1))
+        # fix 2.5: cap backoff so keys are always recoverable within 1 hour max
+        backoff = min(raw_backoff, MAX_BACKOFF_SECONDS)
         record.status = "rate_limited"
         record.cooldown_until = self._now_fn() + timedelta(seconds=backoff)
+
+        try:
+            from utils.logger import get_logger
+            label = self.key_label(key)
+            get_logger(__name__).warning(
+                f"Key {label} is rate-limited (failure #{record.failures}); "
+                f"cooldown {backoff}s (capped at {MAX_BACKOFF_SECONDS}s)"
+            )
+        except Exception:
+            pass
 
     def key_label(self, key: str) -> str:
         for idx, record in enumerate(self._keys, start=1):

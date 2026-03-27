@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import time
 from pathlib import Path
 import re
@@ -350,6 +351,8 @@ class JarvisApp:
         self.emotion = EmotionEngine()
         self.usage = UsageTracker()
         self._usage_alerted_day = None
+        self._hard_cap_hit = False  # fix 7.1: set True when daily hard-cap is reached
+
         self._event_lock = threading.Lock()
         self._events = deque(maxlen=100)
         self.memory = MemoryRouter(
@@ -405,7 +408,19 @@ class JarvisApp:
         return self.session.switch(name)
 
     def reset_context(self) -> None:
+        """Clear current session history and the associated trimmer summary (fix 1.6).
+
+        Also auto-exports as a backup before clearing (fix 7.4).
+        """
+        session_id = self.session.current.session_id
+        # fix 7.4: auto-backup session before clearing
+        try:
+            self.export_session("md")
+        except Exception:
+            pass
         self.session.reset_context()
+        # fix 1.6: clear the stale summary so it doesn't bleed into the new context
+        self.trimmer.summaries.pop(session_id, None)
 
     def list_goals(self) -> list[dict]:
         return self._list_goals()
@@ -1111,6 +1126,10 @@ class JarvisApp:
         memories = self.memory.search(user_text, session_id=session_id, top_k=DEFAULT_MEMORY_TOP_K)
         world_state = snapshot_environment()
 
+        # fix 2.13: strip clipboard content unless explicitly opt-ed in
+        if not settings.INCLUDE_CLIPBOARD_IN_CONTEXT:
+            world_state.pop("clipboard", None)
+
         context_block = {
             "world_state": world_state,
             "relevant_memories": memories,
@@ -1181,6 +1200,10 @@ class JarvisApp:
         allow_tools: bool = True,
         dry_run_tools: bool = False,
     ) -> Generator[str, None, None]:
+        if self._hard_cap_hit:
+            yield f"Daily token hard cap of {settings.DAILY_TOKEN_HARD_CAP} reached. Further calls blocked."
+            return
+
         command_response = self._apply_text_commands(user_text)
         if command_response:
             yield command_response
@@ -1234,8 +1257,23 @@ class JarvisApp:
         provider = self.engine.last_provider
         self.usage.add(provider, input_tokens, output_tokens, session_id=session_id)
         today = date.today()
+        total = self.usage.total_tokens_today(session_id=session_id)
+
+        # fix 7.1: hard cap — refuse further LLM calls and alert
+        hard_cap = settings.DAILY_TOKEN_HARD_CAP
+        if hard_cap > 0 and total >= hard_cap:
+            self._hard_cap_hit = True
+            msg = (
+                f"[usage] HARD CAP REACHED: daily token usage {total} "
+                f">= hard cap {hard_cap}. Further LLM calls are blocked for today."
+            )
+            print(msg)
+            try:
+                send_telegram_text(msg)
+            except Exception:
+                pass
+
         if self._usage_alerted_day != today:
-            total = self.usage.total_tokens_today(session_id=session_id)
             if total >= settings.DAILY_TOKEN_ALERT_THRESHOLD:
                 print(
                     f"\n[usage] Warning: daily token usage {total} "
@@ -1251,6 +1289,15 @@ def main() -> int:
     except SettingsError as exc:
         print(str(exc))
         return 1
+
+    # fix 7.8: graceful shutdown on SIGTERM and SIGINT
+    def _shutdown_handler(*_):
+        print("\n[signal] Shutdown signal received — cleaning up…")
+        app.shutdown()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
 
     try:
         run_cli(app)

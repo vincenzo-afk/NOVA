@@ -85,10 +85,20 @@ class PhoneWatcher:
         self._poll_notifications()
         self._poll_sms()
 
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
-            self.adb.screenshot_to_local(tmp.name)
-            tmp.seek(0)
-            image_bytes = tmp.read()
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp_path = tmp.name
+            self.adb.screenshot_to_local(tmp_path)
+            with open(tmp_path, "rb") as fh:
+                image_bytes = fh.read()
+        finally:
+            if tmp_path:
+                import os as _os
+                try:
+                    _os.unlink(tmp_path)
+                except Exception:
+                    pass
 
         analysis = analyze_image(image_bytes)
         message = self._detect_issue(analysis)

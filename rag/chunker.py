@@ -22,6 +22,8 @@ def _word_count(text: str) -> int:
 
 
 def chunk_text(text: str, size: int = 512, overlap: int = 64) -> list[str]:
+    if overlap >= size:
+        raise ValueError(f"overlap ({overlap}) must be less than size ({size})")
     if not text.strip():
         return []
 
