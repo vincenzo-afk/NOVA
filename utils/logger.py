@@ -46,7 +46,7 @@ def _ensure_logger_initialized():
         setup_logger()
 
 
-def get_logger():
+def get_logger(name=None):
     """Return configured logger, auto-initializing if needed."""
     _ensure_logger_initialized()
-    return logger
+    return logger.bind(name=name) if name else logger

@@ -352,6 +352,22 @@ class JarvisApp:
         self.usage = UsageTracker()
         self._usage_alerted_day = None
         self._hard_cap_hit = False  # fix 7.1: set True when daily hard-cap is reached
+        
+        # Add tracking for daily resets (fix 1.5)
+        self._hard_cap_hit_date: date | None = None
+        
+        # Add summary cache tracking (fix 6.1)
+        self._summary_cache: dict[int, str] = {}
+        self._summary_cache_lock = threading.Lock()  # fix 3.2
+        self._last_snippet_hash: int | None = None
+
+        # Add single thread for TTS execution (fix 5.1)
+        self._tts_queue = __import__('queue').Queue()
+        self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
+        self._tts_thread.start()
+
+        # Add semaphore for background summarization (fix 3.1)
+        self._summarize_semaphore = threading.Semaphore(1)
 
         self._event_lock = threading.Lock()
         self._events = deque(maxlen=100)
@@ -517,13 +533,17 @@ class JarvisApp:
         return self._mouse_keyboard
 
     def _get_omniparser_client(self):
+        current_token = self.omniparser.auth_token if hasattr(self, 'omniparser') else None
         if self._omniparser_client is None:
             from vision.omniparser import OmniParserClient
 
             self._omniparser_client = OmniParserClient(
                 settings.OMNIPARSER_SERVER_URL,
-                auth_token=self.omniparser.auth_token if hasattr(self, 'omniparser') else None
+                auth_token=current_token
             )
+        else:
+            # Fix 2.2: ensure token stays updated across server restarts
+            self._omniparser_client.auth_token = current_token
         return self._omniparser_client
 
     def _current_ui_elements(self) -> list[dict[str, Any]]:
@@ -1024,16 +1044,30 @@ class JarvisApp:
         )
         return result
 
+    def _tts_worker(self) -> None:
+        """Fix 5.1: TTS executed on a single dedicated background thread."""
+        try:
+            from voice.tts_offline import speak as speak_offline
+        except Exception:
+            return
+            
+        while True:
+            text = self._tts_queue.get()
+            if text is None:
+                self._tts_queue.task_done()
+                break
+            try:
+                speak_offline(text)
+            except Exception:
+                pass
+            finally:
+                self._tts_queue.task_done()
+
     def _notify_tts(self, text: str) -> bool:
         if not settings.AUTONOMY_NOTIFY_TTS:
             return False
-        try:
-            from voice.tts_offline import speak as speak_offline
-
-            speak_offline(text)
-            return True
-        except Exception:
-            return False
+        self._tts_queue.put(text)
+        return True
 
     def _notify_autonomy_event(self, text: str) -> None:
         self.record_event("autonomy", text)
@@ -1194,8 +1228,9 @@ class JarvisApp:
         
         # Check if we have a cached summary for this text
         text_hash = hash(text)
-        if hasattr(self, '_summary_cache') and text_hash in self._summary_cache:
-            return self._summary_cache[text_hash]
+        with self._summary_cache_lock:
+            if text_hash in self._summary_cache:
+                return self._summary_cache[text_hash]
         
         # If no cache, return truncated text (will be summarized in background)
         return text[:700]
@@ -1204,21 +1239,24 @@ class JarvisApp:
         """Summarize history in background thread and update cache."""
         if not text.strip():
             return
-        
-        system = "Summarize the conversation history into a concise paragraph for future context."
+            
+        # Fix 3.1: Bound concurrency with semaphore
+        if not self._summarize_semaphore.acquire(blocking=False):
+            return  # Already summarizing, skip this one
+            
         try:
-            summary = self.engine.ask(prompt=text, system=system, history=[])
-            # Update the cache
-            if not hasattr(self, '_summary_cache'):
-                self._summary_cache = {}
-            self._summary_cache[hash(text)] = summary
-            # Update the trimmer's summary
-            self.trimmer.summaries[session_id] = summary
-        except Exception:
-            # On error, use truncated text
-            if not hasattr(self, '_summary_cache'):
-                self._summary_cache = {}
-            self._summary_cache[hash(text)] = text[:700]
+            system = "Summarize the conversation history into a concise paragraph for future context."
+            try:
+                summary = self.engine.ask(prompt=text, system=system, history=[])
+                # Fix 3.2: Lock around _summary_cache writes
+                with self._summary_cache_lock:
+                    self._summary_cache[hash(text)] = summary
+                self.trimmer.summaries[session_id] = summary
+            except Exception:
+                with self._summary_cache_lock:
+                    self._summary_cache[hash(text)] = text[:700]
+        finally:
+            self._summarize_semaphore.release()
 
     def _apply_text_commands(self, user_text: str) -> str | None:
         text = user_text.strip().lower()
@@ -1322,17 +1360,24 @@ class JarvisApp:
         today = date.today()
         total = self.usage.total_tokens_today(session_id=session_id)
 
+        # fix 1.5: clear hard cap if day resets
+        if self._hard_cap_hit_date != today:
+            self._hard_cap_hit = False
+            self._hard_cap_hit_date = None
+
         # fix 7.1: hard cap — refuse further LLM calls and alert
         hard_cap = settings.DAILY_TOKEN_HARD_CAP
-        if hard_cap > 0 and total >= hard_cap:
+        if hard_cap > 0 and total >= hard_cap and not self._hard_cap_hit:
             self._hard_cap_hit = True
+            self._hard_cap_hit_date = today
             msg = (
                 f"[usage] HARD CAP REACHED: daily token usage {total} "
                 f">= hard cap {hard_cap}. Further LLM calls are blocked for today."
             )
             print(msg)
             try:
-                send_telegram_text(msg)
+                # Fix 1.2: Use valid telegram notifier signature
+                self._notify_telegram(msg)
             except Exception:
                 pass
 

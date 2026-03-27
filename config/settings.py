@@ -191,10 +191,18 @@ class Settings:
                     "(leave empty to run fully offline via Ollama)"
                 )
             real_keys = [k for k in self.OPENAI_API_KEYS if k.lower() not in self._PLACEHOLDER_KEYS]
-            if not real_keys:
+            if not real_keys and self.OPENAI_API_KEYS:
                 errors.append(
                     "OPENAI_API_KEYS must contain at least one real API key — "
-                    "placeholder values (key1, key2…) were detected (fix 8.1)"
+                    "placeholder values (key1, key2…) were detected"
+                )
+            
+            # Fix 6.4: Validate Gemini keys too
+            real_gemini = [k for k in self.GEMINI_API_KEYS if k.lower() not in self._PLACEHOLDER_KEYS]
+            if not real_gemini and self.GEMINI_API_KEYS:
+                errors.append(
+                    "GEMINI_API_KEYS must contain at least one real API key — "
+                    "placeholder values (key_a, key_b…) were detected"
                 )
 
         if phase in {"phase3", "all"}:
@@ -210,12 +218,14 @@ class Settings:
     @property
     def has_cloud_llm(self) -> bool:
         """True if cloud LLM is configured."""
-        return bool(self.OPENAI_API_KEYS and self.OPENAI_BASE_URL)
+        real_keys = [k for k in self.OPENAI_API_KEYS if k.lower() not in self._PLACEHOLDER_KEYS]
+        return bool(real_keys and self.OPENAI_BASE_URL)
 
     @property
     def has_gemini(self) -> bool:
         """True if any Gemini API key is present."""
-        return any(k.strip() for k in self.GEMINI_API_KEYS)
+        real_keys = [k for k in self.GEMINI_API_KEYS if k.lower() not in self._PLACEHOLDER_KEYS]
+        return bool(real_keys)
 
     @property
     def has_telegram(self) -> bool:
