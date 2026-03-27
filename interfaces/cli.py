@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from utils.events import format_event_log
+from utils.goals import format_goal_list
+from utils.health import format_health_table, summarize_health
+
 HAS_RICH = True
 try:
     from rich.console import Console
@@ -15,6 +19,18 @@ except Exception:  # pragma: no cover
 
         def input(self, prompt: str) -> str:
             return input(prompt)
+
+
+def format_usage_message(title: str, summary: dict) -> str:
+    if not summary:
+        return f"{title}:\n(no usage yet)"
+    lines = [f"{title}:"]
+    for provider, data in summary.items():
+        lines.append(
+            f"{provider}: input={data.get('input_tokens', 0)} "
+            f"output={data.get('output_tokens', 0)} total={data.get('total_tokens', 0)}"
+        )
+    return "\n".join(lines)
 
 
 def run_cli(agent) -> None:
@@ -48,6 +64,66 @@ def run_cli(agent) -> None:
                 continue
         if user_text == "/status":
             console.print(agent.status_text())
+            continue
+        if user_text == "/usage":
+            session_id = agent.session.current.session_id
+            console.print(format_usage_message("Usage today", agent.usage.today_summary(session_id=session_id)))
+            continue
+        if user_text == "/usage week":
+            session_id = agent.session.current.session_id
+            console.print(format_usage_message("Usage this week", agent.usage.weekly_summary(session_id=session_id)))
+            continue
+        if user_text == "/health":
+            try:
+                items = agent.health.status_table()
+                console.print(f"Health summary: {summarize_health(items)}")
+                console.print(format_health_table(items))
+            except Exception as exc:
+                console.print(f"Health unavailable: {exc}")
+            continue
+        if user_text == "/goals":
+            try:
+                console.print(format_goal_list(agent.list_goals()))
+            except Exception as exc:
+                console.print(f"Goals unavailable: {exc}")
+            continue
+        if user_text == "/alerts":
+            try:
+                console.print(format_event_log(agent.recent_events()))
+            except Exception as exc:
+                console.print(f"Alerts unavailable: {exc}")
+            continue
+        if user_text.startswith("/goal "):
+            goal = user_text.split(" ", 1)[1].strip()
+            if goal:
+                console.print(agent.add_goal(goal))
+            continue
+        if user_text.startswith("/resume_goal "):
+            goal_id = user_text.split(" ", 1)[1].strip()
+            if goal_id:
+                console.print(agent.resume_goal(goal_id))
+            continue
+        if user_text.startswith("/cancel_goal "):
+            goal_id = user_text.split(" ", 1)[1].strip()
+            if goal_id:
+                console.print(agent.cancel_goal(goal_id))
+            continue
+        if user_text == "/mute":
+            agent.set_muted(True)
+            console.print("Muted proactive alerts/notifications.")
+            continue
+        if user_text == "/unmute":
+            agent.set_muted(False)
+            console.print("Unmuted proactive alerts/notifications.")
+            continue
+        if user_text.startswith("/export"):
+            fmt = "md"
+            parts = user_text.split(maxsplit=1)
+            if len(parts) > 1 and parts[1].strip().lower() in {"json", "md", "markdown"}:
+                v = parts[1].strip().lower()
+                fmt = "json" if v == "json" else "md"
+            path = agent.export_session(fmt)
+            console.print(f"Exported session -> {path}")
             continue
 
         console.print("[bold magenta]JARVIS[/bold magenta] > " if HAS_RICH else "JARVIS > ", end="")

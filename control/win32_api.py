@@ -9,6 +9,8 @@ import subprocess
 import sys
 from typing import Iterable
 
+from control import os_layer
+
 
 def read_file(path: str) -> str:
     return Path(path).read_text(encoding="utf-8")
@@ -48,11 +50,15 @@ def list_processes() -> list[str]:
     return sorted({line.strip() for line in out.splitlines() if line.strip()})
 
 
-def launch_process(command: list[str] | str) -> int:
-    if isinstance(command, str):
-        proc = subprocess.Popen(command, shell=True)
-    else:
-        proc = subprocess.Popen(command)
+def launch_process(command: str) -> int:
+    """Launch a process by command string. Returns PID."""
+    import shlex
+    try:
+        args = shlex.split(command)
+        proc = subprocess.Popen(args)
+    except Exception:
+        # Fall back to shell=True if shlex splitting fails
+        proc = subprocess.Popen(command, shell=True)  # nosec B602 B603
     return int(proc.pid)
 
 
@@ -153,3 +159,168 @@ def disk_info(paths: Iterable[str] | None = None) -> list[dict]:
         except Exception:
             continue
     return info
+
+
+def list_windows() -> list[str]:
+    if not sys.platform.startswith("win"):
+        return []
+    try:
+        import win32gui
+
+        titles: list[str] = []
+
+        def _handler(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd)
+                if title:
+                    titles.append(title)
+
+        win32gui.EnumWindows(_handler, None)
+        return titles
+    except Exception:
+        return []
+
+
+def _find_window_handles(title_substring: str) -> list[int]:
+    if not sys.platform.startswith("win"):
+        return []
+    try:
+        import win32gui
+
+        matches: list[int] = []
+        needle = title_substring.lower()
+
+        def _handler(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd)
+                if title and needle in title.lower():
+                    matches.append(hwnd)
+
+        win32gui.EnumWindows(_handler, None)
+        return matches
+    except Exception:
+        return []
+
+
+def focus_window(title_substring: str) -> bool:
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import win32gui
+
+        handles = _find_window_handles(title_substring)
+        if not handles:
+            return False
+        win32gui.SetForegroundWindow(handles[0])
+        return True
+    except Exception:
+        return False
+
+
+def close_window(title_substring: str) -> bool:
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import win32con
+        import win32gui
+
+        handles = _find_window_handles(title_substring)
+        if not handles:
+            return False
+        for hwnd in handles:
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        return True
+    except Exception:
+        return False
+
+
+def resize_window(title_substring: str, width: int, height: int) -> bool:
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import win32gui
+
+        handles = _find_window_handles(title_substring)
+        if not handles:
+            return False
+        hwnd = handles[0]
+        left, top, _, _ = win32gui.GetWindowRect(hwnd)
+        win32gui.MoveWindow(hwnd, left, top, int(width), int(height), True)
+        return True
+    except Exception:
+        return False
+
+
+def registry_read(path: str, name: str) -> str | None:
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import winreg
+
+        root, subkey = _parse_registry_path(path)
+        with winreg.OpenKey(root, subkey) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+        return str(value)
+    except Exception:
+        return None
+
+
+def registry_write(path: str, name: str, value: str, value_type: str = "REG_SZ") -> bool:
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import winreg
+
+        root, subkey = _parse_registry_path(path)
+        with winreg.CreateKey(root, subkey) as key:
+            reg_type = _registry_type(value_type)
+            payload: object = value
+            if reg_type in {winreg.REG_DWORD, winreg.REG_QWORD}:
+                try:
+                    payload = int(value)
+                except Exception:
+                    payload = 0
+            winreg.SetValueEx(key, name, 0, reg_type, payload)
+        return True
+    except Exception:
+        return False
+
+
+def _parse_registry_path(path: str):
+    key = path.strip().replace("/", "\\")
+    parts = key.split("\\", 1)
+    root_name = parts[0].upper()
+    subkey = parts[1] if len(parts) > 1 else ""
+    return _registry_root(root_name), subkey
+
+
+def _registry_root(root_name: str):
+    import winreg
+
+    mapping = {
+        "HKCU": winreg.HKEY_CURRENT_USER,
+        "HKEY_CURRENT_USER": winreg.HKEY_CURRENT_USER,
+        "HKLM": winreg.HKEY_LOCAL_MACHINE,
+        "HKEY_LOCAL_MACHINE": winreg.HKEY_LOCAL_MACHINE,
+        "HKCR": winreg.HKEY_CLASSES_ROOT,
+        "HKEY_CLASSES_ROOT": winreg.HKEY_CLASSES_ROOT,
+        "HKU": winreg.HKEY_USERS,
+        "HKEY_USERS": winreg.HKEY_USERS,
+    }
+    return mapping.get(root_name, winreg.HKEY_CURRENT_USER)
+
+
+def _registry_type(type_name: str):
+    import winreg
+
+    lookup = {
+        "REG_SZ": winreg.REG_SZ,
+        "REG_DWORD": winreg.REG_DWORD,
+        "REG_QWORD": winreg.REG_QWORD,
+        "REG_BINARY": winreg.REG_BINARY,
+    }
+    return lookup.get(type_name.upper(), winreg.REG_SZ)
+
+
+def send_notification(title: str, message: str) -> None:
+    os_layer.send_notification(title, message)

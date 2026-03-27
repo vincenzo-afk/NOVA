@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 
 
@@ -20,11 +21,21 @@ class OfflineWhisper:
         if not audio_bytes:
             return ""
         self._load()
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-            f.write(audio_bytes)
-            f.flush()
+        # Use delete=False so the file can be read on all platforms (inc. Windows)
+        tmp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                f.write(audio_bytes)
+                tmp_path = f.name
             try:
-                segments, _ = self._model.transcribe(f.name, language=lang)
+                segments, _ = self._model.transcribe(tmp_path, language=lang)
             except Exception:
-                segments, _ = self._model.transcribe(f.name)
+                # Re-try without language hint if the code is unrecognised
+                segments, _ = self._model.transcribe(tmp_path)
             return " ".join(seg.text for seg in segments).strip()
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass

@@ -17,9 +17,7 @@ class KeyState:
 
 class RoundRobinPool:
     def __init__(self, keys: list[str], now_fn: Callable[[], datetime] | None = None):
-        if not keys:
-            raise ValueError("RoundRobinPool requires at least one API key")
-        self._keys = [KeyState(key=k) for k in keys]
+        self._keys = [KeyState(key=k) for k in keys if k.strip()]
         self._index = 0
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
 
@@ -35,6 +33,8 @@ class RoundRobinPool:
                 record.cooldown_until = None
 
     def get_next(self) -> str | None:
+        if not self._keys:
+            return None
         self._recover_due_keys()
         total = len(self._keys)
         for _ in range(total):

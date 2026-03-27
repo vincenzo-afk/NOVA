@@ -4,8 +4,11 @@ from core.tools.dispatcher import ToolCall
 from safety.guardrails import guardrails
 
 
+import tempfile
+
 def test_guardrails_high_risk_for_destructive_tools():
-    risk = guardrails.check(ToolCall(tool="win32_api.delete", args={"path": "/tmp/x"}))
+    tmp = f"{tempfile.gettempdir()}/x"
+    risk = guardrails.check(ToolCall(tool="win32_api.delete", args={"path": tmp}))
     assert risk.score >= 7
 
 
@@ -15,7 +18,8 @@ def test_guardrails_low_risk_for_safe_tools():
 
 
 def test_guardrails_high_risk_requires_confirmation():
-    call = ToolCall(tool="win32_api.delete", args={"path": "/tmp/x"})
+    tmp = f"{tempfile.gettempdir()}/x"
+    call = ToolCall(tool="win32_api.delete", args={"path": tmp})
     risk = guardrails.check(call)
     approved = guardrails.authorize(call, risk, confirm_callback=lambda _: False)
     assert approved.blocked

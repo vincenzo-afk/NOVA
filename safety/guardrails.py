@@ -10,6 +10,8 @@ import threading
 import time
 from typing import Any, Callable
 
+from config.settings import settings
+
 
 DESTRUCTIVE_TOOLS = {
     "win32_api.delete",
@@ -213,4 +215,4 @@ class Guardrails:
                 handle.write(line + "\n")
 
 
-guardrails = Guardrails()
+guardrails = Guardrails(threshold_high=settings.RISK_CONFIRM_THRESHOLD)
