@@ -1,13 +1,49 @@
-"""OmniParser local process manager."""
+"""OmniParser local process manager.
+
+Fixes applied:
+- 1.4: Strip all secrets from subprocess environment — only PATH and PYTHONPATH passed.
+- 2.11: Poll is_running() with exponential backoff after Popen to wait for startup.
+"""
 
 from __future__ import annotations
 
 import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+
+
+_SECRET_ENV_PREFIXES = (
+    "OPENAI_",
+    "GEMINI_",
+    "MEM0_",
+    "TELEGRAM_",
+    "PORCUPINE_",
+    "ANTHROPIC_",
+    "GOOGLE_",
+    "AWS_",
+)
+
+
+def _safe_env(extra_pythonpath: str = "") -> dict[str, str]:
+    """Build a minimal environment for the OmniParser subprocess.
+
+    Only passes PATH, PYTHONPATH, and HOME — never any API keys or tokens.
+    """
+    safe: dict[str, str] = {}
+    for key in ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "USERPROFILE"):
+        val = os.environ.get(key)
+        if val:
+            safe[key] = val
+
+    pythonpath_parts = [p for p in [extra_pythonpath, os.environ.get("PYTHONPATH", "")] if p]
+    if pythonpath_parts:
+        safe["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+    return safe
 
 
 class OmniParserServer:
@@ -35,29 +71,49 @@ class OmniParserServer:
                 continue
         return False
 
-    def ensure_running(self) -> None:
+    def ensure_running(self, startup_timeout: float = 120.0) -> None:
+        """Start OmniParser server if not running, then wait for it to become healthy.
+
+        Fix 2.11: polls with exponential backoff for up to `startup_timeout` seconds.
+        Fix 1.4: passes only a safe, secret-free environment to the subprocess.
+        """
         if self.is_running():
             return
         if self.proc and self.proc.poll() is None:
-            return
-        env = os.environ.copy()
-        project_root = Path.cwd().resolve()
-        env["PYTHONPATH"] = f"{project_root}{os.pathsep}{env.get('PYTHONPATH', '')}".strip(os.pathsep)
-        cwd = str(project_root)
-        if self.repo_dir:
-            repo_path = Path(self.repo_dir).expanduser().resolve()
-            env["PYTHONPATH"] = f"{repo_path}{os.pathsep}{env.get('PYTHONPATH', '')}".strip(os.pathsep)
-        log_dir = Path("logs")
-        log_dir.mkdir(exist_ok=True)
-        log_path = log_dir / "omniparser_server.log"
-        self.log_file = log_path.open("a", encoding="utf-8")
-        self.proc = subprocess.Popen(
-            self.command,
-            stdout=self.log_file,
-            stderr=self.log_file,
-            env=env,
-            cwd=cwd,
-        )
+            # Process is alive but not responding yet — wait below
+            pass
+        else:
+            project_root = Path.cwd().resolve()
+            pythonpath = str(project_root)
+            if self.repo_dir:
+                pythonpath = str(Path(self.repo_dir).expanduser().resolve()) + os.pathsep + pythonpath
+
+            env = _safe_env(extra_pythonpath=pythonpath)
+            log_dir = Path("logs")
+            log_dir.mkdir(exist_ok=True)
+            log_path = log_dir / "omniparser_server.log"
+            self.log_file = log_path.open("a", encoding="utf-8")
+            self.proc = subprocess.Popen(
+                self.command,
+                stdout=self.log_file,
+                stderr=self.log_file,
+                env=env,
+                cwd=str(project_root),
+            )
+
+        # Poll with exponential backoff up to startup_timeout
+        delay = 1.0
+        deadline = time.monotonic() + startup_timeout
+        attempt = 0
+        while time.monotonic() < deadline:
+            if self.is_running():
+                return
+            attempt += 1
+            wait = min(delay * (2 ** (attempt - 1)), 16.0)
+            print(f"[omniparser] waiting for server startup (attempt {attempt}, sleeping {wait:.0f}s)…")
+            time.sleep(wait)
+
+        print("[omniparser] server did not become healthy within startup timeout — continuing anyway")
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -82,7 +138,7 @@ class OmniParserServer:
         som_path = weights_dir / "icon_detect" / "model.pt" if weights_dir else None
         caption_path = weights_dir / "icon_caption_florence" if weights_dir else None
         command = [
-            "python3",
+            sys.executable,
             "-m",
             "vision.omniparser_app",
             "--host",

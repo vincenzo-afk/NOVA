@@ -1,10 +1,17 @@
-"""Goal decomposition engine with loop guards and step executor."""
+"""Goal decomposition engine with loop guards and step executor.
+
+Fixes applied:
+- 1.5: GoalRunner now checks guardrails risk for each step individually.
+       High-risk steps without a confirm_callback will block and halt the run.
+- 1.7: Configurable minimum inter-step delay to prevent API hammering.
+"""
 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from core.tools.dispatcher import Dispatcher, ToolCall
 
@@ -47,10 +54,24 @@ class GoalResult:
 
 
 class GoalRunner:
-    """Executes a list of tool steps with cycle detection and step limits."""
+    """Executes a list of tool steps with cycle detection, step limits, and per-step guardrails.
 
-    def __init__(self, dispatcher: Dispatcher):
+    Fix 1.5: every step is individually checked by guardrails. High-risk steps without
+    a confirm_callback will be blocked and halt the goal (no silent bypass).
+    Fix 1.7: `step_delay_seconds` adds a minimum inter-step pause to prevent burst API hammering.
+    """
+
+    def __init__(
+        self,
+        dispatcher: Dispatcher,
+        confirm_callback: Callable[[str], bool] | None = None,
+        step_delay_seconds: float = 0.0,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ):
         self.dispatcher = dispatcher
+        self.confirm_callback = confirm_callback  # fix 1.5
+        self.step_delay_seconds = max(0.0, step_delay_seconds)  # fix 1.7
+        self._sleep_fn = sleep_fn
 
     def run(
         self,
@@ -84,9 +105,32 @@ class GoalRunner:
             if not can_execute:
                 return GoalResult(status="stopped", reason=reason, results=results, next_index=idx)
 
+            # fix 1.5: per-step guardrails check
+            if not dry_run:
+                from safety.guardrails import guardrails
+                call = ToolCall(tool=tool, args=args)
+                risk = guardrails.check(call)
+                authorized = guardrails.authorize(
+                    call,
+                    risk,
+                    confirm_callback=self.confirm_callback,
+                    dry_run=False,
+                )
+                if authorized.blocked:
+                    return GoalResult(
+                        status="blocked",
+                        reason=f"step {idx} blocked by guardrails: {authorized.reason}",
+                        results=results,
+                        next_index=idx,
+                    )
+
             guard.record(tool, args)
             call = ToolCall(tool=tool, args=args)
             result = self.dispatcher.execute(call, dry_run=dry_run)
             results.append(result)
+
+            # fix 1.7: inter-step delay
+            if self.step_delay_seconds > 0 and idx < len(indexed_steps) - 1:
+                self._sleep_fn(self.step_delay_seconds)
 
         return GoalResult(status="completed", reason="ok", results=results, next_index=len(indexed_steps))

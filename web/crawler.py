@@ -1,4 +1,7 @@
-"""Simple breadth-first crawler."""
+"""Simple breadth-first web crawler with SSRF protection.
+
+Fix 4.2: applies the same private IP guard from scraper.py before visiting any URL.
+"""
 
 from __future__ import annotations
 
@@ -7,9 +10,17 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+from web.scraper import _validate_url
+
 
 def crawl(seed_url: str, max_pages: int = 5) -> list[str]:
-    seen = set()
+    # Validate seed URL before starting
+    try:
+        _validate_url(seed_url)
+    except ValueError as exc:
+        raise ValueError(f"Crawl blocked: {exc}") from exc
+
+    seen: set[str] = set()
     queue = [seed_url]
     pages: list[str] = []
 
@@ -18,6 +29,12 @@ def crawl(seed_url: str, max_pages: int = 5) -> list[str]:
         if url in seen:
             continue
         seen.add(url)
+
+        # SSRF guard on each queued link
+        try:
+            _validate_url(url)
+        except ValueError:
+            continue
 
         try:
             response = requests.get(

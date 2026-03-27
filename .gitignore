@@ -1,7 +1,22 @@
 __pycache__/
 *.pyc
+*.pyo
 .pytest_cache/
 .venv/
 .env
 .jarvis_chroma/
+.jarvis_docs/
 jarvis_jobs.sqlite
+
+# Logs — may contain sensitive action audit trails (issue 8.4)
+logs/
+
+# Session exports — contain full conversation history (issue 4.1)
+exports/
+
+# OmniParser vendor checkout — handled as submodule or download
+vendor/
+
+# Ruff/mypy caches
+.ruff_cache/
+.mypy_cache/

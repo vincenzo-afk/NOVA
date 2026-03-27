@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 
+
+_DEFAULT_DB = f"sqlite:///{Path(__file__).resolve().parent.parent}/jarvis_jobs.sqlite?timeout=30"
+
+
 class TaskScheduler:
-    def __init__(self, db_url: str = "sqlite:///jarvis_jobs.sqlite"):
-        self.scheduler = BackgroundScheduler(jobstores={"default": SQLAlchemyJobStore(url=db_url)})
+    def __init__(self, db_url: str = _DEFAULT_DB):
+        from sqlalchemy import create_engine
+        engine = create_engine(db_url, connect_args={"timeout": 30})
+        self.scheduler = BackgroundScheduler(
+            jobstores={"default": SQLAlchemyJobStore(engine=engine)}
+        )
+
 
     def start(self) -> None:
         if not self.scheduler.running:

@@ -1,4 +1,9 @@
-"""Telegram interface with chat-id whitelist and edit-based streaming."""
+"""Telegram interface with chat-id whitelist and edit-based streaming.
+
+Fixes applied:
+- 1.2: integer-safe whitelist check; raise RuntimeError at startup if TELEGRAM_CHAT_ID is empty.
+- 1.2: log every rejected authorization attempt.
+"""
 
 from __future__ import annotations
 
@@ -15,11 +20,20 @@ from interfaces.cli import format_usage_message
 from utils.events import format_event_log
 from utils.goals import format_goal_list
 from utils.health import format_health_table, summarize_health
+from utils.logger import get_logger
+
+_log = get_logger(__name__)
 
 
-def is_whitelisted(user_id: str, allowed_chat_id: str | None = None) -> bool:
+def is_whitelisted(user_id: str | int, allowed_chat_id: str | None = None) -> bool:
+    """Type-safe integer comparison for Telegram chat ID whitelist (fix 1.2)."""
     whitelist = allowed_chat_id or settings.TELEGRAM_CHAT_ID
-    return str(user_id) == str(whitelist)
+    if not whitelist or not str(whitelist).strip():
+        return False
+    try:
+        return int(user_id) == int(whitelist)
+    except (ValueError, TypeError):
+        return False
 
 
 def format_status_message(status_text: str) -> str:
@@ -100,6 +114,14 @@ def run_telegram_bot(agent: Any, token: str | None = None, allowed_chat_id: str 
     if not bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
 
+    # fix 1.2: fail fast if whitelist is empty
+    effective_chat_id = allowed_chat_id or settings.TELEGRAM_CHAT_ID
+    if not effective_chat_id or not str(effective_chat_id).strip():
+        raise RuntimeError(
+            "TELEGRAM_CHAT_ID must be set when the Telegram bot is enabled. "
+            "Without it the bot is open to any Telegram user."
+        )
+
     try:
         from telegram import InputFile
         from telegram.ext import (
@@ -114,7 +136,16 @@ def run_telegram_bot(agent: Any, token: str | None = None, allowed_chat_id: str 
 
     async def _authorized(update) -> bool:
         user = update.effective_user
-        return bool(user and is_whitelisted(str(user.id), allowed_chat_id=allowed_chat_id))
+        if not user:
+            return False
+        authorized = is_whitelisted(user.id, allowed_chat_id=effective_chat_id)
+        if not authorized:
+            # fix 1.2: log every rejected attempt
+            _log.warning(
+                f"Telegram auth rejected: user_id={user.id} username={user.username!r} "
+                f"whitelist={effective_chat_id!r}"
+            )
+        return authorized
 
     async def on_status(update, _context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):

@@ -8,10 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 import shutil
-from typing import Iterable
-
-from control.os_layer import register_startup, startup_command
-from control.adb.tailscale import ensure_tailscale_available
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -185,10 +181,14 @@ def ensure_system_dependencies() -> None:
     ensure_adb_available()
     ensure_ffmpeg_available()
     ensure_mpg123_available()
-    if ensure_tailscale_available():
-        print("✓ Tailscale available")
-    else:
-        print("⚠️ Tailscale not installed; remote ADB tunneling may be unavailable.")
+    try:
+        from control.adb.tailscale import ensure_tailscale_available  # fix 6.10
+        if ensure_tailscale_available():
+            print("✓ Tailscale available")
+        else:
+            print("⚠️ Tailscale not installed; remote ADB tunneling may be unavailable.")
+    except ImportError:
+        print("⚠️ Tailscale check skipped (dependencies not yet installed).")
 
 
 def ensure_omniparser_repo(env_path: Path, env_values: dict[str, str]) -> Path | None:
@@ -424,10 +424,13 @@ def maybe_install_ollama_model(env_values: dict[str, str]) -> None:
 
 
 def register_startup_entry() -> None:
-    command = startup_command(str(REPO_ROOT), python_executable=sys.executable, entrypoint="main.py")
     try:
+        from control.os_layer import register_startup, startup_command  # fix 6.10
+        command = startup_command(str(REPO_ROOT), python_executable=sys.executable, entrypoint="main.py")
         location = register_startup(command, app_name="jarvis")
         print(f"✓ Startup registered: {location}")
+    except ImportError:
+        print("⚠️ Startup registration skipped (dependencies not yet installed).")
     except Exception as exc:
         print(f"⚠️ Startup registration skipped: {exc}")
 

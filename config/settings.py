@@ -57,6 +57,13 @@ class Settings:
 
     # Usage alerts
     DAILY_TOKEN_ALERT_THRESHOLD: int = 100_000
+    DAILY_TOKEN_HARD_CAP: int = 0  # 0 = disabled; set e.g. 500000 to hard-cap spend (fix 7.1)
+
+    # Ambiguity / reasoning (fix 6.1)
+    AMBIGUITY_THRESHOLD: float = 0.6
+
+    # Privacy / context injection (fix 2.13)
+    INCLUDE_CLIPBOARD_IN_CONTEXT: bool = False
 
     # Voice
     DEFAULT_LANG: str = "en"
@@ -136,6 +143,9 @@ class Settings:
             RISK_CONFIRM_THRESHOLD=env_int("RISK_CONFIRM_THRESHOLD", 7),
             DEFAULT_SESSION=env("DEFAULT_SESSION", "jarvis_personal"),
             DAILY_TOKEN_ALERT_THRESHOLD=env_int("DAILY_TOKEN_ALERT_THRESHOLD", 100_000),
+            DAILY_TOKEN_HARD_CAP=env_int("DAILY_TOKEN_HARD_CAP", 0),
+            AMBIGUITY_THRESHOLD=env_float("AMBIGUITY_THRESHOLD", 0.6),
+            INCLUDE_CLIPBOARD_IN_CONTEXT=env_bool("INCLUDE_CLIPBOARD_IN_CONTEXT", "false"),
             DEFAULT_LANG=env("DEFAULT_LANG", "en"),
             VAD_SILENCE_MS=env_int("VAD_SILENCE_MS", 800),
             WHISPER_MODEL=env("WHISPER_MODEL", "base"),
@@ -154,6 +164,8 @@ class Settings:
             AUTONOMY_NOTIFY_TELEGRAM=env_bool("AUTONOMY_NOTIFY_TELEGRAM", "true"),
             AUTONOMY_NOTIFY_TTS=env_bool("AUTONOMY_NOTIFY_TTS", "false"),
         )
+
+    _PLACEHOLDER_KEYS = {"key1", "key2", "key3", "key_a", "key_b", "ghp_test_key", "your_key_here", ""}
 
     def validate_startup(self, phase: str = "minimal") -> None:
         """Fail fast with clear errors for required startup keys.
@@ -178,10 +190,11 @@ class Settings:
                     "OPENAI_BASE_URL is required for cloud primary LLM "
                     "(leave empty to run fully offline via Ollama)"
                 )
-            if not self.OPENAI_API_KEYS:
+            real_keys = [k for k in self.OPENAI_API_KEYS if k.lower() not in self._PLACEHOLDER_KEYS]
+            if not real_keys:
                 errors.append(
-                    "OPENAI_API_KEYS must contain at least one API key "
-                    "(leave empty to run fully offline via Ollama)"
+                    "OPENAI_API_KEYS must contain at least one real API key — "
+                    "placeholder values (key1, key2…) were detected (fix 8.1)"
                 )
 
         if phase in {"phase3", "all"}:
