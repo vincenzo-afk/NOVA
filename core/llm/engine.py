@@ -39,6 +39,8 @@ class LLMEngine:
             except ValueError:
                 self.pool = None
         self.last_provider = "unknown"
+        # Fix 7.1: Track session tokens used by this engine locally
+        self.session_tokens_used: float = 0.0
 
     def ask(self, prompt: str, system: str, history: list[dict] | None = None) -> str:
         return "".join(self.ask_stream(prompt, system, history))
@@ -53,6 +55,13 @@ class LLMEngine:
 
         # Attempt cloud keys if pool is available
         if self.pool is not None:
+            # Fix 7.1: Pre-generation token cap guard
+            from config import settings
+            hard_cap = settings.DAILY_TOKEN_HARD_CAP
+            if hard_cap > 0 and self.session_tokens_used >= hard_cap:
+                yield f"[ERROR] Daily token hard cap of {hard_cap} reached (autonomy/generation blocked)."
+                return
+
             tried: set[str] = set()
             while True:
                 key = self.pool.get_next()
@@ -69,6 +78,11 @@ class LLMEngine:
                     self.pool.mark_rate_limited(key, retry_after=exc.retry_after)
                 except requests.RequestException:
                     self.pool.mark_rate_limited(key, retry_after=60)
+                except RuntimeError as exc:
+                    if "hard cap" in str(exc).lower():
+                        yield f"[ERROR] {exc}"
+                        return
+                    self.pool.mark_dead(key)
                 except Exception:
                     self.pool.mark_dead(key)
 
@@ -88,6 +102,13 @@ class LLMEngine:
             if role in {"user", "assistant", "system"} and content:
                 msgs.append({"role": role, "content": content})
         msgs.append({"role": "user", "content": prompt})
+
+        # Fix 7.1: Track input tokens
+        from config import settings
+        if settings.DAILY_TOKEN_HARD_CAP > 0:
+            total_chars = sum(len(str(m.get("content", ""))) for m in msgs)
+            self.session_tokens_used += total_chars / 4.0
+
         return msgs
 
     def _cloud_stream(self, messages: list[dict], api_key: str) -> Iterable[str]:
@@ -119,6 +140,12 @@ class LLMEngine:
                 continue
             token = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
             if token:
+                # Fix 7.1: Track output tokens
+                from config import settings
+                if settings.DAILY_TOKEN_HARD_CAP > 0:
+                    self.session_tokens_used += len(token) / 4.0
+                    if self.session_tokens_used >= settings.DAILY_TOKEN_HARD_CAP:
+                        raise RuntimeError(f"Daily token hard cap of {settings.DAILY_TOKEN_HARD_CAP} reached during stream.")
                 yield token
 
     def _ollama_stream(self, messages: list[dict], system: str) -> Iterable[str]:
