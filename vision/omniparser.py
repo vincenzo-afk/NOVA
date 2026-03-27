@@ -18,16 +18,21 @@ _UI_ELEMENT_CACHE_TTL_S = 0.5  # fix 3.2: 500 ms TTL
 
 
 class OmniParserClient:
-    def __init__(self, base_url: str = "http://localhost:8000"):
+    def __init__(self, base_url: str = "http://localhost:8000", auth_token: str | None = None):
         self.base_url = base_url.rstrip("/")
+        self.auth_token = auth_token
 
     def parse(self, image_bytes: bytes) -> dict:
         """POST base64-encoded image to /parse/ and return parsed payload."""
         encoded = base64.b64encode(image_bytes).decode("ascii")
+        headers = {}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
         response = requests.post(
             f"{self.base_url}/parse/",
             json={"base64_image": encoded},
             timeout=30,
+            headers=headers,
         )
         response.raise_for_status()
         return response.json()
