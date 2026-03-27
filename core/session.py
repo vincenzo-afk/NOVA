@@ -12,6 +12,7 @@ class SessionState:
     name: str
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     history: list[dict] = field(default_factory=list)
+    # Fix 5.3: Use RLock so _persist_session can re-acquire while caller holds lock
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
 
@@ -35,9 +36,9 @@ class SessionManager:
             self._persist_session(self._current)
 
     def add_turn(self, role: str, content: str) -> None:
+        # Fix 1.3: Removed duplicate definition; persist inside lock via RLock
         with self._current._lock:
             self._current.history.append({"role": role, "content": content})
-            # Fix 1.3: Removed duplicate definition, and persist while holding lock
             self._persist_session(self._current)
 
     def _persist_session(self, session: SessionState) -> None:
@@ -49,6 +50,7 @@ class SessionManager:
             sessions_dir.mkdir(exist_ok=True)
             safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in session.name)
             path = sessions_dir / f"{safe_name}.json"
+            # RLock allows re-entrant acquire — safe when called from within lock context
             with session._lock:
                 data = {"name": session.name, "session_id": session.session_id, "history": session.history}
             path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
