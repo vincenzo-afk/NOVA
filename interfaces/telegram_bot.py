@@ -2,19 +2,59 @@
 
 from __future__ import annotations
 
+from io import BytesIO
+import json
 import time
 from typing import Any
 
 from config.settings import settings
 from control.adb.qr_pairing import QRPairing
-from utils.exporter import export_markdown
 from vision.capture import capture_screen_png
 from vision.gemini_vision import analyze_image
+from interfaces.cli import format_usage_message
+from utils.events import format_event_log
+from utils.goals import format_goal_list
+from utils.health import format_health_table, summarize_health
 
 
 def is_whitelisted(user_id: str, allowed_chat_id: str | None = None) -> bool:
     whitelist = allowed_chat_id or settings.TELEGRAM_CHAT_ID
     return str(user_id) == str(whitelist)
+
+
+def format_status_message(status_text: str) -> str:
+    try:
+        payload = json.loads(status_text)
+    except Exception:
+        return status_text
+
+    health_summary = payload.get("health_summary") or {}
+    lines = [
+        "JARVIS Status",
+        f"Session            | {payload.get('session', 'unknown')}",
+        f"Session ID         | {payload.get('session_id', '')}",
+        f"Provider           | {payload.get('provider_last', 'unknown')}",
+        f"Memory Mode        | {payload.get('memory_mode', 'unknown')}",
+        f"Emotion            | {payload.get('emotion', 'neutral')}",
+        f"Cloud Keys Active  | {payload.get('active_cloud_keys', 0)}",
+        f"Muted              | {payload.get('muted', False)}",
+        f"Tailscale          | {payload.get('tailscale_ip', '') or 'n/a'}",
+        f"Health             | ok={health_summary.get('ok', 0)} down={health_summary.get('down', 0)} restarting={health_summary.get('restarting', 0)} failed={health_summary.get('restart_failed', 0)}",
+        "",
+        "Usage Today",
+        str(payload.get("usage_today", "")),
+        "",
+        "Usage Week",
+        str(payload.get("usage_week", "")),
+    ]
+    return "\n".join(lines).strip()
+
+
+def telegram_photo_from_png(png: bytes, filename: str = "screenshot.png"):
+    buffer = BytesIO(png)
+    buffer.name = filename
+    buffer.seek(0)
+    return buffer
 
 
 async def _stream_text(message: Any, context: Any, agent: Any, prompt_text: str) -> None:
@@ -79,12 +119,15 @@ def run_telegram_bot(agent: Any, token: str | None = None, allowed_chat_id: str 
     async def on_status(update, _context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
             return
-        await update.message.reply_text(agent.status_text())
+        await update.message.reply_text(format_status_message(agent.status_text()))
 
     async def on_health(update, _context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
             return
-        await update.message.reply_text(f"Health:\n{agent.status_text()}")
+        health_items = agent.health.status_table()
+        header = summarize_health(health_items)
+        body = format_health_table(health_items)
+        await update.message.reply_text(f"Health summary: {header}\n\n{body}")
 
     async def on_session(update, context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
@@ -99,18 +142,89 @@ def run_telegram_bot(agent: Any, token: str | None = None, allowed_chat_id: str 
     async def on_export(update, _context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
             return
-        timestamp = int(time.time())
-        path = f"exports/{agent.session.current.name}_{timestamp}.md"
-        export_markdown(agent.session.current.history, path)
+        path = agent.export_session("md")
         with open(path, "rb") as file_handle:
             await update.message.reply_document(document=InputFile(file_handle, filename=path.split("/")[-1]))
+
+    async def on_goals(update, _context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        await update.message.reply_text(format_goal_list(agent.list_goals()))
+
+    async def on_alerts(update, _context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        await update.message.reply_text(format_event_log(agent.recent_events()))
+
+    async def on_goal(update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        text = " ".join(context.args).strip()
+        if not text:
+            await update.message.reply_text("Usage: /goal <goal description>")
+            return
+        result = agent.add_goal(text)
+        if result.get("status") != "pending":
+            await update.message.reply_text(f"Goal planning failed: {result}")
+            return
+        await update.message.reply_text(
+            f"Queued goal {result['id']}.\n"
+            f"Status: {result['status']}\n"
+            f"Goal: {result['goal']}"
+        )
+
+    async def on_resume_goal(update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /resume_goal <goal_id>")
+            return
+        goal_id = context.args[0].strip()
+        result = agent.resume_goal(goal_id)
+        await update.message.reply_text(f"{result}")
+
+    async def on_cancel_goal(update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        if not context.args:
+            await update.message.reply_text("Usage: /cancel_goal <goal_id>")
+            return
+        goal_id = context.args[0].strip()
+        result = agent.cancel_goal(goal_id)
+        await update.message.reply_text(f"{result}")
+
+    async def on_mute(update, _context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        agent.set_muted(True)
+        await update.message.reply_text("Muted proactive alerts and autonomy notifications.")
+
+    async def on_unmute(update, _context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        agent.set_muted(False)
+        await update.message.reply_text("Unmuted proactive alerts and autonomy notifications.")
+
+    async def on_usage(update, _context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        session_id = agent.session.current.session_id
+        summary = agent.usage.today_summary(session_id=session_id)
+        await update.message.reply_text(format_usage_message("Usage today", summary))
+
+    async def on_usage_week(update, _context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        session_id = agent.session.current.session_id
+        summary = agent.usage.weekly_summary(session_id=session_id)
+        await update.message.reply_text(format_usage_message("Usage this week", summary))
 
     async def on_screenshot(update, _context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
             return
         try:
             png = capture_screen_png()
-            await update.message.reply_photo(photo=png)
+            await update.message.reply_photo(photo=InputFile(telegram_photo_from_png(png), filename="screenshot.png"))
         except Exception as exc:
             await update.message.reply_text(f"Screenshot failed: {exc}")
 
@@ -152,6 +266,15 @@ def run_telegram_bot(agent: Any, token: str | None = None, allowed_chat_id: str 
     app.add_handler(CommandHandler("health", on_health))
     app.add_handler(CommandHandler("session", on_session))
     app.add_handler(CommandHandler("export", on_export))
+    app.add_handler(CommandHandler("goals", on_goals))
+    app.add_handler(CommandHandler("alerts", on_alerts))
+    app.add_handler(CommandHandler("goal", on_goal))
+    app.add_handler(CommandHandler("resume_goal", on_resume_goal))
+    app.add_handler(CommandHandler("cancel_goal", on_cancel_goal))
+    app.add_handler(CommandHandler("mute", on_mute))
+    app.add_handler(CommandHandler("unmute", on_unmute))
+    app.add_handler(CommandHandler("usage", on_usage))
+    app.add_handler(CommandHandler("usage_week", on_usage_week))
     app.add_handler(CommandHandler("screenshot", on_screenshot))
     app.add_handler(CommandHandler("qr", on_qr))
     app.add_handler(MessageHandler(filters.PHOTO, on_image))

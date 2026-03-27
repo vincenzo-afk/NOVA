@@ -40,8 +40,10 @@ _ACTION_VERBS = {
 }
 
 
-def build_system_prompt(base: str, dispatcher=None) -> str:
+def build_system_prompt(base: str, dispatcher=None, emotion: str | None = None) -> str:
     prompt = f"{base}\n\n{_COT_PREFIX}"
+    if emotion:
+        prompt += f"\n\nCurrent emotional tone: {emotion}."
     if dispatcher:
         prompt += "\n\n" + dispatcher.get_tool_schema_prompt()
     return prompt

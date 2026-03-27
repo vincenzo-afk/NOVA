@@ -9,7 +9,7 @@ import subprocess
 import qrcode
 
 from config.settings import settings
-from control.adb.tailscale import tailscale_ip_v4
+from control.adb.tailscale import ensure_tailscale_connected, tailscale_ip_v4
 
 
 class QRPairing:
@@ -25,6 +25,7 @@ class QRPairing:
 
     def resolve_target_ip(self, prefer_remote: bool = False) -> str:
         if prefer_remote:
+            ensure_tailscale_connected()
             remote = settings.TAILSCALE_PHONE_IP.strip() or tailscale_ip_v4()
             if remote:
                 return remote

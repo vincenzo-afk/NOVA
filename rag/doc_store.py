@@ -1,12 +1,15 @@
-"""Document vector-like store built on local memory primitives."""
+"""Document vector store with ChromaDB and graceful fallback."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+from pathlib import Path
 from typing import Any
 
 from rag.chunker import chunk_text
 from rag.doc_loader import DocumentLoader
+from utils.embeddings import EmbeddingBackend, get_embedder
 
 
 @dataclass
@@ -16,10 +19,43 @@ class StoredChunk:
 
 
 class DocumentStore:
-    def __init__(self):
+    def __init__(
+        self,
+        persist_dir: str = ".jarvis_docs",
+        collection_name: str = "jarvis_docs",
+        embedding_model: str = "all-MiniLM-L6-v2",
+    ):
         self.loader = DocumentLoader()
         self._docs: dict[str, list[StoredChunk]] = {}
         self._doc_meta: dict[str, dict[str, Any]] = {}
+        self.persist_dir = Path(persist_dir)
+        self.persist_dir.mkdir(parents=True, exist_ok=True)
+        self.collection_name = collection_name
+        self.embedding_model = embedding_model
+        self._client = None
+        self._collection = None
+        self._embedder: EmbeddingBackend | None = None
+        self._use_chroma = self._init_chroma()
+
+    def _init_chroma(self) -> bool:
+        try:
+            import chromadb  # type: ignore
+
+            if not EmbeddingBackend.is_available():
+                return False
+            self._client = chromadb.PersistentClient(path=str(self.persist_dir))
+            self._collection = self._client.get_or_create_collection(
+                self.collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+            self._embedder = get_embedder(self.embedding_model)
+            return True
+        except Exception:  # pragma: no cover - optional dependency
+            return False
+
+    def _chunk_id(self, filename: str, idx: int, text: str) -> str:
+        seed = f"{filename}:{idx}:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
     def ingest(self, filepath: str) -> dict:
         doc = self.loader.load(filepath)
@@ -31,20 +67,42 @@ class DocumentStore:
             "page_count": doc["page_count"],
             "size_bytes": doc["size_bytes"],
         }
-        self._docs[filename] = [
-            StoredChunk(
-                text=chunk,
-                metadata={
-                    "filename": filename,
-                    "chunk_index": idx,
-                    **self._doc_meta[filename],
-                },
-            )
-            for idx, chunk in enumerate(chunks)
-        ]
+        self._docs[filename] = []
+        for idx, chunk in enumerate(chunks):
+            meta = {
+                "filename": filename,
+                "chunk_index": idx,
+                **self._doc_meta[filename],
+            }
+            self._docs[filename].append(StoredChunk(text=chunk, metadata=meta))
+
+        if self._use_chroma and self._collection and self._embedder:
+            try:
+                embeddings = self._embedder.encode([c.text for c in self._docs[filename]])
+                ids = [self._chunk_id(filename, idx, c.text) for idx, c in enumerate(self._docs[filename])]
+                self._collection.upsert(
+                    ids=ids,
+                    documents=[c.text for c in self._docs[filename]],
+                    metadatas=[c.metadata for c in self._docs[filename]],
+                    embeddings=embeddings,
+                )
+            except Exception:
+                self._use_chroma = False
         return {"filename": filename, "chunks": len(chunks), **self._doc_meta[filename]}
 
     def query(self, question: str, filename: str | None = None, top_k: int = 5) -> list[str]:
+        if self._use_chroma and self._collection and self._embedder:
+            try:
+                embedding = self._embedder.encode([question])[0]
+                query_kwargs = {"query_embeddings": [embedding], "n_results": top_k}
+                if filename:
+                    query_kwargs["where"] = {"filename": filename}
+                results = self._collection.query(**query_kwargs)
+                docs = results.get("documents", [[]])[0]
+                return [doc for doc in docs if doc]
+            except Exception:
+                self._use_chroma = False
+
         corpus: list[StoredChunk] = []
         if filename:
             corpus = self._docs.get(filename, [])

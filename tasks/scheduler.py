@@ -37,6 +37,25 @@ class TaskScheduler:
     def list_jobs(self) -> list[str]:
         return [job.id for job in self.scheduler.get_jobs()]
 
+    def list_jobs_detailed(self) -> list[dict]:
+        jobs = []
+        for job in self.scheduler.get_jobs():
+            jobs.append(
+                {
+                    "id": job.id,
+                    "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
+                    "trigger": str(job.trigger),
+                }
+            )
+        return jobs
+
+    def remove_job(self, job_id: str) -> bool:
+        try:
+            self.scheduler.remove_job(job_id)
+            return True
+        except Exception:
+            return False
+
 
 def parse_schedule_text(schedule_text: str) -> dict:
     text = schedule_text.strip().lower()

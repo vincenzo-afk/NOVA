@@ -9,6 +9,7 @@ import re
 import requests
 
 from config.settings import settings
+from core.llm.fallback import NetworkState
 
 
 def _default_response() -> dict:
@@ -58,6 +59,10 @@ def _normalize(data: dict | None) -> dict:
 
 def analyze_image(image_bytes: bytes) -> dict:
     if not image_bytes:
+        return _default_response()
+    if not NetworkState.is_online():
+        return _default_response()
+    if not any(k.strip() for k in settings.GEMINI_API_KEYS):
         return _default_response()
 
     prompt = (

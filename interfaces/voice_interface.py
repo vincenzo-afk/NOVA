@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import threading
 
@@ -27,31 +28,46 @@ def _transcribe_audio(audio_bytes: bytes, whisper: OfflineWhisper) -> str:
     return whisper.transcribe(audio_bytes, lang=settings.DEFAULT_LANG)
 
 
-def _play_audio_file(path: str) -> None:
+def _play_audio_file(path: str, stop_event: threading.Event | None = None) -> None:
     for cmd in (["afplay", path], ["mpg123", "-q", path], ["ffplay", "-nodisp", "-autoexit", path]):
         try:
-            subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                while proc.poll() is None:
+                    if stop_event is not None and stop_event.is_set():
+                        proc.terminate()
+                        break
+                    threading.Event().wait(0.05)
+                if proc.poll() is None:
+                    proc.wait(timeout=1)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
             return
         except Exception:
             continue
 
 
-def _speak_text(text: str) -> None:
+def _speak_text(
+    text: str,
+    emotion: str = "neutral",
+    stop_event: threading.Event | None = None,
+) -> None:
     if settings.DEFAULT_LANG == "ta" and NetworkState.is_online():
         try:
             path = speak_tamil(text)
-            _play_audio_file(path)
+            _play_audio_file(path, stop_event=stop_event)
             return
         except Exception:
             pass
 
     if NetworkState.is_online():
         try:
-            tts_online(text, lang=settings.DEFAULT_LANG)
+            tts_online(text, emotion=emotion, lang=settings.DEFAULT_LANG, stop_event=stop_event)
             return
         except Exception:
             pass
-    tts_offline(text)
+    tts_offline(text, stop_event=stop_event)
 
 
 def _wait_for_wakeword(enabled: bool, event: threading.Event) -> None:
@@ -60,6 +76,40 @@ def _wait_for_wakeword(enabled: bool, event: threading.Event) -> None:
     print("Waiting for wake word...")
     event.wait()
     event.clear()
+
+
+def _normalize_hotkey(spec: str) -> str:
+    parts = [part.strip().lower() for part in spec.split("+") if part.strip()]
+    mapping = {
+        "ctrl": "<ctrl>",
+        "control": "<ctrl>",
+        "shift": "<shift>",
+        "alt": "<alt>",
+        "cmd": "<cmd>",
+        "command": "<cmd>",
+        "win": "<cmd>",
+        "meta": "<cmd>",
+    }
+    normalized: list[str] = []
+    for part in parts:
+        normalized.append(mapping.get(part, part if part.startswith("<") else part))
+    return "+".join(normalized)
+
+
+def _start_barge_in_listener(on_barge_in: callable) -> object | None:
+    if not settings.VOICE_BARGEIN_ENABLED:
+        return None
+    try:
+        from pynput import keyboard
+    except Exception:
+        print("Barge-in hotkey unavailable; install pynput to enable Ctrl+Shift+X stop.")
+        return None
+
+    hotkey = _normalize_hotkey(settings.VOICE_BARGEIN_HOTKEY)
+    hotkeys = keyboard.GlobalHotKeys({hotkey: on_barge_in})
+    hotkeys.start()
+    print(f"Barge-in enabled: {settings.VOICE_BARGEIN_HOTKEY} to stop speech and re-listen.")
+    return hotkeys
 
 
 def run_voice_loop(
@@ -71,6 +121,8 @@ def run_voice_loop(
     whisper = OfflineWhisper(model_size=settings.WHISPER_MODEL)
     wakeword_event = threading.Event()
     wakeword: WakeWordListener | None = None
+    barge_in_event = threading.Event()
+    hotkey_listener = _start_barge_in_listener(barge_in_event.set)
 
     if use_wakeword:
         wakeword = WakeWordListener(callback=wakeword_event.set)
@@ -79,6 +131,7 @@ def run_voice_loop(
     print("Voice mode started. Press Ctrl+C to stop.")
     try:
         while True:
+            barge_in_event.clear()
             _wait_for_wakeword(use_wakeword, wakeword_event)
 
             audio = recorder.capture_until_silence()
@@ -99,10 +152,17 @@ def run_voice_loop(
             if wakeword:
                 wakeword.set_muted(True)
             try:
-                _speak_text(response)
+                emotion = getattr(agent, "emotion_state", "neutral")
+                _speak_text(response, emotion=emotion, stop_event=barge_in_event)
+                if barge_in_event.is_set():
+                    print("[voice] Barge-in received; listening again.")
+                    continue
             finally:
                 if wakeword:
                     wakeword.set_muted(False)
     finally:
+        with contextlib.suppress(Exception):
+            if hotkey_listener is not None:
+                hotkey_listener.stop()
         if wakeword:
             wakeword.stop()

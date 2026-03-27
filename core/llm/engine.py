@@ -1,4 +1,4 @@
-"""Unified LLM interface with streaming and cloud->ollama fallback."""
+"""Unified LLM interface with streaming, round-robin key rotation, and cloud→Ollama fallback."""
 
 from __future__ import annotations
 
@@ -23,13 +23,21 @@ class LLMEngine:
         openai_keys: list[str],
         ollama_base_url: str,
         ollama_model: str,
+        openai_model: str = "gpt-4o",
         timeout: int = 90,
     ):
         self.openai_base_url = openai_base_url.rstrip("/")
         self.ollama_base_url = ollama_base_url.rstrip("/")
         self.ollama_model = ollama_model
+        self.openai_model = openai_model
         self.timeout = timeout
-        self.pool = RoundRobinPool(openai_keys)
+        # Only initialise pool if we have keys; otherwise cloud path is effectively disabled
+        self.pool: RoundRobinPool | None = None
+        if openai_keys:
+            try:
+                self.pool = RoundRobinPool(openai_keys)
+            except ValueError:
+                self.pool = None
         self.last_provider = "unknown"
 
     def ask(self, prompt: str, system: str, history: list[dict] | None = None) -> str:
@@ -43,25 +51,28 @@ class LLMEngine:
     ) -> Generator[str, None, None]:
         messages = self._build_messages(prompt=prompt, system=system, history=history or [])
 
-        tried: set[str] = set()
-        while True:
-            key = self.pool.get_next()
-            if not key or key in tried:
-                break
-            tried.add(key)
-            self.last_provider = f"cloud • {self.pool.key_label(key)}"
-            try:
-                for token in self._cloud_stream(messages=messages, api_key=key):
-                    yield token
-                self.pool.mark_success(key)
-                return
-            except RateLimitError as exc:
-                self.pool.mark_rate_limited(key, retry_after=exc.retry_after)
-            except requests.RequestException:
-                self.pool.mark_rate_limited(key, retry_after=60)
-            except Exception:
-                self.pool.mark_dead(key)
+        # Attempt cloud keys if pool is available
+        if self.pool is not None:
+            tried: set[str] = set()
+            while True:
+                key = self.pool.get_next()
+                if not key or key in tried:
+                    break
+                tried.add(key)
+                self.last_provider = f"cloud • {self.pool.key_label(key)}"
+                try:
+                    for token in self._cloud_stream(messages=messages, api_key=key):
+                        yield token
+                    self.pool.mark_success(key)
+                    return
+                except RateLimitError as exc:
+                    self.pool.mark_rate_limited(key, retry_after=exc.retry_after)
+                except requests.RequestException:
+                    self.pool.mark_rate_limited(key, retry_after=60)
+                except Exception:
+                    self.pool.mark_dead(key)
 
+        # Fallback to Ollama
         self.last_provider = "local • ollama"
         try:
             for token in self._ollama_stream(messages=messages, system=system):
@@ -86,7 +97,7 @@ class LLMEngine:
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
-            json={"model": "gpt-oss-120b", "messages": messages, "stream": True},
+            json={"model": self.openai_model, "messages": messages, "stream": True},
             timeout=self.timeout,
             stream=True,
         )
@@ -102,12 +113,47 @@ class LLMEngine:
             payload = raw_line[5:].strip()
             if payload == "[DONE]":
                 break
-            data = json.loads(payload)
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
             token = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
             if token:
                 yield token
 
     def _ollama_stream(self, messages: list[dict], system: str) -> Iterable[str]:
+        """Use Ollama's /api/chat endpoint for better multi-turn support."""
+        response = requests.post(
+            f"{self.ollama_base_url}/api/chat",
+            json={
+                "model": self.ollama_model,
+                "messages": messages,
+                "stream": True,
+            },
+            timeout=self.timeout,
+            stream=True,
+        )
+        if response.status_code == 404:
+            # Older Ollama versions only have /api/generate — fall back
+            yield from self._ollama_generate_stream(messages, system)
+            return
+        response.raise_for_status()
+
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            try:
+                data = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            token = data.get("message", {}).get("content", "")
+            if token:
+                yield token
+            if data.get("done"):
+                break
+
+    def _ollama_generate_stream(self, messages: list[dict], system: str) -> Iterable[str]:
+        """Legacy Ollama /api/generate endpoint fallback."""
         prompt = self._messages_to_prompt(messages)
         response = requests.post(
             f"{self.ollama_base_url}/api/generate",
@@ -125,7 +171,10 @@ class LLMEngine:
         for raw_line in response.iter_lines(decode_unicode=True):
             if not raw_line:
                 continue
-            data = json.loads(raw_line)
+            try:
+                data = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
             token = data.get("response", "")
             if token:
                 yield token

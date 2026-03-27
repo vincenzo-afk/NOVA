@@ -1,6 +1,9 @@
+# LLM
 openai
 ollama
 google-generativeai
+
+# Voice
 pvporcupine
 pyaudio
 sounddevice
@@ -8,30 +11,54 @@ silero-vad
 faster-whisper
 pyttsx3
 gTTS
+pynput
+
+# Vision
 Pillow
 opencv-python
 numpy
+
+# Control
 pyautogui
 pywin32
 playwright
+
+# Web & Search
 requests
 beautifulsoup4
 duckduckgo-search
 rank-bm25
+
+# Memory
 mem0ai
 chromadb
 sentence-transformers
+
+# Documents (RAG)
 pypdf
 python-docx
+
+# ADB & Networking
 pure-python-adb
 adb-wifi-py
 qrcode[pil]
+
+# Interfaces
 rich
 pyqt6
 python-telegram-bot
 pystray
+
+# Tasks
 apscheduler
+SQLAlchemy
+
+# Validation
 pydantic
+
+# Utils
 python-dotenv
 loguru
+psutil
 pytest
+huggingface_hub
