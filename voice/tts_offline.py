@@ -2,46 +2,60 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
-from threading import Lock
+
+_QUEUE: queue.Queue | None = None
+_WORKER_THREAD: threading.Thread | None = None
+
+def _tts_worker() -> None:
+    import pyttsx3
+    try:
+        engine = pyttsx3.init()
+    except Exception:
+        return
+        
+    while True:
+        try:
+            item = _QUEUE.get()
+        except Exception:
+            continue
+            
+        if item is None:
+            _QUEUE.task_done()
+            break
+            
+        text, done_event = item
+        try:
+            engine.say(text)
+            engine.runAndWait()
+        except Exception:
+            pass
+        finally:
+            done_event.set()
+            _QUEUE.task_done()
 
 
-_ENGINE = None
-_LOCK = Lock()
-
-
-def _engine():
-    global _ENGINE
-    if _ENGINE is None:
-        import pyttsx3
-
-        _ENGINE = pyttsx3.init()
-    return _ENGINE
+def _ensure_worker() -> None:
+    global _QUEUE, _WORKER_THREAD
+    if _QUEUE is None:
+        _QUEUE = queue.Queue()
+    if _WORKER_THREAD is None or not _WORKER_THREAD.is_alive():
+        _WORKER_THREAD = threading.Thread(target=_tts_worker, daemon=True)
+        _WORKER_THREAD.start()
 
 
 def speak(text: str, stop_event: threading.Event | None = None) -> None:
+    """Queue text for speech and block until done or stopped."""
     if not text.strip():
         return
-    with _LOCK:
-        engine = _engine()
-        done = threading.Event()
-
-        def _run() -> None:
-            try:
-                engine.say(text)
-                engine.runAndWait()
-            finally:
-                done.set()
-
-        worker = threading.Thread(target=_run, daemon=True)
-        worker.start()
-        while not done.is_set():
-            if stop_event is not None and stop_event.is_set():
-                try:
-                    engine.stop()
-                except Exception:
-                    pass
-                break
-            time.sleep(0.05)
-        worker.join(timeout=1)
+    
+    _ensure_worker()
+    done_event = threading.Event()
+    _QUEUE.put((text, done_event))
+    
+    while not done_event.is_set():
+        if stop_event is not None and stop_event.is_set():
+            break
+        time.sleep(0.05)
