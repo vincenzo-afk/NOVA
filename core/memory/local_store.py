@@ -66,6 +66,23 @@ class LocalMemoryStore:
         if self._dedup_exists(hash_id):
             return {"status": "duplicate", "id": hash_id}
 
+        # Fix 1.8: Check disk space before writing
+        if self._use_chroma:
+            try:
+                import shutil
+                usage = shutil.disk_usage(str(self.persist_dir))
+                # Warn if less than 1 GB free
+                if usage.free < 1_000_000_000:
+                    try:
+                        from utils.logger import get_logger
+                        get_logger(__name__).warning(
+                            f"Low disk space ({usage.free / 1e9:.1f} GB free) — ChromaDB may fail"
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         payload = metadata or {}
         if self._use_chroma and self._collection and self._embedder:
             try:

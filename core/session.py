@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import threading
 import uuid
 
 
@@ -11,6 +12,7 @@ class SessionState:
     name: str
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     history: list[dict] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 class SessionManager:
@@ -27,12 +29,59 @@ class SessionManager:
         return self._current
 
     def add_turn(self, role: str, content: str) -> None:
-        self._current.history.append({"role": role, "content": content})
+        with self._current._lock:
+            self._current.history.append({"role": role, "content": content})
 
     def reset_context(self) -> None:
-        self._current.history.clear()
+        with self._current._lock:
+            self._current.history.clear()
+        # Fix 2.6: Persist empty history after reset
+        self._persist_session(self._current)
+
+    def add_turn(self, role: str, content: str) -> None:
+        with self._current._lock:
+            self._current.history.append({"role": role, "content": content})
+        # Fix 2.6: Persist after each turn
+        self._persist_session(self._current)
+
+    def _persist_session(self, session: SessionState) -> None:
+        """Serialize session history to a JSON file for crash recovery (fix 2.6)."""
+        try:
+            import json
+            from pathlib import Path
+            sessions_dir = Path(".jarvis_sessions")
+            sessions_dir.mkdir(exist_ok=True)
+            safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in session.name)
+            path = sessions_dir / f"{safe_name}.json"
+            with session._lock:
+                data = {"name": session.name, "session_id": session.session_id, "history": session.history}
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_session(self, name: str) -> SessionState | None:
+        """Load session history from JSON file if it exists (fix 2.6)."""
+        try:
+            import json
+            from pathlib import Path
+            sessions_dir = Path(".jarvis_sessions")
+            safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in name)
+            path = sessions_dir / f"{safe_name}.json"
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                session = SessionState(name=data["name"], session_id=data["session_id"])
+                session.history = data.get("history", [])
+                return session
+        except Exception:
+            pass
+        return None
 
     def _get_or_create(self, name: str) -> SessionState:
         if name not in self._sessions:
-            self._sessions[name] = SessionState(name=name)
+            # Fix 2.6: Try to load from disk first
+            loaded = self._load_session(name)
+            if loaded:
+                self._sessions[name] = loaded
+            else:
+                self._sessions[name] = SessionState(name=name)
         return self._sessions[name]

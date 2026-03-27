@@ -18,23 +18,13 @@ def _format_k_tokens(tokens: int) -> str:
     return str(tokens)
 
 
+# Fix 6.3: Use format_goal_list from utils.goals instead of duplicate implementation
 def _format_goal_summary(agent: Any) -> str:
     try:
         goals = list(agent.list_goals())
     except Exception:
         goals = []
-    if not goals:
-        return "Goals: 0"
-
-    counts: dict[str, int] = {}
-    for goal in goals:
-        status = str(goal.get("status", "unknown"))
-        counts[status] = counts.get(status, 0) + 1
-    parts = [f"{len(goals)} total"]
-    for status in ("pending", "running", "paused", "completed", "failed", "cancelled"):
-        if counts.get(status):
-            parts.append(f"{counts[status]} {status}")
-    return "Goals: " + " · ".join(parts)
+    return format_goal_list(goals)
 
 
 def _format_health_summary(agent: Any) -> str:

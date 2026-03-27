@@ -81,3 +81,21 @@ def clarifying_question(user_text: str) -> str:
         "I want to do this correctly. Did you mean a specific target or action? "
         f"For example, if you said '{user_text}', tell me exactly what object/app/file I should use."
     )
+
+
+# Fix 4.3: Prompt injection detection patterns
+_INJECTION_PATTERNS = [
+    re.compile(r"ignore (all |previous )?instructions?", re.IGNORECASE),
+    re.compile(r"you are now", re.IGNORECASE),
+    re.compile(r"system prompt", re.IGNORECASE),
+    re.compile(r"<\|.*?\|>"),  # token delimiters
+    re.compile(r"\{\s*\"tool\"\s*:\s*\""),  # JSON tool call in user input
+]
+
+
+def detect_prompt_injection(text: str) -> bool:
+    """Return True if the text contains common prompt-injection signatures (fix 4.3)."""
+    for pattern in _INJECTION_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
