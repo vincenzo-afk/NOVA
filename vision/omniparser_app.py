@@ -8,13 +8,14 @@ import threading
 import time
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import uvicorn
 
 app = FastAPI()
 omniparser = None
 omniparser_lock = threading.Lock()
+AUTH_TOKEN = None  # Set via --auth-token argument
 
 
 class ParseRequest(BaseModel):
@@ -59,6 +60,16 @@ async def probe():
     return {"message": "OmniParser API ready"}
 
 
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Validate authentication token for all endpoints except health/probe."""
+    if AUTH_TOKEN and request.url.path not in ["/health", "/probe/"]:
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or auth_header != f"Bearer {AUTH_TOKEN}":
+            raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
+    return await call_next(request)
+
+
 @app.post("/parse/")
 async def parse(parse_request: ParseRequest):
     start = time.time()
@@ -82,7 +93,12 @@ def main() -> None:
     parser.add_argument("--caption-model-name", type=str, default="florence2")
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--BOX_TRESHOLD", type=float, default=0.05)
+    parser.add_argument("--auth-token", type=str, default="", help="Authentication token for API security")
     args = parser.parse_args()
+    
+    # Set global auth token
+    global AUTH_TOKEN
+    AUTH_TOKEN = args.auth_token if args.auth_token else None
 
     som_path, caption_path = _resolve_paths(args.repo_dir, args.som_model_path or None, args.caption_model_path or None)
 

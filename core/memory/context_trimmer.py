@@ -10,6 +10,7 @@ from typing import Callable
 class ContextTrimmer:
     max_raw_turns: int = 10
     summaries: dict[str, str] = field(default_factory=dict)
+    _last_summarized_count: dict[str, int] = field(default_factory=dict)
 
     def trim(
         self,
@@ -24,6 +25,12 @@ class ContextTrimmer:
         older = history[: -self.max_raw_turns]
         recent = history[-self.max_raw_turns :]
 
+        # Fix 3.3: Only recompute summary when the number of older turns changes
+        last_count = self._last_summarized_count.get(session_id, 0)
+        if len(older) == last_count and summary:
+            # No new turns to summarize, reuse existing summary
+            return summary, recent
+
         snippet = " ".join(
             f"{turn.get('role', 'user')}: {turn.get('content', '').strip()}"
             for turn in older
@@ -37,4 +44,5 @@ class ContextTrimmer:
             summary = compressed[:1200]
 
         self.summaries[session_id] = summary
+        self._last_summarized_count[session_id] = len(older)
         return summary, recent

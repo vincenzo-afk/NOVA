@@ -520,7 +520,10 @@ class JarvisApp:
         if self._omniparser_client is None:
             from vision.omniparser import OmniParserClient
 
-            self._omniparser_client = OmniParserClient(settings.OMNIPARSER_SERVER_URL)
+            self._omniparser_client = OmniParserClient(
+                settings.OMNIPARSER_SERVER_URL,
+                auth_token=self.omniparser.auth_token if hasattr(self, 'omniparser') else None
+            )
         return self._omniparser_client
 
     def _current_ui_elements(self) -> list[dict[str, Any]]:
@@ -1118,8 +1121,29 @@ class JarvisApp:
 
     def _context_messages(self, user_text: str) -> tuple[str, list[dict], list[dict]]:
         session_id = self.session.current.session_id
+        
+        # Check if we need to trigger background summarization
+        history = self.session.current.history
+        if len(history) > self.trimmer.max_raw_turns:
+            older = history[: -self.trimmer.max_raw_turns]
+            snippet = " ".join(
+                f"{turn.get('role', 'user')}: {turn.get('content', '').strip()}"
+                for turn in older
+                if turn.get("content")
+            )
+            # Trigger background summarization if snippet changed
+            if not hasattr(self, '_last_snippet_hash') or hash(snippet) != self._last_snippet_hash:
+                self._last_snippet_hash = hash(snippet)
+                import threading
+                thread = threading.Thread(
+                    target=self._summarize_history_background,
+                    args=(snippet, session_id),
+                    daemon=True
+                )
+                thread.start()
+        
         summary, recent = self.trimmer.trim(
-            self.session.current.history,
+            history,
             session_id=session_id,
             summarizer=self._summarize_history,
         )
@@ -1164,13 +1188,37 @@ class JarvisApp:
         return system_prompt, all_messages, memories
 
     def _summarize_history(self, text: str) -> str:
+        """Summarize conversation history. Uses cached summary if available."""
         if not text.strip():
             return ""
+        
+        # Check if we have a cached summary for this text
+        text_hash = hash(text)
+        if hasattr(self, '_summary_cache') and text_hash in self._summary_cache:
+            return self._summary_cache[text_hash]
+        
+        # If no cache, return truncated text (will be summarized in background)
+        return text[:700]
+    
+    def _summarize_history_background(self, text: str, session_id: str) -> None:
+        """Summarize history in background thread and update cache."""
+        if not text.strip():
+            return
+        
         system = "Summarize the conversation history into a concise paragraph for future context."
         try:
-            return self.engine.ask(prompt=text, system=system, history=[])
+            summary = self.engine.ask(prompt=text, system=system, history=[])
+            # Update the cache
+            if not hasattr(self, '_summary_cache'):
+                self._summary_cache = {}
+            self._summary_cache[hash(text)] = summary
+            # Update the trimmer's summary
+            self.trimmer.summaries[session_id] = summary
         except Exception:
-            return text[:700]
+            # On error, use truncated text
+            if not hasattr(self, '_summary_cache'):
+                self._summary_cache = {}
+            self._summary_cache[hash(text)] = text[:700]
 
     def _apply_text_commands(self, user_text: str) -> str | None:
         text = user_text.strip().lower()
@@ -1202,6 +1250,7 @@ class JarvisApp:
             now_muted = self.toggle_mute()
             return "Muted." if now_muted else "Unmuted."
         if re.match(r"^switch session\s+.+$", text):
+            # Fix 6.8: Extract session name from original user_text to preserve case
             name = user_text.strip().split(maxsplit=2)[-1]
             state = self.switch_session(name)
             return f"Switched to {state.name} ({state.session_id})."

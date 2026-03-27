@@ -44,13 +44,15 @@ class EmbeddingBackend:
             raise RuntimeError(f"SentenceTransformer unavailable: {exc}") from exc
 
     def encode(self, texts: Iterable[str]) -> List[list[float]]:
+        # Fix 3.1: Release lock after model loading - SentenceTransformer.encode() is thread-safe
         with self._lock:
             if self._model is None:
                 self._load()
-            embeddings = self._model.encode(
-                list(texts),
-                normalize_embeddings=True,
-            )
+        # Model is now loaded, encode without holding the lock
+        embeddings = self._model.encode(
+            list(texts),
+            normalize_embeddings=True,
+        )
         try:
             return embeddings.tolist()
         except Exception:

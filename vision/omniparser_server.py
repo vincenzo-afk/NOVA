@@ -8,6 +8,7 @@ Fixes applied:
 from __future__ import annotations
 
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -58,6 +59,8 @@ class OmniParserServer:
         self.repo_dir = repo_dir or os.getenv("OMNIPARSER_REPO_DIR", "")
         self.proc: subprocess.Popen | None = None
         self.log_file = None
+        # Fix 7.3: Generate random auth token for API security
+        self.auth_token = secrets.token_urlsafe(32)
         if not self.command:
             self.command = self._build_default_command()
 
@@ -145,6 +148,8 @@ class OmniParserServer:
             host,
             "--port",
             str(port),
+            "--auth-token",
+            self.auth_token,
         ]
         if repo_path:
             command += ["--repo-dir", str(repo_path)]
