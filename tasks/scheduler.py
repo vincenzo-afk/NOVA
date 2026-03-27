@@ -10,6 +10,7 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 
 
+# Fix 6.7: Use absolute path for SQLite database
 _DEFAULT_DB = f"sqlite:///{Path(__file__).resolve().parent.parent}/jarvis_jobs.sqlite?timeout=30"
 
 

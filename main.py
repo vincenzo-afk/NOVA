@@ -1147,7 +1147,21 @@ class JarvisApp:
             dispatcher=self.dispatcher,
             emotion=self.emotion.state,
         )
-        return system_prompt, [context_message, *recent], memories
+
+        # Fix 2.9: Check total token count and trim if needed
+        all_messages = [context_message, *recent]
+        try:
+            total_tokens = estimate_tokens_from_messages(all_messages)
+            # If exceeding ~8000 tokens, drop oldest raw turns beyond what ContextTrimmer handles
+            if total_tokens > 8000 and len(recent) > 2:
+                # Keep at least 2 recent turns, drop the rest
+                keep_count = max(2, len(recent) - (total_tokens - 8000) // 500)
+                recent = recent[-keep_count:]
+                all_messages = [context_message, *recent]
+        except Exception:
+            pass
+
+        return system_prompt, all_messages, memories
 
     def _summarize_history(self, text: str) -> str:
         if not text.strip():

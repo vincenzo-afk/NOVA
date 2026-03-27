@@ -17,9 +17,11 @@ class HealthItem:
 
 
 class HealthMonitor:
-    def __init__(self, on_change: Callable[[str, str, str | None], None] | None = None):
+    def __init__(self, on_change: Callable[[str, str, str | None], None] | None = None, max_restart_attempts: int = 3):
         self._state: dict[str, HealthItem] = {}
         self._checks: dict[str, tuple[Callable[[], bool], Callable[[], None] | None]] = {}
+        self._restart_attempts: dict[str, int] = {}  # fix 5.1: track restart attempts
+        self._max_restart_attempts = max_restart_attempts
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
@@ -63,11 +65,22 @@ class HealthMonitor:
             if healthy:
                 self.heartbeat(name, "ok")
                 self._emit_change(name, "ok", previous_status)
+                # fix 5.1: reset restart attempts on recovery
+                with self._lock:
+                    self._restart_attempts[name] = 0
                 continue
 
             self.heartbeat(name, "down")
             self._emit_change(name, "down", previous_status)
             if restart_fn is not None:
+                # fix 5.1: check restart attempt count
+                with self._lock:
+                    attempts = self._restart_attempts.get(name, 0)
+                    if attempts >= self._max_restart_attempts:
+                        self.heartbeat(name, "restart_failed")
+                        self._emit_change(name, "restart_failed", "down")
+                        continue
+                    self._restart_attempts[name] = attempts + 1
                 try:
                     restart_fn()
                     self.heartbeat(name, "restarting")

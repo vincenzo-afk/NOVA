@@ -51,14 +51,13 @@ def list_processes() -> list[str]:
 
 
 def launch_process(command: str) -> int:
-    """Launch a process by command string. Returns PID."""
+    """Launch a process by command string. Returns PID.
+    
+    Fix 1.3: Removed shell=True to prevent shell injection. Uses shlex.split() for safe parsing.
+    """
     import shlex
-    try:
-        args = shlex.split(command)
-        proc = subprocess.Popen(args)
-    except Exception:
-        # Fall back to shell=True if shlex splitting fails
-        proc = subprocess.Popen(command, shell=True)  # nosec B602 B603
+    args = shlex.split(command)
+    proc = subprocess.Popen(args)
     return int(proc.pid)
 
 

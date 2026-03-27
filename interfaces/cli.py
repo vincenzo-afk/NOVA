@@ -43,6 +43,15 @@ def run_cli(agent) -> None:
         user_text = console.input(prompt).strip()
         if not user_text:
             continue
+        # Fix 6.9: Guard against excessively long input
+        if len(user_text) > 50_000:
+            msg = (
+                "[red]Input too long ({:,} chars). Please shorten your message.[/red]".format(len(user_text))
+                if HAS_RICH
+                else "Input too long ({:,} chars). Please shorten your message.".format(len(user_text))
+            )
+            console.print(msg)
+            continue
         if user_text in {"/exit", "/quit"}:
             console.print("[yellow]Goodbye.[/yellow]" if HAS_RICH else "Goodbye.")
             return

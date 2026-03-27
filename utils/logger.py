@@ -34,5 +34,19 @@ def setup_logger(log_dir: str = "logs", level: str = "INFO") -> None:
     )
 
 
+# Fix 6.6: Auto-setup logger on first import to ensure all code paths get configured logger
+_logger_initialized = False
+
+
+def _ensure_logger_initialized():
+    """Ensure logger is initialized on first use."""
+    global _logger_initialized
+    if not _logger_initialized:
+        _logger_initialized = True
+        setup_logger()
+
+
 def get_logger():
+    """Return configured logger, auto-initializing if needed."""
+    _ensure_logger_initialized()
     return logger

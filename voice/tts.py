@@ -195,4 +195,12 @@ def speak(
     if gtts_result:
         return
 
+    # Fix 6.4: Try pyttsx3 as final fallback
+    try:
+        from voice.tts_offline import speak as offline_speak
+        offline_speak(clean)
+        return
+    except Exception:
+        pass
+
     print(f"[online-tts fallback {lang}/{emotion}] {clean}")
