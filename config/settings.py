@@ -80,7 +80,7 @@ class Settings:
     # Proactive screen watcher
     PROACTIVE_WATCHER_ENABLED: bool = True
     PROACTIVE_WATCHER_INTERVAL: int = 30
-    HEALTH_MONITOR_INTERVAL: int = 60.0
+    HEALTH_MONITOR_INTERVAL: float = 60.0
     PROACTIVE_WATCHER_COOLDOWN: float = 120.0
 
     # Phone watcher
@@ -139,7 +139,7 @@ class Settings:
             MEM0_API_KEY=env("MEM0_API_KEY"),
             PORCUPINE_ACCESS_KEY=env("PORCUPINE_ACCESS_KEY"),
             PORCUPINE_KEYWORD_PATH=env(
-                "PORCUPINE_KEYWORD_PATH", "./assets/Hey-Jarvis_en_windows_v3_0_0.ppn"
+                "PORCUPINE_KEYWORD_PATH", "./assets/Hey-Nova_en_windows_v3_0_0.ppn"
             ),
             PORCUPINE_SENSITIVITY=env_float("PORCUPINE_SENSITIVITY", 0.6),
             TELEGRAM_BOT_TOKEN=env("TELEGRAM_BOT_TOKEN"),
@@ -150,7 +150,7 @@ class Settings:
             OMNIPARSER_SERVER_URL=env("OMNIPARSER_SERVER_URL", "http://localhost:8000"),
             OMNIPARSER_REPO_DIR=env("OMNIPARSER_REPO_DIR", ""),
             RISK_CONFIRM_THRESHOLD=env_int("RISK_CONFIRM_THRESHOLD", 7),
-            DEFAULT_SESSION=env("DEFAULT_SESSION", "jarvis_personal"),
+            DEFAULT_SESSION=env("DEFAULT_SESSION", "nova_personal"),
             DAILY_TOKEN_ALERT_THRESHOLD=env_int("DAILY_TOKEN_ALERT_THRESHOLD", 100_000),
             DAILY_TOKEN_HARD_CAP=env_int("DAILY_TOKEN_HARD_CAP", 500000),
             AMBIGUITY_THRESHOLD=env_float("AMBIGUITY_THRESHOLD", 0.6),
@@ -161,10 +161,12 @@ class Settings:
             GEMINI_TTS_MODEL=env("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts"),
             GEMINI_TTS_VOICE=env("GEMINI_TTS_VOICE", "Kore"),
             GEMINI_TTS_TIMEOUT_SECONDS=env_int("GEMINI_TTS_TIMEOUT_SECONDS", 45),
+            TTS_OFFLINE_WATCHDOG_SECONDS=env_int("TTS_OFFLINE_WATCHDOG_SECONDS", 10),
             VOICE_BARGEIN_HOTKEY=env("VOICE_BARGEIN_HOTKEY", "ctrl+shift+x"),
             VOICE_BARGEIN_ENABLED=env_bool("VOICE_BARGEIN_ENABLED", "true"),
             PROACTIVE_WATCHER_ENABLED=env_bool("PROACTIVE_WATCHER_ENABLED", "true"),
             PROACTIVE_WATCHER_INTERVAL=env_float("PROACTIVE_WATCHER_INTERVAL", 30.0),
+            HEALTH_MONITOR_INTERVAL=env_float("HEALTH_MONITOR_INTERVAL", 60.0),
             PROACTIVE_WATCHER_COOLDOWN=env_float("PROACTIVE_WATCHER_COOLDOWN", 120.0),
             PHONE_WATCHER_ENABLED=env_bool("PHONE_WATCHER_ENABLED", "false"),
             AUTONOMY_ENABLED=env_bool("AUTONOMY_ENABLED", "false"),

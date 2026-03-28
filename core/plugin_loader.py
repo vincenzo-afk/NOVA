@@ -29,7 +29,8 @@ def _restricted_import(name: str, *args, **kwargs):
     """Block dangerous imports in plugins."""
     if name in _BLOCKED_IMPORTS:
         raise ImportError(f"Plugin attempted to import blocked module: {name}")
-    return __builtins__["__import__"](name, *args, **kwargs)
+    import builtins
+    return builtins.__import__(name, *args, **kwargs)
 
 
 def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
