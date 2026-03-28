@@ -1045,16 +1045,24 @@ class NOVAApp:
         poll = max(2.0, float(settings.AUTONOMY_POLL_SECONDS))
         while not self._autonomy_stop.is_set():
             goal = None
+            # Shallow copy the list to safely scan without holding the main global lock
             with self._goal_lock:
-                for item in self._goals:
-                    if item.get("status") == "pending":
-                        steps = item.get("steps") or []
-                        if not steps:
-                            continue
-                        item["status"] = "running"
-                        item["started_at"] = time.time()
-                        goal = copy.deepcopy(item)
-                        break
+                goals_snapshot = list(self._goals)
+                
+            candidate_id = None
+            for item in goals_snapshot:
+                if item.get("status") == "pending" and item.get("steps"):
+                    candidate_id = item.get("id")
+                    break
+                    
+            if candidate_id:
+                with self._goal_lock:
+                    for item in self._goals:
+                        if item.get("id") == candidate_id and item.get("status") == "pending" and item.get("steps"):
+                            item["status"] = "running"
+                            item["started_at"] = time.time()
+                            goal = copy.deepcopy(item)
+                            break
             if not goal:
                 self._autonomy_stop.wait(poll)
                 continue
