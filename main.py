@@ -1527,31 +1527,23 @@ class NOVAApp:
         total = self.usage.total_tokens_today(session_id=session_id)
 
         with self._usage_lock:
-            # Bug fix (connectivity/2): Reset hard cap when the calendar day changes
             if self._hard_cap_hit_date != today:
                 self._hard_cap_hit = False
                 self._hard_cap_hit_date = None
-
-            hard_cap = settings.DAILY_TOKEN_HARD_CAP
-            if hard_cap > 0 and total >= hard_cap and not self._hard_cap_hit:
+            hardcap = settings.DAILY_TOKEN_HARD_CAP
+            if hardcap > 0 and total >= hardcap and not self._hard_cap_hit:
                 self._hard_cap_hit = True
                 self._hard_cap_hit_date = today
-                msg = (
-                    f"[usage] HARD CAP REACHED: daily token usage {total} "
-                    f">= hard cap {hard_cap}. Further LLM calls are blocked for today."
-                )
+                msg = f"[usage] HARD CAP REACHED: daily token usage {total} >= hard cap {hardcap}. Further LLM calls are blocked for today."
                 print(msg)
                 try:
                     self._notify_telegram(msg)
                 except Exception:
                     pass
-
+            # ↓ THIS BLOCK MUST ALSO BE INSIDE THE WITH:
             if self._usage_alerted_day != today:
                 if total >= settings.DAILY_TOKEN_ALERT_THRESHOLD:
-                    print(
-                        f"\n[usage] Warning: daily token usage {total} "
-                        f"exceeded threshold {settings.DAILY_TOKEN_ALERT_THRESHOLD}."
-                    )
+                    print(f"\n[usage] Warning: daily token usage {total} exceeded threshold {settings.DAILY_TOKEN_ALERT_THRESHOLD}.")
                     self._usage_alerted_day = today
 
 
