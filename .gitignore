@@ -39,3 +39,4 @@ vendor/
 # Editor tempfiles
 *.swp
 *.swo
+.jarvis/
