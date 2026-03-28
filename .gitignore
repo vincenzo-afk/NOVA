@@ -4,19 +4,38 @@ __pycache__/
 .pytest_cache/
 .venv/
 .env
+
+# ChromaDB vector stores — may grow unboundedly on disk
 .jarvis_chroma/
 .jarvis_docs/
+
+# APScheduler job database
 jarvis_jobs.sqlite
 
-# Logs — may contain sensitive action audit trails (issue 8.4)
-logs/
+# Persisted session history (contains conversation content) (fix 2.6)
+.jarvis_sessions/
 
-# Session exports — contain full conversation history (issue 4.1)
+# Emergency stop persistence file (fix 1.9)
+.jarvis/
+
+# Logs — may contain sensitive action audit trails (Security 4.1)
+logs/
+*.jsonl
+
+# Session exports — contain full conversation history (Security 4.1)
 exports/
 
 # OmniParser vendor checkout — handled as submodule or download
 vendor/
 
-# Ruff/mypy caches
+# Ruff/mypy/pytest caches
 .ruff_cache/
 .mypy_cache/
+.qoder/
+
+# macOS metadata
+.DS_Store
+
+# Editor tempfiles
+*.swp
+*.swo
