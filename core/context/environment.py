@@ -116,10 +116,24 @@ def _network_status() -> str:
         return "offline"
 
 
+import time
+
+_ENVIRONMENT_CACHE: dict = {}
+_ENVIRONMENT_CACHE_TTL = 10.0
+_ENVIRONMENT_CACHE_TIME = 0.0
+
 def snapshot_environment() -> dict:
+    global _ENVIRONMENT_CACHE, _ENVIRONMENT_CACHE_TIME
+    now = time.monotonic()
+    if now - _ENVIRONMENT_CACHE_TIME < _ENVIRONMENT_CACHE_TTL:
+        # Return copied cache but update to current time dynamically
+        cached = dict(_ENVIRONMENT_CACHE)
+        cached["time"] = datetime.now().isoformat(timespec="seconds")
+        return cached
+
     clipboard = _get_clipboard()[:1000]
     app, title = _foreground_app_and_title()
-    return {
+    result = {
         "time": datetime.now().isoformat(timespec="seconds"),
         "cwd": os.getcwd(),
         "os": platform.platform(),
@@ -131,3 +145,6 @@ def snapshot_environment() -> dict:
         "battery_pct": _battery_pct(),
         "last_active_file": _last_active_file(clipboard),
     }
+    _ENVIRONMENT_CACHE = dict(result)
+    _ENVIRONMENT_CACHE_TIME = now
+    return result

@@ -96,6 +96,11 @@ class Settings:
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "Settings":
         """Load from .env file; warn prominently if missing."""
+        import os
+        if os.environ.get("JARVIS_ENV") == "test" or os.environ.get("NOVA_ENV") == "test":
+            # Sec 6: skip .env loading for tests to avoid loading live keys
+            return cls(OPENAI_API_KEYS=[], GEMINI_API_KEYS=[])
+
         env_path = Path(env_file)
         if not env_path.exists():
             # Bug fix (Deployment/2): Log a clear warning instead of silently starting degraded

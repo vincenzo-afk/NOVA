@@ -30,7 +30,17 @@ _PRIVATE_NETWORKS = [
 def _is_private_ip(ip: str) -> bool:
     try:
         addr = ipaddress.ip_address(ip)
-        return any(addr in net for net in _PRIVATE_NETWORKS)
+        if getattr(addr, "ipv4_mapped", None):
+            addr = addr.ipv4_mapped
+        
+        # Check against all networks, catching type mismatches cleanly
+        for net in _PRIVATE_NETWORKS:
+            try:
+                if addr in net:
+                    return True
+            except TypeError:
+                continue
+        return False
     except ValueError:
         return False
 
@@ -65,9 +75,15 @@ def scrape_text(url: str) -> str:
         tag.decompose()
     
     import re
+    from core.think.reasoning import detect_prompt_injection
+    
     text = soup.get_text("\n", strip=True)
     
-    # Fix 16: Prompt Injection Guard
+    # Fix 16 & Sec 3: Prompt Injection Guard
+    is_injected, reason = detect_prompt_injection(text)
+    if is_injected:
+        return f"[Content from web (untrusted) - BLOCKED due to prompt injection: {reason}]"
+        
     text = re.sub(r"\[/?tool_call\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r'\{[^{}]*"tool"\s*:\s*"[^"]+"[^{}]*\}', "", text, flags=re.IGNORECASE)
     

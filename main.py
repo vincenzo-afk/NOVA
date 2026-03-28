@@ -435,7 +435,18 @@ class NOVAApp:
         )
         self.base_system_prompt = DEFAULT_SYSTEM_PROMPT
         self._register_builtin_tools()
+        
+        # Bug 2 & Missing 1: execution lock and separate autonomy runner
+        self._execution_lock = threading.Semaphore(1)
         self.goal_runner = GoalRunner(self.dispatcher)
+        
+        def _autonomy_confirm(prompt: str) -> bool:
+            if settings.AUTONOMY_NOTIFY_TELEGRAM:
+                self._notify_telegram(f"Autonomy paused for high-risk step.\n{prompt}\nReply with: /approve_goal")
+            return False
+            
+        self.autonomy_runner = GoalRunner(self.dispatcher, confirm_callback=_autonomy_confirm)
+        
         load_plugins(self.dispatcher)
         self._start_health_monitoring()
         self._start_watchers_if_enabled()
@@ -686,7 +697,9 @@ class NOVAApp:
 
     def _run_goal(self, goal: str, steps: list[GoalStepArgs], max_steps: int = 20, dry_run: bool = False) -> dict:
         step_dicts = [{"tool": step.tool, "args": step.args} for step in steps]
-        result = self.goal_runner.run(step_dicts, max_steps=max_steps, dry_run=dry_run)
+        with self._execution_lock:
+            result = self.goal_runner.run(step_dicts, max_steps=max_steps, dry_run=dry_run)
+        
         return {
             "goal": goal,
             "status": result.status,
@@ -707,7 +720,6 @@ class NOVAApp:
             dispatcher=self.dispatcher,
             emotion=self.emotion.state,
         )
-        raw = self.engine.ask(prompt=f"Goal: {goal}", system=system_prompt, history=[])
 
         def _extract_steps(text: str) -> list[dict]:
             text = text.strip()
@@ -737,7 +749,15 @@ class NOVAApp:
                     steps.append({"tool": tool, "args": args})
             return steps
 
-        steps = _extract_steps(raw)
+        raw = ""
+        steps = []
+        for attempt in range(3):
+            raw = self.engine.ask(prompt=f"Goal: {goal}", system=system_prompt, history=[])
+            steps = _extract_steps(raw)
+            if steps:
+                break
+            system_prompt += "\nCRITICAL ERROR: Your previous response was not a valid JSON list. You MUST return ONLY a JSON list of tool objects."
+
         if not steps:
             return {"goal": goal, "status": "failed", "reason": "no_steps_parsed", "raw": raw}
         if len(steps) > max_steps:
@@ -1058,10 +1078,11 @@ class NOVAApp:
             if candidate_id:
                 with self._goal_lock:
                     for item in self._goals:
-                        if item.get("id") == candidate_id and item.get("status") == "pending" and item.get("steps"):
+                        if item.get("id") == candidate_id and item.get("status") in {"pending", "approved_for_step"} and item.get("steps"):
+                            # If it was specifically approved, we will pass a flag down
+                            goal = copy.deepcopy(item)
                             item["status"] = "running"
                             item["started_at"] = time.time()
-                            goal = copy.deepcopy(item)
                             break
             if not goal:
                 self._autonomy_stop.wait(poll)
@@ -1070,7 +1091,16 @@ class NOVAApp:
             steps = goal.get("steps") or []
             max_steps = int(goal.get("max_steps") or settings.AUTONOMY_MAX_STEPS)
             start_index = int(goal.get("cursor") or 0)
-            result = self.goal_runner.run(steps, max_steps=max_steps, start_index=start_index)
+            
+            with self._execution_lock:
+                if goal.get("status") == "approved_for_step":
+                    # Bypass guardrails for just ONE step
+                    self.autonomy_runner.confirm_callback = lambda p: True
+                    result = self.autonomy_runner.run(steps, max_steps=max_steps, start_index=start_index)
+                    # Restore callback
+                    self.autonomy_runner.confirm_callback = _autonomy_confirm
+                else:
+                    result = self.autonomy_runner.run(steps, max_steps=max_steps, start_index=start_index)
 
             status = "completed" if result.status == "completed" else "paused"
             if result.status == "stopped" and "Cycle detected" in result.reason:
@@ -1079,6 +1109,8 @@ class NOVAApp:
                 status = "paused"
             if result.status == "failed":
                 status = "failed"
+            if result.status == "blocked":
+                status = "awaiting_confirmation"
 
             with self._goal_lock:
                 for item in self._goals:
@@ -1413,6 +1445,25 @@ class NOVAApp:
         config.constants so a project rename requires only one file change.
         """
         text = user_text.strip().lower()
+        
+        def cmd(c: str) -> bool:
+            return text.startswith(f"/{c}")
+            
+        if cmd("approve_goal"):
+            parts = user_text.strip().split()
+            candidate_id = parts[1] if len(parts) > 1 else None
+            with self._goal_lock:
+                for goal in self._goals:
+                    if candidate_id and goal["id"] == candidate_id and goal["status"] == "awaiting_confirmation":
+                        goal["status"] = "approved_for_step"
+                        self._save_goals()
+                        return f"Goal {candidate_id} approved for next step."
+                    elif not candidate_id and goal["status"] == "awaiting_confirmation":
+                        goal["status"] = "approved_for_step"
+                        self._save_goals()
+                        return f"Goal {goal['id']} approved for next step."
+            return "No matching goal awaiting confirmation."
+
         agent = AGENT_NAME.lower()
         if text in {"switch to work mode", "work mode", "switch to work"}:
             state = self.switch_session(DEFAULT_SESSION_WORK)

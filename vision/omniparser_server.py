@@ -95,6 +95,11 @@ class OmniParserServer:
             log_dir = Path("logs")
             log_dir.mkdir(exist_ok=True)
             log_path = log_dir / "omniparser_server.log"
+            if self.log_file:
+                try:
+                    self.log_file.close()
+                except Exception:
+                    pass
             self.log_file = log_path.open("a", encoding="utf-8")
             self.proc = subprocess.Popen(
                 self.command,
@@ -116,7 +121,13 @@ class OmniParserServer:
             print(f"[omniparser] waiting for server startup (attempt {attempt}, sleeping {wait:.0f}s)…")
             time.sleep(wait)
 
-        print("[omniparser] server did not become healthy within startup timeout — continuing anyway")
+        print("[omniparser] server did not become healthy within startup timeout — killing and continuing anyway")
+        if self.proc:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:

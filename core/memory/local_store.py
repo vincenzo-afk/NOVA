@@ -21,10 +21,12 @@ class LocalMemoryStore:
         self.collection_name = collection_name
         self.embedding_model = embedding_model
         self._items: list[dict] = []
+        self._item_hashes: set[str] = set()
         self._client = None
         self._collection = None
         self._embedder: EmbeddingBackend | None = None
         self._use_chroma = self._init_chroma()
+        self._chroma_retry_time = 0.0
 
     def _init_chroma(self) -> bool:
         try:
@@ -53,13 +55,22 @@ class LocalMemoryStore:
         return self._collection.query(**kwargs)
 
     def _dedup_exists(self, hash_id: str) -> bool:
+        import time
         if not self._use_chroma:
-            return any(i["id"] == hash_id for i in self._items)
+            if time.time() > self._chroma_retry_time:
+                self._use_chroma = self._init_chroma()
+            
+        if not self._use_chroma:
+            return hash_id in self._item_hashes
         try:
             data = self._chroma_get(ids=[hash_id])
-            return bool(data.get("ids"))
+            if data and data.get("ids"):
+                return True
+            return hash_id in self._item_hashes
         except Exception:
-            return False
+            self._use_chroma = False
+            self._chroma_retry_time = time.time() + 60.0
+            return hash_id in self._item_hashes
 
     def add(self, text: str, session_id: str, metadata: dict | None = None) -> dict:
         hash_id = hashlib.sha256(f"{session_id}:{text}".encode("utf-8")).hexdigest()
@@ -95,8 +106,9 @@ class LocalMemoryStore:
                 )
                 return {"status": "ok", "id": hash_id}
             except Exception:
-                # fallback to in-memory if vector store fails
+                import time
                 self._use_chroma = False
+                self._chroma_retry_time = time.time() + 60.0
 
         self._items.append(
             {
@@ -106,6 +118,7 @@ class LocalMemoryStore:
                 "metadata": payload,
             }
         )
+        self._item_hashes.add(hash_id)
         return {"status": "ok", "id": hash_id}
 
     def search(self, query: str, session_id: str, top_k: int = 20) -> list[dict]:
@@ -135,7 +148,9 @@ class LocalMemoryStore:
                     )
                 return output
             except Exception:
+                import time
                 self._use_chroma = False
+                self._chroma_retry_time = time.time() + 60.0
 
         q_terms = set(query.lower().split())
         scored = []
@@ -163,7 +178,9 @@ class LocalMemoryStore:
                     for idx in range(len(ids))
                 ]
             except Exception:
+                import time
                 self._use_chroma = False
+                self._chroma_retry_time = time.time() + 60.0
 
         return [
             {"id": i["id"], "text": i["text"], "metadata": i["metadata"]}

@@ -22,13 +22,7 @@ from core.memory.local_store import LocalMemoryStore
 from core.memory.mem0_client import Mem0Client
 
 
-# Patterns that are common prompt-injection signatures (fix 7.2)
-_INJECTION_PATTERNS = [
-    re.compile(r"ignore (all |previous )?instructions?", re.IGNORECASE),
-    re.compile(r"you are now", re.IGNORECASE),
-    re.compile(r"system prompt", re.IGNORECASE),
-    re.compile(r"<\|.*?\|>"),  # token delimiters
-]
+from core.think.reasoning import detect_prompt_injection
 
 _MAX_MEMORY_TEXT_LEN = 4000  # cap memory entries to prevent runaway growth
 
@@ -36,8 +30,9 @@ _MAX_MEMORY_TEXT_LEN = 4000  # cap memory entries to prevent runaway growth
 def _sanitize_memory_text(text: str) -> str:
     """Strip or truncate suspicious injection content before persisting."""
     truncated = text[:_MAX_MEMORY_TEXT_LEN]
-    for pattern in _INJECTION_PATTERNS:
-        truncated = pattern.sub("[filtered]", truncated)
+    is_injected, reason = detect_prompt_injection(truncated)
+    if is_injected:
+        return f"[filtered memory injection: {reason}]"
     return truncated
 
 
@@ -64,9 +59,11 @@ class MemoryRouter:
         with self._sync_lock:  # fix 2.2: lock before mutating shared state
             if hash_id in self._seen_hashes:
                 return {"status": "duplicate", "id": hash_id}
-            self._seen_hashes.add(hash_id)
 
         local_result = self.local.add(safe_text, session_id, metadata)
+        if local_result.get("status") in {"ok", "duplicate"}:
+            with self._sync_lock:
+                self._seen_hashes.add(hash_id)
 
         if self._online:
             self.mem0.add(safe_text, session_id, metadata)

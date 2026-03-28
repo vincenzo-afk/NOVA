@@ -21,41 +21,11 @@ WORKDIR /app
 # -----------------------------------
 FROM base AS deps
 
-COPY requirements.txt .
+COPY requirements.lock .
 
 # Install Python deps — skip Windows-only packages
 RUN python -m pip install --upgrade pip && \
-    python -m pip install --no-cache-dir \
-        openai==1.3.5 \
-        google-generativeai \
-        faster-whisper \
-        pyttsx3 \
-        gTTS \
-        pynput \
-        Pillow==11.3.0 \
-        opencv-python-headless==4.8.1.78 \
-        numpy==1.26.4 \
-        pyautogui \
-        playwright \
-        requests==2.32.5 \
-        beautifulsoup4 \
-        duckduckgo-search \
-        rank-bm25==0.2.2 \
-        mem0ai \
-        chromadb \
-        sentence-transformers \
-        pypdf \
-        python-docx \
-        qrcode[pil] \
-        rich==14.3.3 \
-        APScheduler==3.10.4 \
-        SQLAlchemy==2.0.29 \
-        pydantic==2.12.5 \
-        python-dotenv==1.0.1 \
-        loguru \
-        psutil==5.9.3 \
-        huggingface_hub==0.36.2 \
-        pytest==8.4.2
+    python -m pip install --no-cache-dir -r requirements.lock
 
 # Install Playwright browsers
 RUN python -m playwright install chromium --with-deps || true
@@ -79,5 +49,8 @@ ENV PYTHONUNBUFFERED=1 \
     AUTONOMY_ENABLED=false
 
 EXPOSE 7860
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD ps aux | grep 'python3 main.py' | grep -v grep || exit 1
 
 CMD ["python3", "main.py"]
