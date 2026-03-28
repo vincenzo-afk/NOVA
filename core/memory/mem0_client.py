@@ -27,6 +27,7 @@ class Mem0Client:
         if not self.api_key:
             return
         # Try multiple possible SDKs/clients (mem0 is evolving).
+        last_exc: Exception | None = None
         for module_name, ctor_name in (
             ("mem0ai", "MemoryClient"),
             ("mem0ai", "Client"),
@@ -41,8 +42,17 @@ class Mem0Client:
                 self._client = ctor(api_key=self.api_key)
                 self._remote_enabled = True
                 return
-            except Exception:
+            except Exception as exc:
+                last_exc = exc
                 continue
+        try:
+            from utils.logger import get_logger
+            get_logger(__name__).warning(
+                "mem0 remote init failed; using local fallback only: %s",
+                last_exc,
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _call_with_variants(fn, **kwargs):

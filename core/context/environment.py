@@ -123,9 +123,39 @@ _ENVIRONMENT_CACHE: dict = {}
 _ENVIRONMENT_CACHE_TTL = 10.0
 _ENVIRONMENT_CACHE_TIME = 0.0
 _ENVIRONMENT_LOCK = threading.RLock()
+_REFRESH_INFLIGHT = False
+
+
+def _compute_snapshot(include_clipboard: bool) -> dict:
+    clipboard = _get_clipboard()[:1000] if include_clipboard else ""
+    app, title = _foreground_app_and_title()
+    return {
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "cwd": os.getcwd(),
+        "os": platform.platform(),
+        "hostname": socket.gethostname(),
+        "network": _network_status(),
+        "clipboard": clipboard,
+        "foreground_app": app,
+        "window_title": title,
+        "battery_pct": _battery_pct(),
+        "last_active_file": _last_active_file(clipboard) if include_clipboard else None,
+    }
+
+
+def _refresh_background(include_clipboard: bool) -> None:
+    global _ENVIRONMENT_CACHE, _ENVIRONMENT_CACHE_TIME, _REFRESH_INFLIGHT
+    try:
+        snapshot = _compute_snapshot(include_clipboard=include_clipboard)
+        with _ENVIRONMENT_LOCK:
+            _ENVIRONMENT_CACHE = dict(snapshot)
+            _ENVIRONMENT_CACHE_TIME = time.monotonic()
+    finally:
+        with _ENVIRONMENT_LOCK:
+            _REFRESH_INFLIGHT = False
 
 def snapshot_environment(include_clipboard: bool = True) -> dict:
-    global _ENVIRONMENT_CACHE, _ENVIRONMENT_CACHE_TIME
+    global _ENVIRONMENT_CACHE, _ENVIRONMENT_CACHE_TIME, _REFRESH_INFLIGHT
     now = time.monotonic()
     with _ENVIRONMENT_LOCK:
         if now - _ENVIRONMENT_CACHE_TIME < _ENVIRONMENT_CACHE_TTL:
@@ -137,20 +167,25 @@ def snapshot_environment(include_clipboard: bool = True) -> dict:
                 cached["last_active_file"] = None
             return cached
 
-        clipboard = _get_clipboard()[:1000] if include_clipboard else ""
-        app, title = _foreground_app_and_title()
-        result = {
-            "time": datetime.now().isoformat(timespec="seconds"),
-            "cwd": os.getcwd(),
-            "os": platform.platform(),
-            "hostname": socket.gethostname(),
-            "network": _network_status(),
-            "clipboard": clipboard,
-            "foreground_app": app,
-            "window_title": title,
-            "battery_pct": _battery_pct(),
-            "last_active_file": _last_active_file(clipboard) if include_clipboard else None,
-        }
+        # If we already have data, return stale data immediately and refresh asynchronously.
+        if _ENVIRONMENT_CACHE:
+            cached = dict(_ENVIRONMENT_CACHE)
+            cached["time"] = datetime.now().isoformat(timespec="seconds")
+            if not include_clipboard:
+                cached.pop("clipboard", None)
+                cached["last_active_file"] = None
+            if not _REFRESH_INFLIGHT:
+                _REFRESH_INFLIGHT = True
+                threading.Thread(
+                    target=_refresh_background,
+                    args=(include_clipboard,),
+                    daemon=True,
+                ).start()
+            return cached
+
+    # First call has no cache yet; compute synchronously.
+    result = _compute_snapshot(include_clipboard=include_clipboard)
+    with _ENVIRONMENT_LOCK:
         _ENVIRONMENT_CACHE = dict(result)
-        _ENVIRONMENT_CACHE_TIME = now
-        return result
+        _ENVIRONMENT_CACHE_TIME = time.monotonic()
+    return result

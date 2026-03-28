@@ -62,6 +62,7 @@ services:
       - ./exports:/app/exports
       - ./logs:/app/logs
       - ./assets:/app/assets
+      - ./.jarvis:/app/.jarvis
       - ./.jarvis_sessions:/app/.jarvis_sessions
     restart: unless-stopped
     stdin_open: true

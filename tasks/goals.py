@@ -81,6 +81,7 @@ class GoalRunner:
         dry_run: bool = False,
         start_index: int = 0,
         on_step: Callable[[int, dict[str, Any]], None] | None = None,
+        confirm_callback: Callable[[str], bool] | None = None,
     ) -> GoalResult:
         guard = GoalRun(max_steps=max_steps)
         results: list[dict] = []
@@ -113,7 +114,7 @@ class GoalRunner:
             authorized = guardrails.authorize(
                 call,
                 risk,
-                confirm_callback=self.confirm_callback,
+                confirm_callback=confirm_callback if confirm_callback is not None else self.confirm_callback,
                 dry_run=dry_run,
             )
             if authorized.blocked:

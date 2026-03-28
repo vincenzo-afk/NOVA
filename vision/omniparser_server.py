@@ -36,7 +36,7 @@ def _safe_env(extra_pythonpath: str = "") -> dict[str, str]:
     Only passes PATH, PYTHONPATH, and HOME — never any API keys or tokens.
     """
     safe: dict[str, str] = {}
-    for key in ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "USERPROFILE"):
+    for key in ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "USERPROFILE", "LANG", "LC_ALL", "LC_CTYPE"):
         val = os.environ.get(key)
         if val:
             safe[key] = val
@@ -141,6 +141,8 @@ class OmniParserServer:
 
     def restart(self) -> None:
         self.stop()
+        self.auth_token = secrets.token_urlsafe(32)
+        self.command = self._build_default_command()
         self.ensure_running()
 
     def _build_default_command(self) -> list[str]:
