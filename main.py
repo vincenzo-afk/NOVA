@@ -8,13 +8,14 @@ import time
 from pathlib import Path
 import re
 import threading
-from collections import deque
+from collections import deque, OrderedDict
 from typing import Any, Generator
 from datetime import date
+import copy
 
 from pydantic import BaseModel, Field
 
-from config.constants import AGENT_NAME, DEFAULT_MEMORY_TOP_K, DEFAULT_SESSION_PERSONAL, DEFAULT_SESSION_WORK, DEFAULT_SYSTEM_PROMPT
+from config.constants import AGENT_NAME, DEFAULT_MEMORY_TOP_K, DEFAULT_SESSION_PERSONAL, DEFAULT_SESSION_WORK, DEFAULT_SYSTEM_PROMPT, MAX_CONTEXT_TOKENS
 from config.settings import SettingsError, settings
 from core.context.environment import snapshot_environment
 from core.emotion.engine import EmotionEngine
@@ -358,7 +359,7 @@ class NOVAApp:
         self._usage_lock = threading.Lock()  # Fix 3: Lock around usage caps
         
         # Add summary cache tracking (fix 6.1, 11)
-        self._summary_cache = __import__("collections").OrderedDict()  # Fix 11
+        self._summary_cache = OrderedDict()  # Fix 11
         self._summary_cache_lock = threading.Lock()  # fix 3.2
         self._last_snippet_hash: int | None = None
 
@@ -398,7 +399,16 @@ class NOVAApp:
             url=settings.OMNIPARSER_SERVER_URL,
             repo_dir=settings.OMNIPARSER_REPO_DIR,
         )
+        Path("assets").mkdir(parents=True, exist_ok=True)
+        Path("exports").mkdir(parents=True, exist_ok=True)
+        self._goals_file = Path(".jarvis/nova_goals.json")
+        self._goals_file.parent.mkdir(parents=True, exist_ok=True)
         self._goals: list[dict] = []
+        if self._goals_file.exists():
+            try:
+                self._goals = json.loads(self._goals_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
         self._goal_lock = threading.Lock()
         self._autonomy_stop = threading.Event()
         self._autonomy_thread: threading.Thread | None = None
@@ -429,8 +439,9 @@ class NOVAApp:
         try:
             from core.memory.backup import schedule_daily_backup
             schedule_daily_backup(self.scheduler)
-        except Exception:
-            pass
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Failed to schedule ChromaDB backup: %s", exc)
 
     def last_provider_label(self) -> str:
         return self.engine.last_provider
@@ -519,7 +530,7 @@ class NOVAApp:
             {
                 "session": self.session.current.name,
                 "session_id": self.session.current.session_id,
-                "active_cloud_keys": self.engine.pool.active_count(),
+                "active_cloud_keys": self.engine.pool.active_count() if self.engine.pool else 0,
                 "memory_mode": "online" if self.memory.online else "offline",
                 "provider_last": self.engine.last_provider,
                 "emotion": self.emotion.state,
@@ -727,22 +738,42 @@ class NOVAApp:
         return {"goal": goal, "status": "ok", "steps": steps, "raw": raw}
 
     def _add_goal(self, goal: str, max_steps: int = 20) -> dict:
-        plan = self._plan_goal(goal, max_steps=min(max_steps, 30))
-        if plan.get("status") != "ok":
-            return plan
         goal_id = f"goal_{int(time.time())}"
         record = {
             "id": goal_id,
             "goal": goal,
-            "steps": plan["steps"],
-            "status": "pending",
+            "steps": [],
+            "status": "planning",
             "created_at": time.time(),
             "max_steps": max_steps,
             "cursor": 0,
         }
         with self._goal_lock:
             self._goals.append(record)
+            self._persist_goals()
+
+        def background_plan():
+            plan = self._plan_goal(goal, max_steps=min(max_steps, 30))
+            with self._goal_lock:
+                for item in self._goals:
+                    if item.get("id") == goal_id:
+                        if plan.get("status") == "ok":
+                            item["steps"] = plan["steps"]
+                            item["status"] = "pending"
+                        else:
+                            item["status"] = "failed"
+                            item["last_result"] = plan
+                        self._persist_goals()
+                        break
+
+        self._summarize_executor.submit(background_plan)
         return record
+
+    def _persist_goals(self) -> None:
+        try:
+            self._goals_file.write_text(json.dumps(self._goals, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def _list_goals(self) -> list[dict]:
         with self._goal_lock:
@@ -754,6 +785,7 @@ class NOVAApp:
                 if item.get("id") == goal_id:
                     if item.get("status") == "pending":
                         item["status"] = "cancelled"
+                        self._persist_goals()
                         return {"goal_id": goal_id, "status": "cancelled"}
                     return {"goal_id": goal_id, "status": "not_pending"}
         return {"goal_id": goal_id, "status": "not_found"}
@@ -764,6 +796,7 @@ class NOVAApp:
                 if item.get("id") == goal_id:
                     if item.get("status") in {"paused", "failed"}:
                         item["status"] = "pending"
+                        self._persist_goals()
                         return {"goal_id": goal_id, "status": "pending"}
                     if item.get("status") == "completed":
                         return {"goal_id": goal_id, "status": "already_completed"}
@@ -951,7 +984,7 @@ class NOVAApp:
             self.omniparser.ensure_running()
         except Exception:
             pass
-        self.health.start(interval_seconds=60)
+        self.health.start(interval_seconds=settings.HEALTH_MONITOR_INTERVAL)
 
     def _start_watchers_if_enabled(self) -> None:
         if settings.PROACTIVE_WATCHER_ENABLED:
@@ -1013,7 +1046,7 @@ class NOVAApp:
                     if item.get("status") == "pending":
                         item["status"] = "running"
                         item["started_at"] = time.time()
-                        goal = __import__("copy").deepcopy(item)
+                        goal = copy.deepcopy(item)
                         break
             if not goal:
                 self._autonomy_stop.wait(poll)
@@ -1048,6 +1081,7 @@ class NOVAApp:
                             "results": result.results,
                             "next_index": result.next_index,
                         }
+                        self._persist_goals()
                         break
 
             message = build_goal_status_message(
@@ -1136,13 +1170,17 @@ class NOVAApp:
         try:
             from voice.tts_offline import speak as speak_offline
         except Exception:
-            return
+            speak_offline = None
             
         while True:
             text = self._tts_queue.get()
             if text is None:
                 self._tts_queue.task_done()
                 break
+                
+            if speak_offline is None:
+                self._tts_queue.task_done()
+                continue
                 
             # Fix 23: Add watchdog for TTS worker thread
             def run_speak():
@@ -1153,9 +1191,9 @@ class NOVAApp:
                     
             worker = threading.Thread(target=run_speak, daemon=True)
             worker.start()
-            worker.join(timeout=settings.GEMINI_TTS_TIMEOUT_SECONDS)
+            worker.join(timeout=settings.TTS_OFFLINE_WATCHDOG_SECONDS)
             if worker.is_alive():
-                print(f"[tts] Warning: TTS worker hung after {settings.GEMINI_TTS_TIMEOUT_SECONDS}s, dropping item.")
+                print(f"[tts] Warning: TTS worker hung after {settings.TTS_OFFLINE_WATCHDOG_SECONDS}s, dropping item.")
             
             self._tts_queue.task_done()
 
@@ -1223,7 +1261,7 @@ class NOVAApp:
             self.dispatcher.register("adb.keyevent", self.adb.keyevent, ADBKeyEventArgs)
             self.dispatcher.register("adb.pull", self.adb.pull, ADBPullArgs)
             self.dispatcher.register("adb.push", self.adb.push, ADBPushArgs)
-            self.dispatcher.register("adb.send_sms", self.adb.send_sms, ADBSmsArgs)
+            self.dispatcher.register("adb.send_sms", self._adb_send_sms, ADBSmsArgs)
             self.dispatcher.register("adb.notifications_dump", self.adb.notifications_dump, EmptyArgs)
             self.dispatcher.register("adb.sms_dump", self.adb.sms_dump, EmptyArgs)
             self.dispatcher.register("adb.screenshot_to_local", self.adb.screenshot_to_local, EmptyArgs)
@@ -1302,11 +1340,11 @@ class NOVAApp:
         # Fix 2.9: Check total token count and trim if needed
         all_messages = [context_message, *recent]
         try:
-            total_tokens = estimate_tokens_from_messages(all_messages)
-            # If exceeding ~8000 tokens, drop oldest raw turns beyond what ContextTrimmer handles
-            if total_tokens > 8000 and len(recent) > 2:
-                # Keep at least 2 recent turns, drop the rest
-                keep_count = max(2, len(recent) - (total_tokens - 8000) // 500)
+            total_tokens = estimate_tokens_from_messages(all_messages) + estimate_tokens(system_prompt)
+            # If exceeding MAX_CONTEXT_TOKENS, drop oldest raw turns beyond what ContextTrimmer handles
+            if total_tokens > MAX_CONTEXT_TOKENS and len(recent) > 2:
+                # Naive approximation: 1 turn = 500 tokens
+                keep_count = max(2, len(recent) - (total_tokens - MAX_CONTEXT_TOKENS) // 500)
                 recent = recent[-keep_count:]
                 all_messages = [context_message, *recent]
         except Exception:
@@ -1319,11 +1357,17 @@ class NOVAApp:
         if not text.strip():
             return ""
         
-        # Check if we have a cached summary for this text
         text_hash = hash(text)
         with self._summary_cache_lock:
             if text_hash in self._summary_cache:
                 self._summary_cache.move_to_end(text_hash)  # Keep LRU fresh
+                return self._summary_cache[text_hash]
+                
+        # Fix 4: Sleep briefly and check cache again in case the background thread produced it
+        time.sleep(0.5)
+        with self._summary_cache_lock:
+            if text_hash in self._summary_cache:
+                self._summary_cache.move_to_end(text_hash)
                 return self._summary_cache[text_hash]
         
         # If no cache, return truncated text (will be summarized in background)
@@ -1360,10 +1404,10 @@ class NOVAApp:
         """
         text = user_text.strip().lower()
         agent = AGENT_NAME.lower()
-        if text in {"switch to work mode", "work mode"}:
+        if text in {"switch to work mode", "work mode", "switch to work"}:
             state = self.switch_session(DEFAULT_SESSION_WORK)
             return f"Switched to {state.name} ({state.session_id})."
-        if text in {"switch to personal mode", "personal mode"}:
+        if text in {"switch to personal mode", "personal mode", "switch to personal"}:
             state = self.switch_session(DEFAULT_SESSION_PERSONAL)
             return f"Switched to {state.name} ({state.session_id})."
         if text in {"reset context", "clear context"}:
@@ -1387,6 +1431,7 @@ class NOVAApp:
         if text in {"toggle mute", "mute toggle"}:
             now_muted = self.toggle_mute()
             return "Muted." if now_muted else "Unmuted."
+        # Fix 13: the match uses lowercased text, but split uses original user_text case
         if re.match(r"^switch session\s+.+$", text):
             name = user_text.strip().split(maxsplit=2)[-1]
             state = self.switch_session(name)
@@ -1460,15 +1505,15 @@ class NOVAApp:
         )
         self.memory.sync_pending(self.session.current.session_id)
 
+    def _adb_send_sms(self, phone_number: str, body: str) -> str:
+        """Fix 10: Enforce allowlist for SMS delivery."""
+        if phone_number not in settings.ALLOWED_PHONE_NUMBERS:
+            return f"Error: {phone_number} is not in settings.ALLOWED_PHONE_NUMBERS"
+        return self.adb.send_sms(phone_number, body)
+
     def _track_usage(self, system_prompt: str, history: list[dict], user_text: str, assistant_text: str) -> None:
-        import functools
-
-        @functools.lru_cache(maxsize=2000)
-        def _cached_token_count(content: str) -> int:
-            return estimate_tokens(content)
-
         input_tokens = estimate_tokens(system_prompt) + estimate_tokens(user_text)
-        input_tokens += sum(_cached_token_count(str(m.get("content", ""))) for m in history)
+        input_tokens += sum(estimate_tokens(str(m.get("content", ""))) for m in history)
         output_tokens = estimate_tokens(assistant_text)
 
         session_id = self.session.current.session_id
