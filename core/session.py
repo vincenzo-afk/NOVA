@@ -85,8 +85,13 @@ class SessionManager:
             if tmp_dev is not None and dst_dev is not None and tmp_dev != dst_dev:
                 raise OSError("temporary file and destination are on different devices; atomic replace not guaranteed")
             tmp_path.replace(path)
-        except Exception:
-            pass
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Session persist failed for %s: %s",
+                getattr(session, "name", "unknown"),
+                exc,
+            )
 
     def _load_session(self, name: str) -> SessionState | None:
         """Load session history from JSON file if it exists (fix 2.6)."""

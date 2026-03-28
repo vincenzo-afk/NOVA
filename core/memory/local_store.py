@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+import threading
 from typing import Any
 
 from utils.embeddings import EmbeddingBackend, get_embedder
@@ -25,6 +26,7 @@ class LocalMemoryStore:
         self._client = None
         self._collection = None
         self._embedder: EmbeddingBackend | None = None
+        self._chroma_init_lock = threading.Lock()
         self._use_chroma = self._init_chroma()
         self._chroma_retry_time = 0.0
 
@@ -58,9 +60,11 @@ class LocalMemoryStore:
         import time
         if not self._use_chroma:
             if time.time() > self._chroma_retry_time:
-                self._use_chroma = self._init_chroma()
-                if not self._use_chroma:
-                    self._chroma_retry_time = time.time() + 60.0
+                with self._chroma_init_lock:
+                    if not self._use_chroma and time.time() > self._chroma_retry_time:
+                        self._use_chroma = self._init_chroma()
+                        if not self._use_chroma:
+                            self._chroma_retry_time = time.time() + 60.0
             
         if not self._use_chroma:
             return hash_id in self._item_hashes
@@ -77,7 +81,9 @@ class LocalMemoryStore:
     def add(self, text: str, session_id: str, metadata: dict | None = None) -> dict:
         import time
         if not self._use_chroma and time.time() > self._chroma_retry_time:
-            self._use_chroma = self._init_chroma()
+            with self._chroma_init_lock:
+                if not self._use_chroma and time.time() > self._chroma_retry_time:
+                    self._use_chroma = self._init_chroma()
 
         hash_id = hashlib.sha256(f"{session_id}:{text}".encode("utf-8")).hexdigest()
         if self._dedup_exists(hash_id):

@@ -76,8 +76,10 @@ class GoalRunner:
         self.step_timeout_seconds = max(1.0, float(step_timeout_seconds))
         self._sleep_fn = sleep_fn
         self._executor = ThreadPoolExecutor(max_workers=1)
+        self._closed = False
 
     def close(self) -> None:
+        self._closed = True
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
@@ -136,7 +138,22 @@ class GoalRunner:
                 )
 
             guard.record(tool, args)
-            future = self._executor.submit(self.dispatcher.execute, call, None, None, dry_run, True)
+            if self._closed:
+                return GoalResult(
+                    status="failed",
+                    reason="runner_closed",
+                    results=results,
+                    next_index=idx,
+                )
+            try:
+                future = self._executor.submit(self.dispatcher.execute, call, None, None, dry_run, True)
+            except RuntimeError:
+                return GoalResult(
+                    status="failed",
+                    reason="runner_closed",
+                    results=results,
+                    next_index=idx,
+                )
             try:
                 result = future.result(timeout=self.step_timeout_seconds)
             except FuturesTimeout:

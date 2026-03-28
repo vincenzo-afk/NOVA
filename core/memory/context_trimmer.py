@@ -39,7 +39,7 @@ class ContextTrimmer:
 
         compressed = summarizer(snippet) if summarizer else snippet[:700]
         if not str(compressed).strip():
-            compressed = snippet[:700]
+            return "", recent
 
         with self._lock:
             latest = self.summaries.get(session_id, "")

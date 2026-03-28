@@ -181,7 +181,9 @@ class Dispatcher:
         try:
             self._consume_token()
         except RateLimitedError as exc:
-            return {"status": "rate_limited", "reason": str(exc)}
+            result = {"status": "rate_limited", "reason": str(exc)}
+            guardrails.log(tool_call, auth, result=result, status="rate_limited", confirmed_by="system")
+            return result
 
         try:
             result = fn(**validated.model_dump())

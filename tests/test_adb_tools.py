@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from control.adb.adb_client import ADBClient
 from control.adb.qr_pairing import QRPairing
 from control.adb.watcher import PhoneWatcher
 from control.adb import tailscale
@@ -88,3 +89,83 @@ def test_phone_watcher_summarizes_notifications_and_sms():
     )
     assert "new SMS activity" in summary
     assert "+15551234567" in summary
+
+
+def test_adb_client_send_sms_builds_structured_args(monkeypatch):
+    adb = ADBClient(device="emulator-5554")
+    calls: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr("config.settings.settings.ALLOWED_PHONE_NUMBERS", [])
+    monkeypatch.setattr(adb, "shell", lambda *args: calls.append(args) or "ok")
+
+    out = adb.send_sms("+15551230000", "hello world")
+
+    assert out == "ok"
+    assert calls == [
+        (
+            "am",
+            "start",
+            "-a",
+            "android.intent.action.SENDTO",
+            "-d",
+            "sms:+15551230000",
+            "--es",
+            "sms_body",
+            "hello world",
+            "--ez",
+            "exit_on_sent",
+            "true",
+        )
+    ]
+
+
+def test_adb_client_notifications_dump_calls_dumpsys(monkeypatch):
+    adb = ADBClient()
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(adb, "shell", lambda *args: calls.append(args) or "dump")
+
+    out = adb.notifications_dump()
+
+    assert out == "dump"
+    assert calls == [("dumpsys", "notification")]
+
+
+def test_phone_watcher_poll_sms_alerts_only_on_change():
+    class _FakeADB:
+        def __init__(self):
+            self.calls = 0
+
+        def sms_dump(self):
+            self.calls += 1
+            return "Row: address=+15550001 body=Ping"
+
+    alerts: list[str] = []
+    watcher = PhoneWatcher(adb=_FakeADB(), on_alert=alerts.append)
+
+    watcher._poll_sms()
+    watcher._poll_sms()
+
+    assert len(alerts) == 1
+    assert "new SMS activity" in alerts[0]
+
+
+def test_phone_watcher_tick_calls_polls_when_device_online(monkeypatch):
+    calls: list[str] = []
+
+    class _FakeADB:
+        def devices(self):
+            return ["emulator-5554"]
+
+        def screenshot_to_local(self, _path):
+            return _path
+
+    watcher = PhoneWatcher(adb=_FakeADB(), on_alert=lambda _m: None)
+
+    monkeypatch.setattr("control.adb.watcher.NetworkState.is_online", lambda: True)
+    monkeypatch.setattr(watcher, "_poll_notifications", lambda: calls.append("notifications"))
+    monkeypatch.setattr(watcher, "_poll_sms", lambda: calls.append("sms"))
+    monkeypatch.setattr("control.adb.watcher.analyze_image", lambda _b: {})
+
+    watcher._tick()
+
+    assert calls == ["notifications", "sms"]

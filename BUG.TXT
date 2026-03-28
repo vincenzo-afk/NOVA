@@ -1,8 +1,6 @@
-Here is the full technical audit of the NOVA project as it stands today, covering only issues found in the current codebase that are not already addressed by BUG.TXT.
+Here's the full technical audit of the NOVA codebase, covering only issues **not already listed in BUG.TXT**.---
 
----
-
-## NOVA — Full Technical Audit Report (Current Codebase)
+## NOVA — Technical Audit Report (New Issues Only)
 
 ---
 
@@ -10,160 +8,102 @@ Here is the full technical audit of the NOVA project as it stands today, coverin
 
 ---
 
-**BUG-NEW-01 — `RoundRobinPool` has no thread-safety for `_keys` and `_index`**
-Severity: Major | Priority: High
-
-`get_next()`, `mark_rate_limited()`, `mark_dead()`, and `mark_success()` all mutate `_keys` list entries and `_index` without any lock. When `LLMEngine.ask_stream()` is called concurrently from multiple threads (e.g., autonomy loop and a CLI user simultaneously), `record.failures += 1` is a non-atomic read-modify-write and `self._index = (self._index + 1) % total` is a non-atomic increment. This can corrupt key state and cause pool exhaustion even when live keys remain.
-
-Fix: Add a `threading.RLock` to `RoundRobinPool.__init__` and wrap all public methods that read or write `_keys` or `_index`.
-
----
-
-**BUG-NEW-02 — `utils/logger.py` has a TOCTOU race in `_ensure_logger_initialized`**
+**BUG-01 — `_commit_memory_async` has a TOCTOU race on `_memory_jobs_inflight`**
 Severity: Major | Priority: High
 
 ```python
-_logger_initialized = False
-def _ensure_logger_initialized():
-    global _logger_initialized
-    if not _logger_initialized:
-        _logger_initialized = True
-        setup_logger()
+# main.py — no lock around this check+increment
+if self._memory_jobs_inflight >= self._max_background_memory_jobs:
+    return
+self._memory_jobs_inflight += 1
+self._memory_executor.submit(_job)
 ```
 
-Two threads can simultaneously read `_logger_initialized = False`, both enter the block, both call `setup_logger()`, and loguru adds duplicate sinks. Every subsequent log line is written twice to stderr and twice to the rotating file, doubling I/O and causing confusing duplicate output. The fix is a `threading.Lock` around this block.
+Two threads calling `ask_stream` concurrently can both read the same value of `_memory_jobs_inflight`, both pass the guard, and both submit, potentially exceeding `_max_background_memory_jobs`. The summary inflight counter uses `self._summary_submit_lock` correctly, but the memory inflight counter has no equivalent lock.
+
+**Fix:** Wrap the check-and-increment for `_memory_jobs_inflight` inside a dedicated lock (reuse `_summary_submit_lock` or create `_memory_submit_lock`).
 
 ---
 
-**BUG-NEW-03 — `tray.py::on_health` retries the exact same failing operation**
+**BUG-02 — `GoalRunner._executor` can receive submissions after `close()` during shutdown**
+Severity: Major | Priority: High
+
+In `NOVAApp.shutdown()`:
+```python
+self._stop_autonomy_loop()   # joins thread with timeout=2s only
+...
+self.goal_runner.close()     # shuts down GoalRunner._executor
+self.autonomy_runner.close()
+```
+
+`_stop_autonomy_loop()` joins with a 2-second timeout. If the autonomy thread is blocked on a long-running tool step (up to `GOAL_STEP_TIMEOUT_SECONDS = 60s`), it outlives the join. Then `goal_runner.close()` shuts down the executor, and when the autonomy thread's step finally finishes, its `_executor.submit()` call raises `RuntimeError: cannot schedule new futures after shutdown`.
+
+**Fix:** Before closing executors, wait for the autonomy lock to drain: `self._autonomy_execution_lock.acquire(timeout=5)` after stopping the thread, or pass the `_shutting_down` event into `GoalRunner` and check it before submitting.
+
+---
+
+**BUG-03 — Off-by-one in `approved_for_step` cursor advancement**
+Severity: Major | Priority: High
+
+In `_autonomy_loop`:
+```python
+result = self.autonomy_runner.run(
+    steps[start_index : start_index + 1],
+    max_steps=1,
+    start_index=0,
+)
+result.next_index = start_index + (1 if result.status == "completed" else 0)
+```
+
+If `start_index >= len(steps)`, `steps[start_index:start_index+1]` is an empty list. The runner completes instantly with `next_index=0`. Then the code sets `result.next_index = start_index + 1` (e.g. `len(steps) + 1`), writing an out-of-bounds cursor value to the persisted goal. The next poll of this goal finds `cursor > len(steps)` and the `GoalResult` immediately returns `completed` — but the goal record is left with a nonsensical cursor.
+
+**Fix:** Guard with `if start_index >= len(steps): mark completed directly`. Also clamp the cursor to `min(result.next_index, len(steps))` before persisting.
+
+---
+
+**BUG-04 — Background summarization writes empty string to `trimmer.summaries`, poisoning context**
+Severity: Major | Priority: Medium
+
+`_summarize_history()` returns `""` until the background job populates the cache. `ContextTrimmer.trim()` receives this empty string, detects it's blank, and falls back to `snippet[:700]` — raw truncated turn text — which it then stores in `trimmer.summaries[session_id]`. On subsequent calls the trimmer sees a "summary" that is actually raw turn text. The background job later stores the real summary, overwriting it. But for all messages between the first overflow and the background completion, the context contains uncompressed turn data, inflating token counts and degrading response quality.
+
+**Fix:** Don't store the fallback `snippet[:700]` in `trimmer.summaries`. In `trim()`, if `compressed` is empty, return `("", recent)` rather than storing the raw snippet as the summary. The background job will populate the real summary before it's needed.
+
+---
+
+**BUG-05 — `tray.py::on_health` inner retry is still an identical call**
 Severity: Minor | Priority: Low
 
+From BUG.TXT's BUG-NEW-03: the fix was acknowledged but looking at the current `tray.py`:
 ```python
 def on_health(_icon, _item):
     try:
         _notify("NOVA Health", _format_health_summary(agent))
-    except Exception:
-        try:
-            _notify("NOVA Health", _format_health_summary(agent))  # identical call
-        except Exception as exc:
-            _notify("NOVA Health", f"Health unavailable: {exc}")
+    except Exception as exc:
+        _notify("NOVA Health", f"Health unavailable: {exc}")
 ```
 
-The inner `try` block is an exact copy of the outer block. If the first call fails, the second call will fail for the same reason. The final `except` block is unreachable because the inner try catches the same exception and calls `_notify` again (which may also fail silently). This is clearly a copy-paste error.
-
-Fix: Remove the inner try block. The final except should call `_notify` directly.
+The outer `try`/`except` is now clean. This item is now **resolved**. However the `_format_health_summary` function references `agent.health.status_table()` with no guard — if `agent.health` is `None` (partial construction failure), this raises `AttributeError` which is caught and reported generically. No actual bug remaining, just a fragile error message path.
 
 ---
 
-**BUG-NEW-04 — `Dispatcher._validate_registration_signature` uses `bind_partial`, which doesn't catch extra schema fields**
-Severity: Major | Priority: High
-
-```python
-kwargs = {field_name: None for field_name in schema.model_fields.keys()}
-signature.bind_partial(**kwargs)
-```
-
-`bind_partial` only validates that the provided kwargs are *acceptable*, not that they are *sufficient*. A function `def fn(x: int)` registered with a schema containing fields `{x, y}` will pass this check because `bind_partial(x=None, y=None)` succeeds (Python's `bind_partial` accepts extra kwargs without error for `**kwargs` functions and also doesn't raise for regular kwargs if they partially bind). More critically, a function with `**kwargs` will always pass regardless of schema mismatch.
-
-The real failure is this: if the function does *not* accept `**kwargs`, the `fn(**validated.model_dump())` call in `execute()` will raise `TypeError` at runtime, which is now caught and returned as `"tool_signature_error"`. But the registration-time validation silently passes when it should fail.
-
-Fix: Use `signature.bind(**kwargs)` in `_validate_registration_signature`, which validates all fields are accepted and no unexpected extras are provided.
-
----
-
-**BUG-NEW-05 — `MemoryRouter.sync_pending` always marks items as synced**
-Severity: Major | Priority: High
-
-```python
-result = self.mem0.add(item["text"], session_id, item["metadata"])
-if result is not None:
-    synced.append(item)
-else:
-    failed.append(item)
-```
-
-`Mem0Client.add()` always returns a `dict` — never `None`. When remote is available it returns `{"status": "ok", ...}`, when it falls back to local it returns `{"status": "ok", ...}` or `{"status": "duplicate", ...}`. The `result is not None` check is therefore always `True`, meaning failed items are never tracked in `failed` and are always removed from `_pending_sync` even when the sync silently failed internally. Offline memories that couldn't reach mem0 are dropped silently.
-
-Fix: Check `result.get("status") in {"ok"}` or catch exceptions specifically for the remote path.
-
----
-
-**BUG-NEW-06 — `GoalRunner.run()` creates a new `ThreadPoolExecutor` for every step**
-Severity: Major | Priority: High
-
-```python
-pool = ThreadPoolExecutor(max_workers=1)
-future = pool.submit(self.dispatcher.execute, call, None, None, dry_run, True)
-try:
-    result = future.result(timeout=self.step_timeout_seconds)
-...
-finally:
-    pool.shutdown(wait=False)
-```
-
-For a 20-step goal, this creates and destroys 20 thread pools. Each `ThreadPoolExecutor` spawns an OS thread that lingers until garbage collection. Under concurrent goal execution (autonomy + manual), this can exhaust thread limits. `pool.shutdown(wait=False)` also doesn't guarantee cleanup, and `cancel_futures=True` is conditionally applied only in Python 3.9+.
-
-Fix: Create one executor per `GoalRunner` instance in `__init__` and reuse it across steps.
-
----
-
-**BUG-NEW-07 — `QRPairing.local_ip()` leaks a socket on exception**
+**BUG-06 — `mark_rate_limited` reads `record.failures` outside the lock**
 Severity: Minor | Priority: Low
 
 ```python
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.connect(("8.8.8.8", 80))
-ip = sock.getsockname()[0]
-sock.close()
+# core/llm/roundrobin.py
+with self._lock:
+    record.failures += 1
+    ...
+
+# OUTSIDE the lock:
+get_logger(__name__).warning(
+    f"Key {label} is rate-limited (failure #{record.failures}); ..."
+)
 ```
 
-If `sock.connect()` raises an `OSError` (e.g., no network), the socket is never closed. Over multiple failed calls this leaks file descriptors.
+After the `with` block releases the lock, another thread can increment `record.failures` before the log statement reads it. The log will show an incorrect (stale or future) failure count. Not a correctness issue in practice, but a misleading audit trail.
 
-Fix: Wrap in a `try/finally` block or use the socket as a context manager.
-
----
-
-**BUG-NEW-08 — `_autonomy_loop` shallow-copies `_goals` but accesses dict references without locking**
-Severity: Major | Priority: Medium
-
-```python
-with self._goal_lock:
-    goals_snapshot = list(self._goals)
-
-for item in goals_snapshot:
-    if item.get("status") in {"pending", ...}:
-        candidate_id = item.get("id")
-```
-
-`list(self._goals)` creates a shallow copy — `item` is a reference to the same dict object still being mutated by `_on_goal_step_completed` in the background. Reading `item.get("status")` outside the lock is a data race. If another thread writes to that dict concurrently, the read may observe a partial update.
-
-Fix: Use `copy.deepcopy(self._goals)` inside the lock, or only read the `id` and `status` fields atomically inside the lock before releasing it.
-
----
-
-**BUG-NEW-09 — `_goal_plan_executor.shutdown(wait=True)` in `shutdown()` can hang indefinitely**
-Severity: Major | Priority: High
-
-```python
-self._goal_plan_executor.shutdown(wait=True, **kwargs)
-```
-
-If a background planning call is blocked waiting for an LLM response (network timeout can be 90 seconds per `LLMEngine`), `shutdown(wait=True)` will block the main thread for the full timeout duration. `app.shutdown()` is called on `SIGTERM` and `SIGINT`, so process termination is blocked.
-
-Fix: Use `shutdown(wait=False, cancel_futures=True)` and use `_shutting_down` event to abort in-flight planning calls.
-
----
-
-**BUG-NEW-10 — Session name collision in `_persist_session`**
-Severity: Minor | Priority: Medium
-
-```python
-safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in session.name)
-```
-
-Session names `"a.b"` and `"a_b"` both sanitize to `"a_b"`, causing them to share the same file path. The second session's history would overwrite the first's file silently.
-
-Fix: Use a hash suffix to disambiguate: `safe_name + "_" + hashlib.sha256(session.name.encode()).hexdigest()[:8]`.
+**Fix:** Capture `failure_count = record.failures` inside the `with` block and use it in the log.
 
 ---
 
@@ -171,37 +111,53 @@ Fix: Use a hash suffix to disambiguate: `safe_name + "_" + hashlib.sha256(sessio
 
 ---
 
-**CONN-NEW-01 — Telegram bot runs synchronous generator in async handler**
+**CONN-01 — Telegram `_stream_text` silently swallows exceptions from `ask_stream`**
 Severity: Major | Priority: High
 
 ```python
-for token in agent.ask_stream(prompt_text):
-    buffer += token
-    now = time.time()
-    if now - last_edit > 1.5:
-        await context.bot.edit_message_text(...)
+def _worker() -> None:
+    try:
+        for token in agent.ask_stream(prompt_text):
+            token_queue.put(token)
+    finally:
+        token_queue.put(None)  # exits loop, buffer is empty
 ```
 
-`agent.ask_stream()` is a synchronous generator. Calling it inside an `async def` handler with `python-telegram-bot` v20+ blocks the asyncio event loop for the entire duration of the LLM call. No other Telegram updates (commands, messages) can be processed while a response is being generated. In a busy bot, this causes request queuing and timeout errors.
+If `ask_stream` raises (e.g., `SettingsError`, unhandled `RuntimeError`), the `finally` block puts `None` and the main coroutine exits with `buffer = ""`, replacing the placeholder with `"(no output)"`. The user gets silent failure with no error context. The exception is completely lost.
 
-Fix: Run `ask_stream()` in a thread executor: `await asyncio.get_event_loop().run_in_executor(None, ...)` or rewrite `ask_stream` as an `async` generator.
+**Fix:** Catch exceptions in `_worker`, put an error string token before the `None` sentinel, or store the exception and re-raise it after the await loop.
 
 ---
 
-**CONN-NEW-02 — `LocalMemoryStore._dedup_exists` floods ChromaDB on startup**
+**CONN-02 — Telegram `on_export` has an unhandled `FileNotFoundError`**
 Severity: Minor | Priority: Medium
 
 ```python
-def _dedup_exists(self, hash_id: str) -> bool:
-    import time
-    if not self._use_chroma:
-        if time.time() > self._chroma_retry_time:
-            self._use_chroma = self._init_chroma()
+async def on_export(update, _context):
+    ...
+    path = agent.export_session("md")
+    with open(path, "rb") as file_handle:  # raises FileNotFoundError if disk full
+        await update.message.reply_document(...)
 ```
 
-`_chroma_retry_time` is initialized to `0.0`. Since `time.time()` is always greater than 0, every `add()` call before ChromaDB is available will attempt `_init_chroma()`. If `_init_chroma()` takes 200ms to fail (connection timeout), and `add()` is called frequently, this generates a continuous stream of connection attempts. The retry time is only set to `now + 60.0` in the `add()` method, not inside `_dedup_exists`.
+If the file write in `export_session` fails silently (disk full) and returns a path that doesn't exist, the `open()` call raises `FileNotFoundError`. This is unhandled in `on_export` and propagates to python-telegram-bot's default error handler, giving the user no feedback.
 
-Fix: Set `self._chroma_retry_time = time.time() + 60.0` inside `_dedup_exists` immediately after `_init_chroma()` fails.
+**Fix:** Wrap in `try/except` and reply with an error message.
+
+---
+
+**CONN-03 — `LocalMemoryStore._init_chroma()` is not thread-safe for concurrent reinit**
+Severity: Major | Priority: Medium
+
+```python
+# In add(), called from multiple threads simultaneously
+if not self._use_chroma and time.time() > self._chroma_retry_time:
+    self._use_chroma = self._init_chroma()
+```
+
+Two threads can concurrently read `self._use_chroma = False`, both enter `_init_chroma()`, and both attempt to create a `PersistentClient` and load `SentenceTransformer`. This doubles initialization work and can cause a race where `self._collection` and `self._embedder` are partially assigned from different invocations.
+
+**Fix:** Add a lock (e.g., `self._chroma_init_lock = threading.Lock()`) around the `_init_chroma` call path in `add()` and `_dedup_exists()`.
 
 ---
 
@@ -209,41 +165,35 @@ Fix: Set `self._chroma_retry_time = time.time() + 60.0` inside `_dedup_exists` i
 
 ---
 
-**PERF-NEW-01 — Web crawler has an unbounded queue**
+**PERF-01 — `UsageTracker._persist()` writes full JSON synchronously on every `add()`**
 Severity: Major | Priority: Medium
 
-```python
-for link in soup.find_all("a", href=True):
-    nxt = urljoin(url, link["href"])
-    if urlparse(nxt).netloc == domain and nxt not in seen:
-        queue.append((nxt, depth + 1))
-```
+Every call to `ask_stream` ends with `_track_usage` → `usage.add(...)` → `_persist()` which does a synchronous `Path.write_text()` of the entire usage JSON. Under high message throughput (autonomy loop running many steps), this means sequential full-file writes after each step. On spinning disk or a slow NFS mount this causes measurable latency spikes.
 
-A single page with 5,000 links (e.g., a Wikipedia article with extensive navigation) adds 5,000 entries to the queue before any of them are visited. `max_pages` limits total pages visited but not queue size. A crawler called with `max_pages=5` on a content-heavy page could queue thousands of URLs consuming significant memory and making the early termination condition unpredictable.
-
-Fix: Cap queue growth: `if len(queue) < max_pages * 10: queue.append(...)`.
+**Fix:** Debounce the write with a dirty flag and a background thread, or batch writes using `threading.Timer` to flush after a quiet period (e.g., 2 seconds of no `add()` calls).
 
 ---
 
-**PERF-NEW-02 — `ContextTrimmer.trim()` holds the lock while calling `summarizer()`**
+**PERF-02 — `_persist_goals()` called on every step completion with no batching**
 Severity: Minor | Priority: Medium
 
-```python
-with self._lock:
-    ...
-    compressed = summarizer(snippet) if summarizer else snippet[:700]
-```
+`_on_goal_step_completed()` calls `_persist_goals()` which writes the full `_goals` list to JSON on every step. A 20-step goal executing rapidly triggers 20 sequential file writes. Unlike `_persist_session()`, this does not use a temp-file-then-rename pattern, meaning a crash mid-write can corrupt the goals file.
 
-The RLock is held for the entire duration of the summarizer call. In production, `_summarize_history()` does a dict lookup (fast), but any future summarizer that makes a blocking call would stall all concurrent `trim()` calls. The summary computation should happen outside the lock, with only the write-back locked.
+**Fix:** Use the same atomic write pattern as `_persist_session` (temp file → rename). Consider debouncing to batch writes within a 500ms window.
 
 ---
 
-**PERF-NEW-03 — `_summarize_executor` and `_memory_executor` have no maximum queue size**
+**PERF-03 — Large document ingestion has no chunked embedding batching**
 Severity: Minor | Priority: Low
 
-Both `ThreadPoolExecutor(max_workers=1)` instances have unbounded work queues. Under sustained high message throughput (e.g., autonomy loop running many steps rapidly), `_commit_memory_async` and background summarization tasks can accumulate thousands of queued jobs before they're processed. This consumes memory and delays acknowledgment of memory writes.
+In `rag/doc_store.py`, `ingest()` embeds all chunks in one call:
+```python
+embeddings = self._embedder.encode([c.text for c in self._docs[filename]])
+```
 
-Fix: Use a bounded queue via a custom executor or track in-flight job count and skip new submissions if the queue is too deep.
+A 300-page PDF produces ~600 chunks. Passing all 600 to `SentenceTransformer.encode()` at once loads the full batch into memory and passes it to the model in one forward pass, which can exhaust RAM on devices with limited VRAM/CPU memory.
+
+**Fix:** Batch the embedding in chunks of, say, 32 or 64 at a time using a simple `for i in range(0, len(chunks), batch_size)` loop.
 
 ---
 
@@ -251,80 +201,73 @@ Fix: Use a bounded queue via a custom executor or track in-flight job count and 
 
 ---
 
-**SEC-NEW-01 — OmniParser auth token exposed in process command line**
-Severity: Major | Priority: High
+**SEC-01 — Input length not validated in Telegram or GUI (only CLI has the guard)**
+Severity: Critical | Priority: High
 
+`interfaces/cli.py` guards against excessively long input:
 ```python
-command = [
-    sys.executable, "-m", "vision.omniparser_app",
-    "--auth-token", self.auth_token,
-]
+if len(user_text) > 50_000:
+    ...
+    continue
 ```
 
-The auth token is passed as a command-line argument and is visible to all users on the system via `ps aux`, `/proc/<pid>/cmdline`, and system monitoring tools. On any multi-user system, this fully defeats the authentication mechanism.
+But `interfaces/telegram_bot.py` and `interfaces/gui/app.py` have no equivalent guard. A user (or attacker with Telegram access) can send a message of arbitrary length, which flows directly into `ask_stream` → `_context_messages` → `build_system_prompt`, potentially consuming enormous token budgets or causing OOM in the embedding stage.
 
-Fix: Pass the token via an environment variable set only in `_safe_env()`:
-```python
-env["OMNIPARSER_AUTH_TOKEN"] = self.auth_token
-```
-Then read it in `omniparser_app.py` with `os.environ.get("OMNIPARSER_AUTH_TOKEN")`.
+**Fix:** Apply the same 50,000-character guard (or a tighter limit) in `on_message` in the Telegram bot and in `send_message` in the GUI before calling `agent.ask_stream`.
 
 ---
 
-**SEC-NEW-02 — CLI and GUI PIN has no brute-force protection**
+**SEC-02 — PIN lockout file path is current-working-directory-relative**
 Severity: Major | Priority: High
 
 ```python
-if pin_hash:
-    entered = getpass.getpass("Enter CLI PIN to unlock NOVA: ")
-    if not _verify_pin(entered, pin_hash):
-        print("Access Denied.")
-        return
+# interfaces/cli.py
+lock_file = Path(CLI_PIN_LOCK_FILE)  # = ".jarvis/cli_pin.lock"
 ```
 
-There is no attempt counter, no lockout, no delay after failed attempts. An attacker with local access can try PINs programmatically by restarting the CLI in a loop. A 4-digit PIN has only 10,000 combinations and can be exhausted in seconds.
+`CLI_PIN_LOCK_FILE = ".jarvis/cli_pin.lock"` is a relative path. If NOVA is started from a different working directory (e.g., `python /opt/nova/main.py` from `/home/user`), the lock file is written to `/home/user/.jarvis/cli_pin.lock`. An attacker can bypass the lockout by simply launching the process from a fresh temp directory. The actual PIN hash file at a fixed user-home path is not bypassed, but the lockout timer is completely circumvented.
 
-Fix: Add an exponential delay after each failed attempt (e.g., `time.sleep(2 ** failed_attempts)`) and lock out after 5 consecutive failures by writing a lock file.
+**Fix:** Resolve the lockout path against an absolute base — either `Path.home() / ".jarvis/cli_pin.lock"` or `Path(__file__).resolve().parent / ".jarvis/cli_pin.lock"`.
 
 ---
 
-**SEC-NEW-03 — `approved_for_step` auto-confirms ALL remaining steps in a goal**
-Severity: Major | Priority: High
-
-In `_autonomy_loop`:
-```python
-if approved_for_step:
-    result = self.autonomy_runner.run(
-        steps, ...
-        confirm_callback=lambda _p: True,  # approves everything
-    )
-```
-
-When the user approves a single paused step with `/approve_goal`, the confirm callback is set to `lambda _p: True` for the entire remaining run. If the goal has 20 steps and step 5 required approval, steps 6–20 are all auto-approved and execute without user confirmation, even if they are high-risk tool calls. A malicious LLM response could embed destructive steps after the approved one.
-
-Fix: The `approved_for_step` flag should only override confirmation for the single next step (`start_index` to `start_index + 1`), then revert to `self._autonomy_confirm_callback` for all subsequent steps.
-
----
-
-**SEC-NEW-04 — `scrape_text` SSRF protection has no redirect following guard**
+**SEC-03 — Rate-limited tool calls are never written to the guardrails audit log**
 Severity: Major | Priority: Medium
 
-`_validate_url()` resolves the initial URL's hostname and blocks private IPs. However, if the server responds with an HTTP 301/302 redirect to `http://192.168.1.1/admin`, the `requests.get()` call will follow the redirect automatically and hit the internal address. The SSRF guard only validates the initial URL, not redirect destinations.
+In `dispatcher.py`:
+```python
+try:
+    self._consume_token()
+except RateLimitedError as exc:
+    return {"status": "rate_limited", "reason": str(exc)}
+```
 
-Fix: Pass `allow_redirects=False` and manually validate each redirect destination, or validate that the final response URL passes `_validate_url()`.
+The rate-limited return path bypasses `guardrails.log(...)`. Repeated high-frequency tool calls (e.g., an autonomy loop hammering `web.search`) that hit the rate limit leave no trace in `logs/guardrails_actions.jsonl`. The audit trail is incomplete, which matters for security review and anomaly detection.
+
+**Fix:** Call `guardrails.log(tool_call, risk, result, status="rate_limited", confirmed_by="system")` before returning from the rate-limited path.
 
 ---
 
-**SEC-NEW-05 — Plugin sandbox `exec` uses shared `restricted_globals` between AST check and execution**
-Severity: Minor | Priority: Medium
+**SEC-04 — `_persist_goals()` uses non-atomic write (no temp-file rename)**
+Severity: Major | Priority: Medium
 
 ```python
-_check_ast(source)
-code = compile(source, str(path), "exec")
-exec(code, restricted_globals)
+def _persist_goals(self) -> None:
+    self._goals_file.write_text(json.dumps(...), encoding="utf-8")
 ```
 
-`_check_ast` only inspects AST nodes statically. A plugin can pass AST inspection but use runtime techniques like `type.__subclasses__()`, accessing `__class__.__mro__` chains, or constructing strings and passing them to `eval` via overridden `__str__` methods. The sandbox provides a meaningful but not complete security boundary. Plugins should be explicitly documented as "trusted code only."
+If the process crashes or is killed mid-write, the goals JSON file is left partially written and becomes invalid JSON. On next startup, `json.loads()` raises `JSONDecodeError` which is caught and logged, but **the entire goal queue is silently lost**. This is a data-integrity risk for long-running autonomy workflows.
+
+**Fix:** Use the same atomic write pattern as `_persist_session`: write to a `.tmp` file, then `Path.replace()`.
+
+---
+
+**SEC-05 — `_PRIVATE_NETWORKS` in `web/scraper.py` is missing the `0.0.0.0/8` range**
+Severity: Minor | Priority: Low
+
+The SSRF blocklist covers RFC1918, loopback, link-local, and Tailscale ranges, but omits `0.0.0.0/8` (current network addresses). On some Unix systems, `http://0.0.0.0/` resolves to localhost, which would bypass the SSRF guard. It also omits `240.0.0.0/4` (reserved/broadcast ranges).
+
+**Fix:** Add `ipaddress.ip_network("0.0.0.0/8")` and `ipaddress.ip_network("240.0.0.0/4")` to `_PRIVATE_NETWORKS`.
 
 ---
 
@@ -332,56 +275,75 @@ exec(code, restricted_globals)
 
 ---
 
-**RISK-NEW-01 — `NOVAApp.__init__` has no partial-initialization guard in `shutdown()`**
-Severity: Major | Priority: High
-
-If any component in the `NOVAApp.__init__` chain raises before all attributes are set (e.g., `TaskScheduler()` fails on a locked SQLite DB, or `MemoryRouter()` raises), the partially constructed object may still have `shutdown()` called on it (e.g., by the signal handler). Accessing `self.scheduler.stop()` when `self.scheduler` was never assigned raises `AttributeError` in the shutdown path, hiding the original error.
-
-Fix: Initialize all attributes to `None` at the start of `__init__`, and add `if self.scheduler is not None:` guards in `shutdown()`.
-
----
-
-**RISK-NEW-02 — `_emergency_stop_paths()` called at module import time before settings are loaded**
+**RISK-01 — `_persist_session()` silently swallows all errors including disk-full**
 Severity: Major | Priority: High
 
 ```python
-# Module-level, executed at import
-_EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths()
+def _persist_session(self, session: SessionState) -> None:
+    try:
+        ...  # write to disk
+    except Exception:
+        pass  # ← completely silent
 ```
 
-`_emergency_stop_paths()` reads `settings.EMERGENCY_STOP_FILE`. The `guardrails.py` module is imported by `dispatcher.py`, which is imported by `main.py` before `settings` is fully validated. If `settings.py` fails to load `.env` (e.g., missing file), the emergency stop path uses defaults, but the `_EMERGENCY_STOP_FILE` module-level variable is frozen at that default and never updated if settings change. In tests, this means the emergency stop file path is computed before `monkeypatch` can override settings.
+If the disk is full, a permissions error occurs, or the session directory is deleted, `_persist_session` silently discards all session history from that point forward. The user has no indication their conversation is not being saved. Session recovery on restart will find no file and start fresh.
 
-Fix: Compute the paths lazily in `Guardrails.__init__` or via a property, not at module level.
+**Fix:** Log at `WARNING` level at minimum: `logging.getLogger(__name__).warning("Session persist failed for %s: %s", session.name, exc)`.
 
 ---
 
-**RISK-NEW-03 — Memory loss if `_summarize_executor` has a queued summary job when `shutdown()` is called**
+**RISK-02 — `NOVAApp.__init__` shuts down and recreates executors it just created**
 Severity: Minor | Priority: Medium
 
 ```python
-self._summarize_executor.shutdown(wait=False, **kwargs)
+# main.py
+self._summarize_executor = ThreadPoolExecutor(max_workers=1)   # created
+self._memory_executor    = ThreadPoolExecutor(max_workers=1)
+self._goal_plan_executor = ThreadPoolExecutor(max_workers=2)
+...
+self._summarize_executor.shutdown(wait=False)  # immediately destroyed
+self._memory_executor.shutdown(wait=False)
+self._goal_plan_executor.shutdown(wait=False)
+self._summarize_executor = ThreadPoolExecutor(max_workers=1)   # recreated
+self._memory_executor    = ThreadPoolExecutor(max_workers=1)
+self._goal_plan_executor = ThreadPoolExecutor(max_workers=2)
 ```
 
-Background summarization jobs that are queued but not yet started are discarded. The trimmer summary for the current session is then lost. On next startup, the context trimmer starts fresh with an empty summary, losing the compressed history of the conversation. The `wait=False` is intentional (to avoid blocking on shutdown), but there's no mechanism to flush or persist the pending summary before abandoning the executor.
+This pattern creates three thread pools, immediately shuts them down, and recreates identical ones. The first set is dead code. While harmless at runtime, it adds confusion, wastes OS thread creation overhead, and leaves a `shutdown(wait=False)` call that could theoretically race with any stray reference to the first pool.
 
-Fix: Before calling `shutdown()`, attempt a short `wait=True` with a timeout, or persist the current `trimmer.summaries` dict to disk as part of session persistence.
+**Fix:** Remove the first creation block and the `shutdown` calls; keep only the final assignments.
 
 ---
 
-**RISK-NEW-04 — `core/session.py` cross-device rename check can silently fail**
+**RISK-03 — `_summarize_history_background` exceptions are silently swallowed on `engine.ask()` failure**
 Severity: Minor | Priority: Low
 
 ```python
-try:
-    if tmp_path.stat().st_dev != sessions_dir.stat().st_dev:
-        raise OSError("temporary file and destination are on different devices...")
-except Exception:
-    pass
+def _summarize_history_background(self, text: str, session_id: str) -> None:
+    try:
+        summary = self.engine.ask(...)
+        ...
+    except Exception as e:
+        logging.getLogger(__name__).warning("Summarizer thread failed unconditionally: %s", e)
 ```
 
-The cross-device check is wrapped in a bare `except Exception: pass`. If the stat fails for any reason (e.g., the temp file was already cleaned up, or an access error), the exception is silently discarded and `tmp_path.replace(path)` proceeds with potentially non-atomic behavior. More importantly, the `raise OSError` inside the try is also caught by the `except Exception: pass`, meaning the check never actually prevents the non-atomic rename.
+If `engine.ask` fails (Ollama down, all cloud keys rate-limited), the background summarizer logs a warning but does not mark the session as "needs retry." On subsequent turns, `_summarize_history()` returns `""` from cache and the trimmer degrades to raw truncation indefinitely. There is no backoff or retry signal — the session permanently loses its summary until a fresh restart.
 
-Fix: Separate the device check into its own try/except that only ignores `OSError` from `stat()`, not the intentional raise.
+**Fix:** Set a per-session retry timestamp in `_last_snippet_hashes` on failure so the background job is re-enqueued after a delay (e.g., 60 seconds).
+
+---
+
+**RISK-04 — Docker `HEALTHCHECK` uses `ps aux` instead of the health endpoint**
+Severity: Minor | Priority: Medium
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD ps aux | grep 'python3 main.py' | grep -v grep || exit 1
+```
+
+This only verifies the process exists, not that it's healthy and responding. NOVA might be stuck in an infinite loop, blocked on DB init, or have crashed its health probe thread — and Docker would still report it as `healthy`. The `_start_probe_server()` method exposes `/health` on `NOVA_HEALTH_PORT` (default 8765) precisely for this purpose.
+
+**Fix:** Replace with `CMD curl -fsS http://localhost:8765/health || exit 1` (curl is already installed in the Dockerfile).
 
 ---
 
@@ -389,80 +351,161 @@ Fix: Separate the device check into its own try/except that only ignores `OSErro
 
 ---
 
-**MINOR-NEW-01 — `LLMEngine.ask_stream` has fragile generator abandonment detection**
-Severity: Minor | Priority: Low
-
-The `finally` block in `ask_stream` persists partial output when the generator is abandoned mid-stream. However, `committed = False` is checked in the finally, but `committed` is only set to `True` after successful `_commit_memory_async()`. If the caller fully consumes all tokens but abandons before the `tool_call` execution block, `committed` stays `False` and the finally block double-calls `add_turn("assistant", ...)` — once in the try block and once in the finally.
-
-Fix: Set `committed = True` immediately after `add_turn("assistant", ...)` in the main try path, not after `_commit_memory_async()`.
-
----
-
-**MINOR-NEW-02 — `interfaces/cli.py` and `interfaces/gui/app.py` use slightly different PIN file paths**
-Severity: Minor | Priority: Low
-
-CLI reads from `.jarvis/cli_pin_hash` then `.jarvis/cli_pin`. GUI reads the same paths. But the file paths are hardcoded twice in two different modules. If the path changes in one module, the other silently diverges, creating a situation where CLI authentication works but GUI doesn't (or vice versa).
-
-Fix: Move the PIN file paths to `config/constants.py` as `CLI_PIN_HASH_FILE = Path(".jarvis/cli_pin_hash")`.
-
----
-
-**MINOR-NEW-03 — `core/plugin_loader.py` allows plugins to shadow tools registered before them**
-Severity: Minor | Priority: Medium
-
-```python
-if name in dispatcher.registry:
-    logging.getLogger(__name__).warning(
-        "Plugin attempted to shadow builtin tool '%s'. Skipping.", name
-    )
-    continue
-```
-
-This check only prevents shadowing tools registered before `load_plugins()` is called. If two plugins both define the same tool name, the first plugin's tool is registered, and the second plugin's tool is silently skipped (the check passes for the first plugin but catches the second). There is no warning that the second plugin partially loaded.
-
----
-
-**MINOR-NEW-04 — `web/crawler.py` depth tracking does not limit link discovery**
-Severity: Minor | Priority: Low
-
-`max_depth` correctly prevents visiting pages beyond the depth limit, but pages at `depth = max_depth` still have all their links added to the queue (they just aren't visited because `if depth >= max_depth: continue`). The queue is populated but then each enqueued link is immediately skipped. This wastes memory and iteration time.
-
-Fix: Only discover links when `depth < max_depth`:
-```python
-if depth < max_depth:
-    for link in soup.find_all("a", href=True):
-        ...
-```
-
----
-
-**MINOR-NEW-05 — `config/settings.py` `_is_placeholder_key` entropy check is weak**
+**MINOR-01 — `Mem0Client._call_with_variants` swallows non-`TypeError` exceptions from early variants**
 Severity: Minor | Priority: Low
 
 ```python
-unique_chars = len(set(k))
-if unique_chars < 6:
-    return True
+for payload in variants:
+    try:
+        return fn(**payload)
+    except TypeError as exc:
+        last_type_error = exc
+        continue
+    # Any other exception (NetworkError, AttributeError) propagates immediately
 ```
 
-A key of `"aaaaaabcde"` (5 unique chars) is correctly flagged, but `"aaaaaa1234567890123456"` (10 unique chars, 22 chars long) passes all checks despite being clearly a test value with low entropy. The entropy check should use Shannon entropy rather than a simple unique-character count.
+If variant 1 raises `TypeError` and variant 2 raises `requests.ConnectionError`, the connection error propagates and variants 3 and 4 are never tried. This means a transient network error in an intermediate variant skips potentially-correct variants.
+
+**Fix:** Catch `(TypeError, AttributeError)` (to handle SDK version changes) but still propagate true network errors separately.
 
 ---
 
-**MINOR-NEW-06 — `vision/omniparser_server.py` blocks the `ensure_running()` deadline with exponential backoff**
+**MINOR-02 — `XDG_CACHE_HOME` is not passed to the OmniParser subprocess**
+Severity: Minor | Priority: Low
+
+`_safe_env()` in `vision/omniparser_server.py` strips all environment variables except a safe subset. It passes `HOME` which allows `~/.cache` to work. However, on systems where `XDG_CACHE_HOME` points to a separate disk/partition for model caches (common in multi-disk setups or Docker with mounted volumes), OmniParser's `transformers` model downloads will silently use `~/.cache` instead, potentially filling the home volume.
+
+**Fix:** Add `"XDG_CACHE_HOME"` to the safe passthrough list in `_safe_env()`.
+
+---
+
+**MINOR-03 — `ask_stream` hard cap and `_track_usage` read `date.today()` independently**
 Severity: Minor | Priority: Low
 
 ```python
-delay = 1.0
-while time.monotonic() < deadline:
-    if self.is_running():
-        return
-    attempt += 1
-    wait = min(delay * (2 ** (attempt - 1)), 16.0)
-    time.sleep(wait)
+# ask_stream — called at start of request
+today = date.today()
+with self._usage_lock:
+    if self._hard_cap_hit_date != today:
+        self._hard_cap_hit = False
+
+# ... LLM call happens (could take 30-90 seconds) ...
+
+# _track_usage — called after LLM responds
+# also calls date.today() internally
 ```
 
-After 5 attempts, `wait = 16.0s`. If the deadline is 120s, the loop only has time for about 7 attempts (1 + 2 + 4 + 8 + 16 + 16 + 16 = 63s, then one more check). The process startup could succeed between two checks but the long sleep delays detection. Use a shorter max backoff (e.g., 4s) for server health checks.
+If a request starts just before midnight and finishes just after, `ask_stream`'s `today` is Day N but `_track_usage`'s `date.today()` is Day N+1. The cap check uses Day N's accumulated total, but the usage is recorded against Day N+1. This is an extremely rare edge case but creates a one-message window where the cap check is wrong.
+
+**Fix:** Pass `today` from `ask_stream` into `_track_usage` so both use the same day anchor.
+
+---
+
+**MINOR-04 — `_register_builtin_tools` uses `EmptyArgs` for tools that return data**
+Severity: Minor | Priority: Low
+
+Several tools registered with `EmptyArgs` return non-trivial data structures but give the LLM no schema hint:
+- `doc.list` → returns `list[dict]`
+- `win32_api.list_processes` → returns `list[str]`
+- `adb.notifications_dump` → returns a long string
+- `adb.sms_dump` → returns a long string
+
+The LLM's tool schema shows `{}` args for these, which is correct. But the return shape is undocumented in the schema prompt. For tools that produce structured output the LLM is expected to parse (like `doc.list`), adding a `description` field to the schema registration would improve LLM reliability.
+
+**Fix:** Consider adding a `docstring` or `description` mechanism to `Dispatcher.register()` and `get_tool_schema_prompt()` so the LLM receives richer hints.
+
+---
+
+**MINOR-05 — `web/scraper.py::_resolve_host` leaks a `ThreadPoolExecutor` thread**
+Severity: Minor | Priority: Low
+
+```python
+pool = ThreadPoolExecutor(max_workers=1)
+fut = pool.submit(_run)
+try:
+    return fut.result(timeout=timeout_seconds)
+except FuturesTimeout as exc:
+    fut.cancel()
+    raise ValueError(...) from exc
+finally:
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        pool.shutdown(wait=False)
+```
+
+`pool.shutdown(wait=False)` does not kill the running DNS thread — `socket.getaddrinfo` is a blocking C call and ignores Python thread interruption. On DNS timeout, the thread continues running in the background until the OS DNS timeout fires (typically 5-30 seconds). Under heavy scraping workloads this accumulates leaked threads.
+
+**Fix:** Accept this as a platform limitation and document it, or replace with `socket.setdefaulttimeout()` in the thread.
+
+---
+
+**MINOR-06 — `interfaces/cli.py` PIN exponential delay runs before the 5th failure write**
+Severity: Minor | Priority: Low
+
+The PIN loop:
+```python
+while failed < 5:
+    entered = getpass.getpass(...)
+    if _verify_pin(entered, pin_hash):
+        break
+    failed += 1
+    delay = min(30, 2 ** failed)
+    time.sleep(delay)
+else:
+    lock_file.write_text(str(time.time() + 300), ...)
+```
+
+After 5 failures the total wait is 2+4+8+16+30 = 60 seconds before the lockout file is written. If the attacker has a script that kills and restarts the process, they can attempt 5 PINs every 60 seconds without ever triggering the lockout (the lockout file is only written after 5 failed attempts complete, not before). The lockout should be written earlier — ideally after the first failure or using an incremental file.
+
+**Fix:** Write the lockout with an increasing timestamp after each failed attempt, not only after all 5 are exhausted.
+
+---
+
+**MINOR-07 — `_context_messages` submits a background summary job on every turn beyond `max_raw_turns`**
+Severity: Minor | Priority: Low
+
+After the conversation exceeds `max_raw_turns` (10), every single call to `_context_messages` creates a new background summarization job (guarded by `_summary_inflight` per session, but not rate-limited beyond that). For sessions with many users (Telegram bot with autonomous autonomy loop), this can queue a large backlog of LLM calls for summarization, adding latency and burning tokens.
+
+**Fix:** Add a minimum re-summary interval (e.g., only re-summarize if more than 3 new turns have been added since the last summarization).
+
+---
+
+**MINOR-08 — `NOVAApp` has no `__del__` or finalizer guard for abandoned instances**
+Severity: Minor | Priority: Low
+
+If `NOVAApp.__init__` raises mid-construction, the partially constructed object's threads (TTS worker, any already-started health monitor) are never stopped because `shutdown()` is never called. The `_tts_thread` is a daemon thread so it will be reaped on process exit, but `health.start()` may have already launched a non-daemon-thread-backed monitor.
+
+**Fix:** Add a `try/except` wrapper around the entire init body that calls `self.shutdown()` before re-raising, or make all background threads daemon threads.
+
+---
+
+**MINOR-09 — `session.py::_persist_session` cross-device check silently passes on its own `raise`**
+Severity: Minor | Priority: Low
+
+From BUG.TXT RISK-NEW-04, this was listed as a concern. Looking at the current code:
+```python
+try:
+    tmp_dev = tmp_path.stat().st_dev
+    dst_dev = sessions_dir.stat().st_dev
+except OSError:
+    tmp_dev = dst_dev = None
+if tmp_dev is not None and dst_dev is not None and tmp_dev != dst_dev:
+    raise OSError("temporary file and destination are on different devices...")
+```
+
+The `raise OSError(...)` is now outside the `try` block, so it correctly propagates. However, it's then caught by the outer `except Exception: pass` in `_persist_session`. The fix from BUG.TXT was applied but the outer silent swallow remains — this intentional safety raise is silently discarded. On cross-device setups, the non-atomic rename proceeds without any log or user feedback.
+
+**Fix:** Log the cross-device error before it's absorbed by the outer handler.
+
+---
+
+**MINOR-10 — Missing `logs/.gitkeep` and `exports/.gitkeep` for Docker volume mounts**
+Severity: Minor | Priority: Low
+
+`docker-compose.yml` mounts `./logs:/app/logs` and `./exports:/app/exports`. On a fresh clone these directories don't exist. Docker creates them as root-owned, causing write-permission errors for NOVA running as a non-root user inside the container. `assets/.gitkeep` exists but the equivalent for `logs/` and `exports/` is absent.
+
+**Fix:** Add `logs/.gitkeep` and `exports/.gitkeep` to the repository and to `.gitignore` exclusions for `*.jsonl` and `*.md` within those directories.
 
 ---
 
@@ -470,42 +513,30 @@ After 5 attempts, `wait = 16.0s`. If the deadline is 120s, the loop only has tim
 
 ---
 
-**MISS-NEW-01 — No test coverage for `control/adb/` modules**
+**MISS-01 — No integration tests covering the Telegram bot auth whitelist**
 Severity: Major | Priority: Medium
 
-`control/adb/adb_client.py`, `control/adb/watcher.py`, and `control/adb/tailscale.py` have partial coverage in `tests/test_adb_tools.py` (mostly QR and tailscale), but `ADBClient.send_sms`, `ADBClient.notifications_dump`, `PhoneWatcher._poll_sms`, and `PhoneWatcher._tick` are untested. These are the most security-sensitive ADB operations.
+`is_whitelisted()` is unit-tested indirectly via `test_telegram_bot.py`, but no test covers the full handler flow: a non-whitelisted `user_id` reaching `on_message` and being rejected without response. The rejection logging path (fix 1.2 from BUG.TXT) is untested, so a regression in `_authorized()` could silently open the bot to arbitrary users.
+
+**Fix:** Add a test that injects a fake `Update` with a non-whitelisted `user_id` and asserts `_authorized()` returns `False` and logs the rejection.
 
 ---
 
-**MISS-NEW-02 — No test coverage for `core/context/environment.py` stale-cache path**
-Severity: Minor | Priority: Low
-
-The stale-cache return-and-background-refresh path in `snapshot_environment()` has no tests. A regression here would silently cause the world state in every LLM prompt to be stale, degrading response quality without any error signal.
-
----
-
-**MISS-NEW-03 — `NOVAApp` has no health check for the probe server itself**
-Severity: Minor | Priority: Low
-
-`_start_probe_server()` launches a `ThreadingHTTPServer` in a daemon thread. If the thread crashes (e.g., port already in use, OS error), the health monitor doesn't know — `NOVA_HEALTH_PORT` returns nothing, and Docker/k8s health checks start failing. The `health` subsystem should register a check: `self.health.register_subsystem("probe_server", check_fn=lambda: self._health_http_server is not None)`.
-
----
-
-**MISS-NEW-04 — No persistence mechanism for `UsageTracker` across restarts**
-Severity: Minor | Priority: Medium
-
-`UsageTracker` stores all data in an in-memory dict. On process restart, all token usage history is lost. The `DAILY_TOKEN_HARD_CAP` check resets to zero on restart, meaning the hard cap can be bypassed by restarting the agent. In production, this is a billing risk.
-
-Fix: Persist the daily usage dict to a SQLite file or JSON file, flushed after each `add()`.
-
----
-
-**MISS-NEW-05 — No rate limiting on `goal.add` tool calls from the LLM**
+**MISS-02 — No test coverage for `_autonomy_loop` goal state transitions**
 Severity: Major | Priority: Medium
 
-The LLM can call `goal.add` as a tool. Each call spawns a background `_goal_plan_executor` future that makes one or more LLM requests. A misconfigured prompt or an adversarial input could cause the agent to call `goal.add` in a loop, spawning hundreds of planning futures and exhausting both thread and token budgets.
+The autonomy loop's status transitions (`pending` → `running` → `completed`/`paused`/`failed`/`awaiting_confirmation`) are complex and security-critical (they control when tools execute autonomously). There are zero tests in `tests/` covering `_autonomy_loop` directly, including the `approved_for_step` path identified in BUG-03 above.
 
-Fix: Cap the number of pending goals: if `len([g for g in self._goals if g["status"] in {"planning", "pending"}]) >= MAX_PENDING_GOALS`, reject new `goal.add` calls with a structured error.
+**Fix:** Add unit tests using `monkeypatch` to mock `autonomy_runner.run()` return values and assert the goal status transitions.
+
+---
+
+**MISS-03 — No test for `_persist_goals()` atomic-write failure**
+Severity: Minor | Priority: Low
+
+Given that `_persist_goals()` uses a non-atomic write (see SEC-04), there is also no test verifying that a corrupt/partial goals file on startup is handled gracefully. The current code catches `JSONDecodeError` and logs a warning, but the test suite doesn't exercise this path.
+
+**Fix:** Add a test that writes invalid JSON to the goals file path and confirms `NOVAApp` starts cleanly with an empty goal list.
 
 ---
 
@@ -513,93 +544,49 @@ Fix: Cap the number of pending goals: if `len([g for g in self._goals if g["stat
 
 ---
 
-**DEPLOY-NEW-01 — `docker-compose.yml` NOVA service has no restart delay after dependencies**
-Severity: Minor | Priority: Medium
-
-The NOVA service `depends_on` all three other services with `condition: service_healthy`. However, ChromaDB and Ollama may be technically healthy (responding to health endpoints) before they have fully initialized their storage. NOVA startup proceeds immediately and ChromaDB vector operations may fail during the first few seconds with `Collection not found` or similar errors.
-
-Fix: Add a `NOVA_STARTUP_DELAY_SECONDS` env var and sleep that many seconds at the start of `main()` in Docker-only mode.
-
----
-
-**DEPLOY-NEW-02 — `requirements.txt` and `requirements.lock` are identical but `Dockerfile` installs from `requirements.lock` while `setup.py` installs from `requirements.txt`**
+**DEPLOY-01 — `requirements.txt` and `requirements.lock` are identical files**
 Severity: Minor | Priority: Low
 
-This was noted in BUG.TXT as DEPLOY-02, but the current `setup.py` shows:
-```python
-req_file = "requirements.lock" if (REPO_ROOT / "requirements.lock").exists() else "requirements.txt"
-```
-This is now correctly resolved — `setup.py` prefers `requirements.lock`. However, the two files are still identical and should be consolidated. Having two files with identical content is confusing for contributors.
+Both files were generated on 2026-03-28 and are byte-for-byte identical. Having two identical files is confusing for contributors who may edit one but not the other. `setup.py` correctly prefers `requirements.lock`, but CI pipelines may target `requirements.txt`.
+
+**Fix:** Delete `requirements.txt` and update any CI scripts or README references to point to `requirements.lock`.
 
 ---
 
-**DEPLOY-NEW-03 — `DATA_DIR` default is `"."` which resolves to the working directory**
+**DEPLOY-02 — `DATA_DIR` default is `"~/.jarvis/data"` but `TaskScheduler` uses `Path(__file__).parent.parent` as its data dir**
 Severity: Minor | Priority: Medium
 
-`settings.DATA_DIR = "."` means `_DEFAULT_DB` in `tasks/scheduler.py` places `jarvis_jobs.sqlite` in whatever directory the process was started from. In Docker, if the working directory changes (e.g., a future Dockerfile restructure changes `WORKDIR`), the scheduler database silently moves. The `DATA_DIR` should default to a fixed path like `/app/data` in Docker and `~/.jarvis/data` natively.
+In `tasks/scheduler.py`:
+```python
+_DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parent.parent)).expanduser().resolve()
+```
+
+When `DATA_DIR` is not set in the environment, this resolves to the repository root, not `~/.jarvis/data`. But `config/settings.py` has `DATA_DIR: str = "~/.jarvis/data"`. These two defaults are inconsistent — `TaskScheduler` uses the repo root while `Settings` advertises `~/.jarvis/data`. In Docker, this places `jarvis_jobs.sqlite` in `/app`, which is not a mounted volume and is lost on container restart.
+
+**Fix:** Make `TaskScheduler.__init__` read `settings.DATA_DIR` directly instead of using its own `os.getenv` default.
 
 ---
 
-**DEPLOY-NEW-04 — No `logs/.gitkeep` or `exports/.gitkeep` for Docker volume mount directories**
-Severity: Minor | Priority: Low
-
-`docker-compose.yml` mounts `./logs:/app/logs` and `./exports:/app/exports`. On a fresh clone, these directories don't exist. Docker will create them as root-owned directories, causing permission errors when NOVA (running as a non-root user) tries to write logs. `assets/.gitkeep` exists but the equivalent for `logs/` and `exports/` is missing.
-
-Fix: Add `logs/.gitkeep` and `exports/.gitkeep` to the repository.
-
----
-
-**DEPLOY-NEW-05 — No graceful handling when `NOVA_HEALTH_PORT` is already in use**
+**DEPLOY-03 — No graceful handling if `NOVA_HEALTH_PORT` (8765) is already in use on startup**
 Severity: Minor | Priority: Medium
 
-```python
-server = ThreadingHTTPServer(("0.0.0.0", int(settings.NOVA_HEALTH_PORT)), _ProbeHandler)
-```
+If port 8765 is taken, `_start_probe_server()` raises `OSError: [Errno 98] Address already in use`. The exception is caught and logged at `ERROR` level, NOVA starts without a health probe, and Docker Compose's `condition: service_healthy` check (which relies on the health endpoint) begins failing immediately. The log message is not visible at startup without checking container logs.
 
-If port 8765 is already in use, `ThreadingHTTPServer` raises `OSError: [Errno 98] Address already in use`. This exception is caught by:
-```python
-try:
-    self._start_probe_server()
-except Exception as exc:
-    logging.getLogger(__name__).warning("Health probe startup failed: %s", exc)
-```
-
-So NOVA starts without a health probe, but Docker health checks (`condition: service_healthy` in compose) will then fail, causing `nova` to be considered unhealthy and potentially restarted in a loop. The error message in logs is not surfaced prominently.
-
-Fix: Log the error at `ERROR` level and expose a `NOVA_HEALTH_PORT` env fallback that tries the next available port.
+**Fix:** Try an alternate port (e.g., 8766) or expose `NOVA_HEALTH_PORT_FALLBACK` env var; log a prominent startup banner if the health probe couldn't bind.
 
 ---
 
-## Summary Table
+### Recommended Fix Order
 
-| ID | Category | Severity | Priority |
-|---|---|---|---|
-| BUG-NEW-01 | Bugs | Major | High |
-| BUG-NEW-02 | Bugs | Major | High |
-| BUG-NEW-03 | Bugs | Minor | Low |
-| BUG-NEW-04 | Bugs | Major | High |
-| BUG-NEW-05 | Bugs | Major | High |
-| BUG-NEW-06 | Bugs | Major | High |
-| BUG-NEW-07 | Bugs | Minor | Low |
-| BUG-NEW-08 | Bugs | Major | Medium |
-| BUG-NEW-09 | Bugs | Major | High |
-| BUG-NEW-10 | Bugs | Minor | Medium |
-| CONN-NEW-01 | Connectivity | Major | High |
-| CONN-NEW-02 | Connectivity | Minor | Medium |
-| PERF-NEW-01 | Performance | Major | Medium |
-| PERF-NEW-02 | Performance | Minor | Medium |
-| PERF-NEW-03 | Performance | Minor | Low |
-| SEC-NEW-01 | Security | Major | High |
-| SEC-NEW-02 | Security | Major | High |
-| SEC-NEW-03 | Security | Major | High |
-| SEC-NEW-04 | Security | Major | Medium |
-| SEC-NEW-05 | Security | Minor | Medium |
-| RISK-NEW-01 | System Risk | Major | High |
-| RISK-NEW-02 | System Risk | Major | High |
-| RISK-NEW-03 | System Risk | Minor | Medium |
-| RISK-NEW-04 | System Risk | Minor | Low |
-| MINOR-NEW-01 through 06 | Minor | Minor | Low–Medium |
-| MISS-NEW-01 through 05 | Missing | Major–Minor | Medium |
-| DEPLOY-NEW-01 through 05 | Deployment | Minor | Low–Medium |
+High-priority items to address first, in order of risk:
 
-**Recommended fix order:** BUG-NEW-05 (sync logic flaw, silent data loss) → SEC-NEW-03 (step approval security hole) → SEC-NEW-01 (auth token in process args) → BUG-NEW-01 (RoundRobinPool thread safety) → BUG-NEW-02 (logger race) → BUG-NEW-09 (shutdown hang) → CONN-NEW-01 (Telegram async blocking) → RISK-NEW-02 (emergency stop import-time init) → SEC-NEW-02 (PIN brute force) → SEC-NEW-04 (SSRF redirect) → then all remaining Medium and Low priority items.
+1. **SEC-01** — Input length validation in Telegram/GUI (active security gap)
+2. **BUG-02** — GoalRunner executor race on shutdown (can cause `RuntimeError` in production)
+3. **BUG-03** — Off-by-one in `approved_for_step` (corrupts persisted goal state)
+4. **SEC-04 / PERF-02** — Atomic write for `_persist_goals` (data loss on crash)
+5. **BUG-01** — `_memory_jobs_inflight` TOCTOU (correctness under concurrency)
+6. **RISK-01** — `_persist_session` silent error swallow (user data silently lost)
+7. **SEC-02** — PIN lockout bypass via CWD change
+8. **BUG-04** — Background summarizer poisoning trimmer with empty strings
+9. **CONN-01** — Telegram silent exception swallow in `_stream_text`
+10. **DEPLOY-02** — `TaskScheduler` data dir inconsistency (production data loss)

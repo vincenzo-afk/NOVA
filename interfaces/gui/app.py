@@ -108,7 +108,7 @@ def launch_gui(agent: Any) -> None:
     pin_hash = ""
     pin_hash_file = Path(CLI_PIN_HASH_FILE)
     legacy_pin_file = Path(CLI_PIN_LEGACY_FILE)
-    lock_file = Path(CLI_PIN_LOCK_FILE)
+    lock_file = Path.home() / CLI_PIN_LOCK_FILE.lstrip("./")
     if pin_hash_file.exists():
         pin_hash = pin_hash_file.read_text(encoding="utf-8").strip()
     elif legacy_pin_file.exists():
@@ -213,6 +213,9 @@ def launch_gui(agent: Any) -> None:
     def send_message() -> None:
         text = input_box.text().strip()
         if not text:
+            return
+        if len(text) > 50_000:
+            append_line("[system] Input too long. Please keep messages under 50,000 characters.")
             return
         input_box.clear()
         append_line(f"You: {text}")
