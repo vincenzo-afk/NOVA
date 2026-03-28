@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
+import ntpath
 from pathlib import Path
 import threading
 import time
@@ -183,8 +184,18 @@ class Guardrails:
         # Fix 15: Explicit registry allowlist
         if tool_name == "win32_api.registry_write":
             path = str(tool_call.args.get("path", "")).lower()
+            if ".." in path.replace("/", "\\").split("\\"):
+                return RiskResult(
+                    score=10,
+                    level="high",
+                    blocked=True,
+                    reason="registry_path_contains_parent_ref",
+                    requires_confirmation=False,
+                    plan=self._build_plan(tool_call),
+                )
+            normalized = ntpath.normpath(path.replace("/", "\\")).lower()
             allowlist = {"hkey_current_user\\software\\nova", "hkey_current_user\\environment"}
-            if not any(path.startswith(a) for a in allowlist):
+            if not any(normalized.startswith(a) for a in allowlist):
                 return RiskResult(
                     score=10,
                     level="high",

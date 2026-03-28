@@ -112,7 +112,12 @@ async def _stream_reply(update: Any, context: Any, agent: Any) -> None:
     await _stream_text(message, context, agent, message.text or "")
 
 
-def run_telegram_bot(agent: Any, token: str | None = None, allowed_chat_id: str | None = None) -> None:
+def run_telegram_bot(
+    agent: Any,
+    token: str | None = None,
+    allowed_chat_id: str | None = None,
+    stop_event: Any | None = None,
+) -> None:
     bot_token = token or settings.TELEGRAM_BOT_TOKEN
     if not bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
@@ -330,4 +335,18 @@ def run_telegram_bot(agent: Any, token: str | None = None, allowed_chat_id: str 
     app.add_handler(CommandHandler("qr", on_qr))
     app.add_handler(MessageHandler(filters.PHOTO, on_image))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    app.run_polling()
+    if stop_event is None:
+        app.run_polling()
+        return
+
+    # Graceful shutdown path for embedding in a managed app lifecycle.
+    app.initialize()
+    app.start()
+    app.updater.start_polling()
+    try:
+        while not stop_event.is_set():
+            time.sleep(0.2)
+    finally:
+        app.updater.stop()
+        app.stop()
+        app.shutdown()

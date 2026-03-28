@@ -80,6 +80,7 @@ class GoalRunner:
         max_steps: int = 20,
         dry_run: bool = False,
         start_index: int = 0,
+        on_step: Callable[[int, dict[str, Any]], None] | None = None,
     ) -> GoalResult:
         guard = GoalRun(max_steps=max_steps)
         results: list[dict] = []
@@ -105,29 +106,32 @@ class GoalRunner:
             if not can_execute:
                 return GoalResult(status="stopped", reason=reason, results=results, next_index=idx)
 
-            # fix 1.5: per-step guardrails check
-            if not dry_run:
-                from safety.guardrails import guardrails
-                call = ToolCall(tool=tool, args=args)
-                risk = guardrails.check(call)
-                authorized = guardrails.authorize(
-                    call,
-                    risk,
-                    confirm_callback=self.confirm_callback,
-                    dry_run=False,
+            # fix 1.5: per-step guardrails check (also during dry_run).
+            from safety.guardrails import guardrails
+            call = ToolCall(tool=tool, args=args)
+            risk = guardrails.check(call)
+            authorized = guardrails.authorize(
+                call,
+                risk,
+                confirm_callback=self.confirm_callback,
+                dry_run=dry_run,
+            )
+            if authorized.blocked:
+                return GoalResult(
+                    status="blocked",
+                    reason=f"step {idx} blocked by guardrails: {authorized.reason}",
+                    results=results,
+                    next_index=idx,
                 )
-                if authorized.blocked:
-                    return GoalResult(
-                        status="blocked",
-                        reason=f"step {idx} blocked by guardrails: {authorized.reason}",
-                        results=results,
-                        next_index=idx,
-                    )
 
             guard.record(tool, args)
-            call = ToolCall(tool=tool, args=args)
             result = self.dispatcher.execute(call, dry_run=dry_run, _skip_guardrails=True)
             results.append(result)
+            if on_step is not None:
+                try:
+                    on_step(idx, result)
+                except Exception:
+                    pass
 
             # fix 1.7: inter-step delay
             if self.step_delay_seconds > 0 and idx < len(indexed_steps) - 1:
