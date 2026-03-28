@@ -1,10 +1,12 @@
-"""JARVIS entry point."""
+"""NOVA entry point."""
 
 from __future__ import annotations
 
 import json
+import queue
 import signal
 import time
+import uuid
 from pathlib import Path
 import re
 import threading
@@ -35,8 +37,8 @@ from control.adb.tailscale import ensure_tailscale_connected, tailscale_ip_v4, t
 from control.adb.watcher import PhoneWatcher
 from control.browser import Browser
 from interfaces.cli import run_cli
-from mcp.master_api import MasterAPI
-from mcp.master_mcp import BUILTIN_SERVICES, MasterMCP
+from nova_mcp.master_api import MasterAPI
+from nova_mcp.master_mcp import BUILTIN_SERVICES, MasterMCP
 from rag.doc_store import DocumentStore
 from safety.guardrails import guardrails
 from tasks.scheduler import TaskScheduler
@@ -55,6 +57,57 @@ from web.scraper import scrape_text
 from web.search import search
 import control.win32_api as win32_api
 
+# ---------------------------------------------------------------------------
+# Path sandbox — restrict file tools to safe roots
+# ---------------------------------------------------------------------------
+_SANDBOX_ROOT = Path(".").resolve()
+_ALLOWED_FILE_ROOTS: list[Path] = [_SANDBOX_ROOT]
+
+# Registry key allowlist — only permit writes under these safe sub-paths
+_REGISTRY_WRITE_ALLOWLIST = {
+    r"HKCU\Software\NOVA",
+    r"HKCU\Software\JarvisApp",
+}
+_REGISTRY_BLOCK_PATTERNS = [
+    r"HKLM\SYSTEM",
+    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+    r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+]
+
+
+def _assert_safe_path(raw_path: str) -> Path:
+    """Raise ValueError if path escapes the sandbox root."""
+    resolved = Path(raw_path).resolve()
+    for allowed in _ALLOWED_FILE_ROOTS:
+        try:
+            resolved.relative_to(allowed)
+            return resolved
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Path '{raw_path}' is outside the allowed sandbox. "
+        f"Allowed roots: {[str(r) for r in _ALLOWED_FILE_ROOTS]}"
+    )
+
+
+def _assert_safe_registry_write(reg_path: str) -> None:
+    """Raise ValueError if registry path is not on the allowlist or matches a blocked pattern."""
+    upper = reg_path.upper()
+    for blocked in _REGISTRY_BLOCK_PATTERNS:
+        if blocked.upper() in upper:
+            raise ValueError(
+                f"Registry write to '{reg_path}' is blocked by security policy."
+            )
+    if not any(reg_path.upper().startswith(a.upper()) for a in _REGISTRY_WRITE_ALLOWLIST):
+        raise ValueError(
+            f"Registry write to '{reg_path}' is not in the allowlist. "
+            f"Allowed prefixes: {list(_REGISTRY_WRITE_ALLOWLIST)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pydantic argument models
+# ---------------------------------------------------------------------------
 
 class WebSearchArgs(BaseModel):
     query: str
@@ -336,7 +389,47 @@ class SetMuteArgs(BaseModel):
     muted: bool
 
 
-class JarvisApp:
+# ---------------------------------------------------------------------------
+# Sandboxed file/registry tool wrappers
+# ---------------------------------------------------------------------------
+
+def _safe_read_file(path: str) -> Any:
+    _assert_safe_path(path)
+    return win32_api.read_file(path)
+
+
+def _safe_write_file(path: str, content: str) -> Any:
+    _assert_safe_path(path)
+    return win32_api.write_file(path, content)
+
+
+def _safe_move_file(src: str, dst: str) -> Any:
+    _assert_safe_path(src)
+    _assert_safe_path(dst)
+    return win32_api.move_file(src, dst)
+
+
+def _safe_copy_file(src: str, dst: str) -> Any:
+    _assert_safe_path(src)
+    _assert_safe_path(dst)
+    return win32_api.copy_file(src, dst)
+
+
+def _safe_delete_file(path: str) -> Any:
+    _assert_safe_path(path)
+    return win32_api.delete_file(path)
+
+
+def _safe_registry_write(path: str, name: str, value: str, value_type: str = "REG_SZ") -> Any:
+    _assert_safe_registry_write(path)
+    return win32_api.registry_write(path, name, value, value_type)
+
+
+# ---------------------------------------------------------------------------
+# Main application class
+# ---------------------------------------------------------------------------
+
+class NovaApp:
     def __init__(self):
         settings.validate_startup(phase="minimal")
 
@@ -351,28 +444,38 @@ class JarvisApp:
         self.emotion = EmotionEngine()
         self.usage = UsageTracker()
         self._usage_alerted_day = None
-        self._hard_cap_hit = False  # fix 7.1: set True when daily hard-cap is reached
-        
-        # Add tracking for daily resets (fix 1.5)
+
+        # FIX #22: double-shutdown guard
+        self._shutdown_called = False
+        self._shutdown_lock = threading.Lock()
+
+        # FIX #3: use threading.Lock for _hard_cap_hit — prevents race condition
+        self._hard_cap_lock = threading.Lock()
+        self._hard_cap_hit = False
         self._hard_cap_hit_date: date | None = None
-        
-        # Add summary cache tracking (fix 6.1)
-        self._summary_cache: dict[int, str] = {}
-        self._summary_cache_lock = threading.Lock()  # fix 3.2
+
+        # FIX #13: bounded summary cache — max 100 entries (LRU-style via OrderedDict)
+        from collections import OrderedDict
+        self._summary_cache: OrderedDict[int, str] = OrderedDict()
+        self._summary_cache_max = 100
+        self._summary_cache_lock = threading.Lock()
         self._last_snippet_hash: int | None = None
 
-        # Add single thread for TTS execution (fix 5.1)
-        self._tts_queue = __import__('queue').Queue()
+        # FIX #2: proper queue import at top level
+        self._tts_queue: queue.Queue = queue.Queue()
+        # FIX #7: TTS dead flag — set True when worker thread dies on import error
+        self._tts_dead = False
         self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         self._tts_thread.start()
 
-        # Add semaphore for background summarization (fix 3.1)
         self._summarize_semaphore = threading.Semaphore(1)
-
         self._event_lock = threading.Lock()
         self._events = deque(maxlen=100)
+
+        # FIX #12: only init Mem0Client when API key is non-empty
+        mem0_client = Mem0Client(api_key=settings.MEM0_API_KEY) if settings.MEM0_API_KEY else None
         self.memory = MemoryRouter(
-            mem0=Mem0Client(api_key=settings.MEM0_API_KEY),
+            mem0=mem0_client,
             local=LocalMemoryStore(),
         )
         self.docs = DocumentStore()
@@ -413,6 +516,9 @@ class JarvisApp:
         self._start_emergency_hotkey()
         self.scheduler.start()
 
+        # FIX #27: ensure exports/ directory exists at startup
+        Path("exports").mkdir(exist_ok=True)
+
     def last_provider_label(self) -> str:
         return self.engine.last_provider
 
@@ -424,18 +530,16 @@ class JarvisApp:
         return self.session.switch(name)
 
     def reset_context(self) -> None:
-        """Clear current session history and the associated trimmer summary (fix 1.6).
+        """Clear current session history and the associated trimmer summary.
 
-        Also auto-exports as a backup before clearing (fix 7.4).
+        Also auto-exports as a backup before clearing.
         """
         session_id = self.session.current.session_id
-        # fix 7.4: auto-backup session before clearing
         try:
             self.export_session("md")
         except Exception:
             pass
         self.session.reset_context()
-        # fix 1.6: clear the stale summary so it doesn't bleed into the new context
         self.trimmer.summaries.pop(session_id, None)
 
     def list_goals(self) -> list[dict]:
@@ -488,6 +592,8 @@ class JarvisApp:
         session = self.session.current
         timestamp = int(time.time())
         safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", session.name).strip("_") or "session"
+        # FIX #27: always ensure exports dir exists before writing
+        Path("exports").mkdir(exist_ok=True)
         if fmt.lower() == "json":
             path = f"exports/{safe_name}_{timestamp}.json"
             return export_json(session.history, path)
@@ -495,12 +601,14 @@ class JarvisApp:
         return export_markdown(session.history, path)
 
     def status_text(self) -> str:
+        pool = self.engine.pool
+        active_keys = pool.active_count() if pool is not None else 0
         health_items = self.health.status_table()
         return json.dumps(
             {
                 "session": self.session.current.name,
                 "session_id": self.session.current.session_id,
-                "active_cloud_keys": self.engine.pool.active_count(),
+                "active_cloud_keys": active_keys,
                 "memory_mode": "online" if self.memory.online else "offline",
                 "provider_last": self.engine.last_provider,
                 "emotion": self.emotion.state,
@@ -528,7 +636,6 @@ class JarvisApp:
     def _get_mouse_keyboard(self):
         if self._mouse_keyboard is None:
             from control.mouse_keyboard import MouseKeyboard
-
             self._mouse_keyboard = MouseKeyboard()
         return self._mouse_keyboard
 
@@ -536,19 +643,16 @@ class JarvisApp:
         current_token = self.omniparser.auth_token if hasattr(self, 'omniparser') else None
         if self._omniparser_client is None:
             from vision.omniparser import OmniParserClient
-
             self._omniparser_client = OmniParserClient(
                 settings.OMNIPARSER_SERVER_URL,
                 auth_token=current_token
             )
         else:
-            # Fix 2.2: ensure token stays updated across server restarts
             self._omniparser_client.auth_token = current_token
         return self._omniparser_client
 
     def _current_ui_elements(self) -> list[dict[str, Any]]:
         from vision.capture import capture_active_window_png
-
         image_bytes = capture_active_window_png()
         return self._get_omniparser_client().ui_elements(image_bytes)
 
@@ -629,7 +733,7 @@ class JarvisApp:
         return "browser closed"
 
     def _schedule_prompt(self, schedule_text: str, prompt: str, job_id: str | None = None) -> dict:
-        job_id = job_id or f"job_{int(time.time())}"
+        job_id = job_id or f"job_{uuid.uuid4().hex[:8]}"
 
         def _run() -> None:
             response = "".join(self.ask_stream(prompt, allow_tools=False))
@@ -709,7 +813,8 @@ class JarvisApp:
         plan = self._plan_goal(goal, max_steps=min(max_steps, 30))
         if plan.get("status") != "ok":
             return plan
-        goal_id = f"goal_{int(time.time())}"
+        # FIX #5: use uuid4 for unique goal IDs — prevents collision within same second
+        goal_id = f"goal_{uuid.uuid4().hex}"
         record = {
             "id": goal_id,
             "goal": goal,
@@ -847,7 +952,7 @@ class JarvisApp:
         return {"muted": self.is_muted()}
 
     def _start_health_monitoring(self) -> None:
-        self.health.register_subsystem("jarvis", lambda: True)
+        self.health.register_subsystem("nova", lambda: True)
         self.health.register_subsystem("network", lambda: NetworkState.is_online())
         self.health.register_subsystem("memory_router", lambda: self.memory is not None)
         self.health.register_subsystem(
@@ -859,6 +964,12 @@ class JarvisApp:
             "omniparser",
             check_fn=self.omniparser.is_running,
             restart_fn=self.omniparser.restart,
+        )
+        # FIX #35: register LLM engine health check
+        self.health.register_subsystem(
+            "llm_engine",
+            check_fn=self._llm_engine_healthy,
+            restart_fn=None,
         )
         if settings.PROACTIVE_WATCHER_ENABLED:
             self.health.register_subsystem(
@@ -883,6 +994,16 @@ class JarvisApp:
         except Exception:
             pass
         self.health.start(interval_seconds=60)
+
+    def _llm_engine_healthy(self) -> bool:
+        """FIX #35: ping Ollama /api/tags to verify engine is reachable."""
+        import requests as _req
+        try:
+            resp = _req.get(f"{settings.OLLAMA_BASE_URL}/api/tags", timeout=5)
+            return resp.status_code == 200
+        except Exception:
+            # Cloud-only mode — engine may still be healthy
+            return self.engine.pool is not None and self.engine.pool.active_count() > 0
 
     def _start_watchers_if_enabled(self) -> None:
         if settings.PROACTIVE_WATCHER_ENABLED:
@@ -986,10 +1107,18 @@ class JarvisApp:
                 total_steps=len(steps),
             )
             print(f"\n[autonomy] {message}")
+            # FIX #8: add synthetic user turn before assistant turn to keep message alternation valid
+            self.session.add_turn("user", f"[autonomy] Executing goal: {goal.get('goal')}")
             self.session.add_turn("assistant", message)
             self._notify_autonomy_event(message)
 
     def shutdown(self) -> None:
+        # FIX #22: guard against double-shutdown (signal handler + finally block)
+        with self._shutdown_lock:
+            if self._shutdown_called:
+                return
+            self._shutdown_called = True
+
         self.health.stop()
         if settings.PROACTIVE_WATCHER_ENABLED:
             self.screen_watcher.stop()
@@ -997,6 +1126,8 @@ class JarvisApp:
             self.phone_watcher.stop()
         self.scheduler.stop()
         self._stop_autonomy_loop()
+        # Signal TTS worker thread to exit cleanly
+        self._tts_queue.put(None)
         if self._emergency_hotkey_listener is not None:
             try:
                 self._emergency_hotkey_listener.stop()
@@ -1021,6 +1152,10 @@ class JarvisApp:
             notify_tts=self._notify_tts,
         )
 
+    # FIX #10: per-subsystem notification cooldown to prevent Telegram spam
+    _health_notify_last: dict[str, float] = {}
+    _HEALTH_NOTIFY_COOLDOWN_SECS = 60
+
     def _handle_health_event(self, name: str, status: str, previous_status: str | None) -> None:
         message = f"Health update: {name} changed to {status}"
         if previous_status:
@@ -1028,11 +1163,15 @@ class JarvisApp:
         self.record_event("health", message)
         print(f"\n[health] {message}")
         if status in {"down", "restart_failed"}:
-            _ = send_telegram_text(
-                bot_token=settings.TELEGRAM_BOT_TOKEN,
-                chat_id=settings.TELEGRAM_CHAT_ID,
-                text=message,
-            )
+            now = time.time()
+            last = self._health_notify_last.get(name, 0.0)
+            if now - last >= self._HEALTH_NOTIFY_COOLDOWN_SECS:
+                self._health_notify_last[name] = now
+                _ = send_telegram_text(
+                    bot_token=settings.TELEGRAM_BOT_TOKEN,
+                    chat_id=settings.TELEGRAM_CHAT_ID,
+                    text=message,
+                )
 
     def _notify_telegram(self, text: str) -> dict | None:
         if not settings.AUTONOMY_NOTIFY_TELEGRAM:
@@ -1045,12 +1184,14 @@ class JarvisApp:
         return result
 
     def _tts_worker(self) -> None:
-        """Fix 5.1: TTS executed on a single dedicated background thread."""
+        """TTS executed on a single dedicated background thread."""
         try:
             from voice.tts_offline import speak as speak_offline
         except Exception:
+            # FIX #7: set dead flag so _notify_tts stops queuing items
+            self._tts_dead = True
             return
-            
+
         while True:
             text = self._tts_queue.get()
             if text is None:
@@ -1064,7 +1205,8 @@ class JarvisApp:
                 self._tts_queue.task_done()
 
     def _notify_tts(self, text: str) -> bool:
-        if not settings.AUTONOMY_NOTIFY_TTS:
+        # FIX #7: do not enqueue if worker is dead
+        if not settings.AUTONOMY_NOTIFY_TTS or self._tts_dead:
             return False
         self._tts_queue.put(text)
         return True
@@ -1084,13 +1226,14 @@ class JarvisApp:
         self.dispatcher.register("doc.query", self.docs.query, DocQueryArgs)
         self.dispatcher.register("doc.list", self.docs.list_docs, EmptyArgs)
         self.dispatcher.register("session.switch", lambda name: self.switch_session(name).name, SessionSwitchArgs)
-        self.dispatcher.register("win32_api.read", win32_api.read_file, FileReadArgs)
-        self.dispatcher.register("win32_api.write", win32_api.write_file, FileWriteArgs)
-        self.dispatcher.register("win32_api.move", win32_api.move_file, FileMoveArgs)
-        self.dispatcher.register("win32_api.delete", win32_api.delete_file, FileDeleteArgs)
+        # FIX #31: use sandboxed wrappers for all file tools
+        self.dispatcher.register("win32_api.read", _safe_read_file, FileReadArgs)
+        self.dispatcher.register("win32_api.write", _safe_write_file, FileWriteArgs)
+        self.dispatcher.register("win32_api.move", _safe_move_file, FileMoveArgs)
+        self.dispatcher.register("win32_api.delete", _safe_delete_file, FileDeleteArgs)
         self.dispatcher.register("win32_api.list_processes", win32_api.list_processes, EmptyArgs)
         self.dispatcher.register("win32_api.search", win32_api.search_files, FileSearchArgs)
-        self.dispatcher.register("win32_api.copy", win32_api.copy_file, FileMoveArgs)
+        self.dispatcher.register("win32_api.copy", _safe_copy_file, FileMoveArgs)
         self.dispatcher.register("win32_api.kill_process", win32_api.kill_process, ProcessKillArgs)
         self.dispatcher.register("win32_api.launch_process", win32_api.launch_process, ProcessLaunchArgs)
         self.dispatcher.register("win32_api.get_clipboard", win32_api.get_clipboard, EmptyArgs)
@@ -1101,7 +1244,8 @@ class JarvisApp:
         self.dispatcher.register("win32_api.close_window", win32_api.close_window, WindowTitleArgs)
         self.dispatcher.register("win32_api.resize_window", win32_api.resize_window, WindowResizeArgs)
         self.dispatcher.register("win32_api.registry_read", win32_api.registry_read, RegistryReadArgs)
-        self.dispatcher.register("win32_api.registry_write", win32_api.registry_write, RegistryWriteArgs)
+        # FIX #18: use sandboxed registry write with allowlist enforcement
+        self.dispatcher.register("win32_api.registry_write", _safe_registry_write, RegistryWriteArgs)
         self.dispatcher.register("win32_api.send_notification", win32_api.send_notification, NotificationArgs)
         self.dispatcher.register("mouse.click", self._mouse_click, MouseClickArgs)
         self.dispatcher.register("mouse.click_element", self._mouse_click_element, MouseClickElementArgs)
@@ -1155,8 +1299,7 @@ class JarvisApp:
 
     def _context_messages(self, user_text: str) -> tuple[str, list[dict], list[dict]]:
         session_id = self.session.current.session_id
-        
-        # Check if we need to trigger background summarization
+
         history = self.session.current.history
         if len(history) > self.trimmer.max_raw_turns:
             older = history[: -self.trimmer.max_raw_turns]
@@ -1165,17 +1308,15 @@ class JarvisApp:
                 for turn in older
                 if turn.get("content")
             )
-            # Trigger background summarization if snippet changed
             if not hasattr(self, '_last_snippet_hash') or hash(snippet) != self._last_snippet_hash:
                 self._last_snippet_hash = hash(snippet)
-                import threading
-                thread = threading.Thread(
+                t = threading.Thread(
                     target=self._summarize_history_background,
                     args=(snippet, session_id),
                     daemon=True
                 )
-                thread.start()
-        
+                t.start()
+
         summary, recent = self.trimmer.trim(
             history,
             session_id=session_id,
@@ -1184,7 +1325,6 @@ class JarvisApp:
         memories = self.memory.search(user_text, session_id=session_id, top_k=DEFAULT_MEMORY_TOP_K)
         world_state = snapshot_environment()
 
-        # fix 2.13: strip clipboard content unless explicitly opt-ed in
         if not settings.INCLUDE_CLIPBOARD_IN_CONTEXT:
             world_state.pop("clipboard", None)
 
@@ -1206,13 +1346,10 @@ class JarvisApp:
             emotion=self.emotion.state,
         )
 
-        # Fix 2.9: Check total token count and trim if needed
         all_messages = [context_message, *recent]
         try:
             total_tokens = estimate_tokens_from_messages(all_messages)
-            # If exceeding ~8000 tokens, drop oldest raw turns beyond what ContextTrimmer handles
             if total_tokens > 8000 and len(recent) > 2:
-                # Keep at least 2 recent turns, drop the rest
                 keep_count = max(2, len(recent) - (total_tokens - 8000) // 500)
                 recent = recent[-keep_count:]
                 all_messages = [context_message, *recent]
@@ -1225,35 +1362,38 @@ class JarvisApp:
         """Summarize conversation history. Uses cached summary if available."""
         if not text.strip():
             return ""
-        
-        # Check if we have a cached summary for this text
+
         text_hash = hash(text)
         with self._summary_cache_lock:
             if text_hash in self._summary_cache:
+                # FIX #13: move to end (LRU)
+                self._summary_cache.move_to_end(text_hash)
                 return self._summary_cache[text_hash]
-        
-        # If no cache, return truncated text (will be summarized in background)
+
         return text[:700]
-    
+
     def _summarize_history_background(self, text: str, session_id: str) -> None:
         """Summarize history in background thread and update cache."""
         if not text.strip():
             return
-            
-        # Fix 3.1: Bound concurrency with semaphore
+
         if not self._summarize_semaphore.acquire(blocking=False):
-            return  # Already summarizing, skip this one
-            
+            return
+
         try:
             system = "Summarize the conversation history into a concise paragraph for future context."
             try:
                 summary = self.engine.ask(prompt=text, system=system, history=[])
-                # Fix 3.2: Lock around _summary_cache writes
                 with self._summary_cache_lock:
+                    # FIX #13: evict oldest entry if cache is full
+                    if len(self._summary_cache) >= self._summary_cache_max:
+                        self._summary_cache.popitem(last=False)
                     self._summary_cache[hash(text)] = summary
                 self.trimmer.summaries[session_id] = summary
             except Exception:
                 with self._summary_cache_lock:
+                    if len(self._summary_cache) >= self._summary_cache_max:
+                        self._summary_cache.popitem(last=False)
                     self._summary_cache[hash(text)] = text[:700]
         finally:
             self._summarize_semaphore.release()
@@ -1261,35 +1401,38 @@ class JarvisApp:
     def _apply_text_commands(self, user_text: str) -> str | None:
         text = user_text.strip().lower()
         if text in {"switch to work mode", "work mode"}:
-            state = self.switch_session("jarvis_work")
+            state = self.switch_session("nova_work")
             return f"Switched to {state.name} ({state.session_id})."
         if text in {"switch to personal mode", "personal mode"}:
-            state = self.switch_session("jarvis_personal")
+            state = self.switch_session("nova_personal")
             return f"Switched to {state.name} ({state.session_id})."
         if text in {"reset context", "clear context"}:
             self.reset_context()
             return "Context reset for this session. Memories are still saved."
-        if text in {"jarvis stop", "emergency stop", "stop now"}:
+        if text in {"nova stop", "emergency stop", "stop now"}:
             guardrails.emergency_stop()
             return "Emergency stop is active. Tool execution is now blocked."
-        if text in {"jarvis resume", "clear emergency stop", "resume tools"}:
+        if text in {"nova resume", "clear emergency stop", "resume tools"}:
             guardrails.clear_emergency_stop()
             return "Emergency stop cleared. Tool execution is enabled."
         if text in {"safety status", "emergency status"}:
             state = "active" if guardrails.is_emergency_stopped() else "inactive"
             return f"Emergency stop is {state}."
-        if text in {"mute", "jarvis mute", "mute notifications"}:
+        if text in {"mute", "nova mute", "mute notifications"}:
             self.set_muted(True)
             return "Muted. Proactive alerts and autonomy notifications are silenced."
-        if text in {"unmute", "jarvis unmute", "unmute notifications"}:
+        if text in {"unmute", "nova unmute", "unmute notifications"}:
             self.set_muted(False)
             return "Unmuted. Proactive alerts and autonomy notifications are active."
         if text in {"toggle mute", "mute toggle"}:
             now_muted = self.toggle_mute()
             return "Muted." if now_muted else "Unmuted."
         if re.match(r"^switch session\s+.+$", text):
-            # Fix 6.8: Extract session name from original user_text to preserve case
-            name = user_text.strip().split(maxsplit=2)[-1]
+            parts = user_text.strip().split(maxsplit=2)
+            # FIX #28: guard against missing session name
+            if len(parts) < 3:
+                return "Please provide a session name. Usage: switch session <name>"
+            name = parts[-1]
             state = self.switch_session(name)
             return f"Switched to {state.name} ({state.session_id})."
         return None
@@ -1301,7 +1444,10 @@ class JarvisApp:
         allow_tools: bool = True,
         dry_run_tools: bool = False,
     ) -> Generator[str, None, None]:
-        if self._hard_cap_hit:
+        # FIX #3: thread-safe hard cap check
+        with self._hard_cap_lock:
+            cap_hit = self._hard_cap_hit
+        if cap_hit:
             yield f"Daily token hard cap of {settings.DAILY_TOKEN_HARD_CAP} reached. Further calls blocked."
             return
 
@@ -1335,7 +1481,12 @@ class JarvisApp:
         tool_call = self.dispatcher.try_parse_tool_call(assistant_text) if allow_tools else None
         if tool_call:
             result = self.dispatcher.execute(tool_call, dry_run=dry_run_tools)
-            tool_result_text = f"[tool_result] {json.dumps(result, ensure_ascii=False)}"
+            # FIX #19: wrap tool result in a delimited block to prevent prompt injection
+            tool_result_text = (
+                "<tool_result>\n"
+                + json.dumps(result, ensure_ascii=False)
+                + "\n</tool_result>"
+            )
             if output_chunks:
                 yield "\n"
             yield tool_result_text
@@ -1360,26 +1511,27 @@ class JarvisApp:
         today = date.today()
         total = self.usage.total_tokens_today(session_id=session_id)
 
-        # fix 1.5: clear hard cap if day resets
-        if self._hard_cap_hit_date != today:
-            self._hard_cap_hit = False
-            self._hard_cap_hit_date = None
+        # FIX #6 + #3: thread-safe daily reset and hard cap enforcement
+        with self._hard_cap_lock:
+            if self._hard_cap_hit_date != today:
+                self._hard_cap_hit = False
+                self._hard_cap_hit_date = None
+                # Reset the LLM engine's session counter too
+                self.engine.session_tokens_used = 0.0
 
-        # fix 7.1: hard cap — refuse further LLM calls and alert
-        hard_cap = settings.DAILY_TOKEN_HARD_CAP
-        if hard_cap > 0 and total >= hard_cap and not self._hard_cap_hit:
-            self._hard_cap_hit = True
-            self._hard_cap_hit_date = today
-            msg = (
-                f"[usage] HARD CAP REACHED: daily token usage {total} "
-                f">= hard cap {hard_cap}. Further LLM calls are blocked for today."
-            )
-            print(msg)
-            try:
-                # Fix 1.2: Use valid telegram notifier signature
-                self._notify_telegram(msg)
-            except Exception:
-                pass
+            hard_cap = settings.DAILY_TOKEN_HARD_CAP
+            if hard_cap > 0 and total >= hard_cap and not self._hard_cap_hit:
+                self._hard_cap_hit = True
+                self._hard_cap_hit_date = today
+                msg = (
+                    f"[usage] HARD CAP REACHED: daily token usage {total} "
+                    f">= hard cap {hard_cap}. Further LLM calls are blocked for today."
+                )
+                print(msg)
+                try:
+                    self._notify_telegram(msg)
+                except Exception:
+                    pass
 
         if self._usage_alerted_day != today:
             if total >= settings.DAILY_TOKEN_ALERT_THRESHOLD:
@@ -1390,15 +1542,19 @@ class JarvisApp:
                 self._usage_alerted_day = today
 
 
+# Keep JarvisApp as an alias for backward compatibility
+JarvisApp = NovaApp
+
+
 def main() -> int:
     setup_logger()
     try:
-        app = JarvisApp()
+        app = NovaApp()
     except SettingsError as exc:
         print(str(exc))
         return 1
 
-    # fix 7.8: graceful shutdown on SIGTERM and SIGINT
+    # FIX #22: graceful shutdown — guard prevents double-call from signal + finally
     def _shutdown_handler(*_):
         print("\n[signal] Shutdown signal received — cleaning up…")
         app.shutdown()

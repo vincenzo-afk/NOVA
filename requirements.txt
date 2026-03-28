@@ -1,64 +1,65 @@
 # LLM
-openai
-ollama
-google-generativeai
+openai>=1.0,<2.0
+ollama>=0.1,<1.0
+google-generativeai>=0.5,<1.0
 
 # Voice
-pvporcupine
-pyaudio
-sounddevice
-silero-vad
-faster-whisper
-pyttsx3
-gTTS
-pynput
+pvporcupine>=3.0,<4.0
+pyaudio>=0.2,<1.0
+sounddevice>=0.4,<1.0
+silero-vad>=4.0,<5.0
+faster-whisper>=0.10,<2.0
+pyttsx3>=2.90,<3.0
+gTTS>=2.3,<3.0
+pynput>=1.7,<2.0
 
 # Vision
-Pillow
-opencv-python
-numpy
+Pillow>=10.0,<12.0
+opencv-python>=4.8,<5.0
+numpy>=1.24,<3.0
 
 # Control
-pyautogui
-pywin32
-playwright
+pyautogui>=0.9,<1.0
+pywin32>=306
+# NOTE: After pip install, run: playwright install chromium
+playwright>=1.40,<2.0
 
 # Web & Search
-requests
-beautifulsoup4
-duckduckgo-search
-rank-bm25
+requests>=2.31,<3.0
+beautifulsoup4>=4.12,<5.0
+duckduckgo-search>=4.0,<7.0
+rank-bm25>=0.2,<1.0
 
 # Memory
-mem0ai
-chromadb
-sentence-transformers
+mem0ai>=0.0.20,<1.0
+chromadb>=0.4,<1.0
+sentence-transformers>=2.2,<4.0
 
 # Documents (RAG)
-pypdf
-python-docx
+pypdf>=3.0,<5.0
+python-docx>=0.8,<2.0
 
 # ADB & Networking
-pure-python-adb
-adb-wifi-py
-qrcode[pil]
+pure-python-adb>=0.3,<1.0
+adb-wifi-py>=0.1
+qrcode[pil]>=7.4,<8.0
 
 # Interfaces
-rich
-pyqt6
-python-telegram-bot
-pystray
+rich>=13.0,<14.0
+pyqt6>=6.6,<7.0
+python-telegram-bot>=20.0,<22.0
+pystray>=0.19,<1.0
 
 # Tasks
-apscheduler
-SQLAlchemy
+apscheduler>=3.10,<4.0
+SQLAlchemy>=2.0,<3.0
 
 # Validation
-pydantic
+pydantic>=2.0,<3.0
 
 # Utils
-python-dotenv
-loguru
-psutil
-pytest
-huggingface_hub
+python-dotenv>=1.0,<2.0
+loguru>=0.7,<1.0
+psutil>=5.9,<7.0
+pytest>=7.0,<9.0
+huggingface_hub>=0.20,<2.0
