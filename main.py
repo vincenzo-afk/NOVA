@@ -1,8 +1,10 @@
-"""JARVIS entry point."""
+"""NOVA entry point."""
 
 from __future__ import annotations
 
 import json
+import logging
+import queue
 import signal
 import time
 from pathlib import Path
@@ -54,6 +56,8 @@ from web.crawler import crawl
 from web.scraper import scrape_text
 from web.search import search
 import control.win32_api as win32_api
+
+logger = logging.getLogger(__name__)
 
 
 class WebSearchArgs(BaseModel):
@@ -351,28 +355,32 @@ class JarvisApp:
         self.emotion = EmotionEngine()
         self.usage = UsageTracker()
         self._usage_alerted_day = None
-        self._hard_cap_hit = False  # fix 7.1: set True when daily hard-cap is reached
-        
-        # Add tracking for daily resets (fix 1.5)
+        self._hard_cap_hit = False
+
+        # Tracking for daily resets
         self._hard_cap_hit_date: date | None = None
-        
-        # Add summary cache tracking (fix 6.1)
+
+        # Summary cache
         self._summary_cache: dict[int, str] = {}
-        self._summary_cache_lock = threading.Lock()  # fix 3.2
+        self._summary_cache_lock = threading.Lock()
         self._last_snippet_hash: int | None = None
 
-        # Add single thread for TTS execution (fix 5.1)
-        self._tts_queue = __import__('queue').Queue()
+        # Fix #2: Use proper top-level queue import instead of __import__ anti-pattern
+        self._tts_queue: queue.Queue = queue.Queue()
         self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         self._tts_thread.start()
 
-        # Add semaphore for background summarization (fix 3.1)
         self._summarize_semaphore = threading.Semaphore(1)
 
         self._event_lock = threading.Lock()
         self._events = deque(maxlen=100)
+
+        # Fix #7: Guard Mem0Client init — skip if key is missing to avoid crash at startup
+        _mem0_key = settings.MEM0_API_KEY
+        _mem0_client = Mem0Client(api_key=_mem0_key) if _mem0_key else None
+
         self.memory = MemoryRouter(
-            mem0=Mem0Client(api_key=settings.MEM0_API_KEY),
+            mem0=_mem0_client,
             local=LocalMemoryStore(),
         )
         self.docs = DocumentStore()
@@ -424,18 +432,16 @@ class JarvisApp:
         return self.session.switch(name)
 
     def reset_context(self) -> None:
-        """Clear current session history and the associated trimmer summary (fix 1.6).
+        """Clear current session history and the associated trimmer summary.
 
-        Also auto-exports as a backup before clearing (fix 7.4).
+        Also auto-exports as a backup before clearing.
         """
         session_id = self.session.current.session_id
-        # fix 7.4: auto-backup session before clearing
         try:
             self.export_session("md")
         except Exception:
             pass
         self.session.reset_context()
-        # fix 1.6: clear the stale summary so it doesn't bleed into the new context
         self.trimmer.summaries.pop(session_id, None)
 
     def list_goals(self) -> list[dict]:
@@ -488,6 +494,8 @@ class JarvisApp:
         session = self.session.current
         timestamp = int(time.time())
         safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", session.name).strip("_") or "session"
+        # Fix #12: Ensure exports/ directory exists before writing
+        Path("exports").mkdir(parents=True, exist_ok=True)
         if fmt.lower() == "json":
             path = f"exports/{safe_name}_{timestamp}.json"
             return export_json(session.history, path)
@@ -528,7 +536,6 @@ class JarvisApp:
     def _get_mouse_keyboard(self):
         if self._mouse_keyboard is None:
             from control.mouse_keyboard import MouseKeyboard
-
             self._mouse_keyboard = MouseKeyboard()
         return self._mouse_keyboard
 
@@ -536,19 +543,16 @@ class JarvisApp:
         current_token = self.omniparser.auth_token if hasattr(self, 'omniparser') else None
         if self._omniparser_client is None:
             from vision.omniparser import OmniParserClient
-
             self._omniparser_client = OmniParserClient(
                 settings.OMNIPARSER_SERVER_URL,
                 auth_token=current_token
             )
         else:
-            # Fix 2.2: ensure token stays updated across server restarts
             self._omniparser_client.auth_token = current_token
         return self._omniparser_client
 
     def _current_ui_elements(self) -> list[dict[str, Any]]:
         from vision.capture import capture_active_window_png
-
         image_bytes = capture_active_window_png()
         return self._get_omniparser_client().ui_elements(image_bytes)
 
@@ -907,6 +911,7 @@ class JarvisApp:
         self._autonomy_thread.start()
 
     def _start_emergency_hotkey(self) -> None:
+        # Fix #15: Log warning instead of silently swallowing failures
         try:
             from pynput import keyboard
 
@@ -927,7 +932,8 @@ class JarvisApp:
                 {hotkey_str: guardrails.emergency_stop}
             )
             self._emergency_hotkey_listener.start()
-        except Exception:
+        except Exception as exc:
+            logger.warning("Emergency hotkey setup failed — hotkey will not be active: %s", exc)
             self._emergency_hotkey_listener = None
 
     def _stop_autonomy_loop(self) -> None:
@@ -1007,6 +1013,8 @@ class JarvisApp:
             self.omniparser.stop()
         except Exception:
             pass
+        # Gracefully drain the TTS queue
+        self._tts_queue.put(None)
 
     def _handle_proactive_alert(self, message: str) -> None:
         self.record_event("proactive", message)
@@ -1045,12 +1053,14 @@ class JarvisApp:
         return result
 
     def _tts_worker(self) -> None:
-        """Fix 5.1: TTS executed on a single dedicated background thread."""
+        """TTS executed on a single dedicated background thread."""
+        # Fix #4: Log import failure so user knows TTS is unavailable
         try:
             from voice.tts_offline import speak as speak_offline
-        except Exception:
+        except Exception as exc:
+            logger.warning("TTS offline module unavailable — voice output disabled: %s", exc)
             return
-            
+
         while True:
             text = self._tts_queue.get()
             if text is None:
@@ -1058,8 +1068,8 @@ class JarvisApp:
                 break
             try:
                 speak_offline(text)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("TTS speak error: %s", exc)
             finally:
                 self._tts_queue.task_done()
 
@@ -1155,8 +1165,7 @@ class JarvisApp:
 
     def _context_messages(self, user_text: str) -> tuple[str, list[dict], list[dict]]:
         session_id = self.session.current.session_id
-        
-        # Check if we need to trigger background summarization
+
         history = self.session.current.history
         if len(history) > self.trimmer.max_raw_turns:
             older = history[: -self.trimmer.max_raw_turns]
@@ -1165,17 +1174,16 @@ class JarvisApp:
                 for turn in older
                 if turn.get("content")
             )
-            # Trigger background summarization if snippet changed
+            # Fix #3: Remove redundant 'import threading' — already imported at top level
             if not hasattr(self, '_last_snippet_hash') or hash(snippet) != self._last_snippet_hash:
                 self._last_snippet_hash = hash(snippet)
-                import threading
                 thread = threading.Thread(
                     target=self._summarize_history_background,
                     args=(snippet, session_id),
                     daemon=True
                 )
                 thread.start()
-        
+
         summary, recent = self.trimmer.trim(
             history,
             session_id=session_id,
@@ -1184,7 +1192,6 @@ class JarvisApp:
         memories = self.memory.search(user_text, session_id=session_id, top_k=DEFAULT_MEMORY_TOP_K)
         world_state = snapshot_environment()
 
-        # fix 2.13: strip clipboard content unless explicitly opt-ed in
         if not settings.INCLUDE_CLIPBOARD_IN_CONTEXT:
             world_state.pop("clipboard", None)
 
@@ -1206,13 +1213,10 @@ class JarvisApp:
             emotion=self.emotion.state,
         )
 
-        # Fix 2.9: Check total token count and trim if needed
         all_messages = [context_message, *recent]
         try:
             total_tokens = estimate_tokens_from_messages(all_messages)
-            # If exceeding ~8000 tokens, drop oldest raw turns beyond what ContextTrimmer handles
             if total_tokens > 8000 and len(recent) > 2:
-                # Keep at least 2 recent turns, drop the rest
                 keep_count = max(2, len(recent) - (total_tokens - 8000) // 500)
                 recent = recent[-keep_count:]
                 all_messages = [context_message, *recent]
@@ -1225,30 +1229,26 @@ class JarvisApp:
         """Summarize conversation history. Uses cached summary if available."""
         if not text.strip():
             return ""
-        
-        # Check if we have a cached summary for this text
+
         text_hash = hash(text)
         with self._summary_cache_lock:
             if text_hash in self._summary_cache:
                 return self._summary_cache[text_hash]
-        
-        # If no cache, return truncated text (will be summarized in background)
+
         return text[:700]
-    
+
     def _summarize_history_background(self, text: str, session_id: str) -> None:
         """Summarize history in background thread and update cache."""
         if not text.strip():
             return
-            
-        # Fix 3.1: Bound concurrency with semaphore
+
         if not self._summarize_semaphore.acquire(blocking=False):
-            return  # Already summarizing, skip this one
-            
+            return
+
         try:
             system = "Summarize the conversation history into a concise paragraph for future context."
             try:
                 summary = self.engine.ask(prompt=text, system=system, history=[])
-                # Fix 3.2: Lock around _summary_cache writes
                 with self._summary_cache_lock:
                     self._summary_cache[hash(text)] = summary
                 self.trimmer.summaries[session_id] = summary
@@ -1288,7 +1288,6 @@ class JarvisApp:
             now_muted = self.toggle_mute()
             return "Muted." if now_muted else "Unmuted."
         if re.match(r"^switch session\s+.+$", text):
-            # Fix 6.8: Extract session name from original user_text to preserve case
             name = user_text.strip().split(maxsplit=2)[-1]
             state = self.switch_session(name)
             return f"Switched to {state.name} ({state.session_id})."
@@ -1301,9 +1300,15 @@ class JarvisApp:
         allow_tools: bool = True,
         dry_run_tools: bool = False,
     ) -> Generator[str, None, None]:
+        # Fix #8: Check hard cap BEFORE any LLM call (was checked after, one turn too late)
         if self._hard_cap_hit:
-            yield f"Daily token hard cap of {settings.DAILY_TOKEN_HARD_CAP} reached. Further calls blocked."
-            return
+            today = date.today()
+            if self._hard_cap_hit_date != today:
+                self._hard_cap_hit = False
+                self._hard_cap_hit_date = None
+            else:
+                yield f"Daily token hard cap of {settings.DAILY_TOKEN_HARD_CAP} reached. Further calls blocked."
+                return
 
         command_response = self._apply_text_commands(user_text)
         if command_response:
@@ -1360,12 +1365,10 @@ class JarvisApp:
         today = date.today()
         total = self.usage.total_tokens_today(session_id=session_id)
 
-        # fix 1.5: clear hard cap if day resets
         if self._hard_cap_hit_date != today:
             self._hard_cap_hit = False
             self._hard_cap_hit_date = None
 
-        # fix 7.1: hard cap — refuse further LLM calls and alert
         hard_cap = settings.DAILY_TOKEN_HARD_CAP
         if hard_cap > 0 and total >= hard_cap and not self._hard_cap_hit:
             self._hard_cap_hit = True
@@ -1376,7 +1379,6 @@ class JarvisApp:
             )
             print(msg)
             try:
-                # Fix 1.2: Use valid telegram notifier signature
                 self._notify_telegram(msg)
             except Exception:
                 pass
@@ -1398,7 +1400,7 @@ def main() -> int:
         print(str(exc))
         return 1
 
-    # fix 7.8: graceful shutdown on SIGTERM and SIGINT
+    # Graceful shutdown on SIGTERM and SIGINT
     def _shutdown_handler(*_):
         print("\n[signal] Shutdown signal received — cleaning up…")
         app.shutdown()
