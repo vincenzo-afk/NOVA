@@ -96,9 +96,10 @@ class Settings:
     GOAL_STEP_TIMEOUT_SECONDS: float = 60.0
 
     # Paths / data
-    DATA_DIR: str = "."
+    DATA_DIR: str = "~/.jarvis/data"
     EMERGENCY_STOP_FILE: str = ".jarvis/emergency_stop"
     NOVA_HEALTH_PORT: int = 8765
+    NOVA_STARTUP_DELAY_SECONDS: float = 0.0
 
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "Settings":
@@ -188,9 +189,10 @@ class Settings:
             AUTONOMY_NOTIFY_TELEGRAM=env_bool("AUTONOMY_NOTIFY_TELEGRAM", "true"),
             AUTONOMY_NOTIFY_TTS=env_bool("AUTONOMY_NOTIFY_TTS", "false"),
             GOAL_STEP_TIMEOUT_SECONDS=env_float("GOAL_STEP_TIMEOUT_SECONDS", 60.0),
-            DATA_DIR=env("DATA_DIR", "."),
+            DATA_DIR=env("DATA_DIR", "~/.jarvis/data"),
             EMERGENCY_STOP_FILE=env("EMERGENCY_STOP_FILE", ".jarvis/emergency_stop"),
             NOVA_HEALTH_PORT=env_int("NOVA_HEALTH_PORT", 8765),
+            NOVA_STARTUP_DELAY_SECONDS=env_float("NOVA_STARTUP_DELAY_SECONDS", 0.0),
         )
 
     _PLACEHOLDER_KEYS = {"key1", "key2", "key3", "key_a", "key_b", "ghp_test_key", "your_key_here", ""}
@@ -202,15 +204,18 @@ class Settings:
         Bug fix (Minor/2): Static allowlist missed novel placeholders like CHANGE_ME or xxx.
         Now also rejects keys that are too short or have insufficient entropy.
         """
-        import math
         k = key.strip()
         if k.lower() in self._PLACEHOLDER_KEYS:
             return True
         if len(k) < self._MIN_REAL_KEY_LENGTH:
             return True
-        # Entropy check: real keys have varied characters
-        unique_chars = len(set(k))
-        if unique_chars < 6:
+        # Entropy check: real keys have varied characters.
+        # A simple unique-char count misses low-entropy repeated patterns.
+        from collections import Counter
+        import math
+        probs = [count / len(k) for count in Counter(k).values()]
+        entropy = -sum(p * math.log2(p) for p in probs if p > 0.0)
+        if entropy < 2.5:
             return True
         return False
 

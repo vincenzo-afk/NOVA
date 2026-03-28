@@ -44,12 +44,15 @@ class SessionManager:
         """Serialize session history to a JSON file for crash recovery (fix 2.6)."""
         try:
             import json
+            import hashlib
             from pathlib import Path
             import tempfile
             import shutil
             sessions_dir = Path(".jarvis_sessions")
             sessions_dir.mkdir(exist_ok=True)
-            safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in session.name)
+            base_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in session.name)
+            suffix = hashlib.sha256(session.name.encode("utf-8")).hexdigest()[:8]
+            safe_name = f"{base_name}_{suffix}"
             path = sessions_dir / f"{safe_name}.json"
             backup_path = sessions_dir / f"{safe_name}.json.bak"
             with session._lock:
@@ -75,10 +78,12 @@ class SessionManager:
                 tmp.flush()
                 tmp_path = Path(tmp.name)
             try:
-                if tmp_path.stat().st_dev != sessions_dir.stat().st_dev:
-                    raise OSError("temporary file and destination are on different devices; atomic replace not guaranteed")
-            except Exception:
-                pass
+                tmp_dev = tmp_path.stat().st_dev
+                dst_dev = sessions_dir.stat().st_dev
+            except OSError:
+                tmp_dev = dst_dev = None
+            if tmp_dev is not None and dst_dev is not None and tmp_dev != dst_dev:
+                raise OSError("temporary file and destination are on different devices; atomic replace not guaranteed")
             tmp_path.replace(path)
         except Exception:
             pass
@@ -87,10 +92,13 @@ class SessionManager:
         """Load session history from JSON file if it exists (fix 2.6)."""
         try:
             import json
+            import hashlib
             from pathlib import Path
             import logging
             sessions_dir = Path(".jarvis_sessions")
-            safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in name)
+            base_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in name)
+            suffix = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+            safe_name = f"{base_name}_{suffix}"
             path = sessions_dir / f"{safe_name}.json"
             backup_path = sessions_dir / f"{safe_name}.json.bak"
             candidates = [path, backup_path]

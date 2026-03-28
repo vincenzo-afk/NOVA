@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from config.constants import AGENT_NAME
+import time
+from pathlib import Path
+
+from config.constants import AGENT_NAME, CLI_PIN_HASH_FILE, CLI_PIN_LEGACY_FILE, CLI_PIN_LOCK_FILE
 from utils.events import format_event_log
 from utils.goals import format_goal_list
 from utils.health import format_health_table, summarize_health
@@ -39,7 +42,6 @@ def run_cli(agent) -> None:
     import getpass
     import hashlib
     import hmac
-    from pathlib import Path
 
     def _verify_pin(entered: str, stored: str) -> bool:
         value = (stored or "").strip()
@@ -61,8 +63,9 @@ def run_cli(agent) -> None:
         return hmac.compare_digest(entered, value)
 
     pin_hash = ""
-    pin_hash_file = Path(".jarvis/cli_pin_hash")
-    legacy_pin_file = Path(".jarvis/cli_pin")
+    pin_hash_file = Path(CLI_PIN_HASH_FILE)
+    legacy_pin_file = Path(CLI_PIN_LEGACY_FILE)
+    lock_file = Path(CLI_PIN_LOCK_FILE)
     if pin_hash_file.exists():
         try:
             pin_hash = pin_hash_file.read_text(encoding="utf-8").strip()
@@ -75,9 +78,32 @@ def run_cli(agent) -> None:
             pin_hash = ""
 
     if pin_hash:
-        entered = getpass.getpass("Enter CLI_PIN to unlock NOVA: ")
-        if not _verify_pin(entered, pin_hash):
-            print("Access Denied.")
+        if lock_file.exists():
+            try:
+                unlock_at = float(lock_file.read_text(encoding="utf-8").strip() or "0")
+                if time.time() < unlock_at:
+                    wait = int(unlock_at - time.time())
+                    print(f"Access temporarily locked. Try again in {wait}s.")
+                    return
+            except Exception:
+                pass
+
+        failed = 0
+        while failed < 5:
+            entered = getpass.getpass("Enter CLI_PIN to unlock NOVA: ")
+            if _verify_pin(entered, pin_hash):
+                try:
+                    lock_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                break
+            failed += 1
+            delay = min(30, 2 ** failed)
+            time.sleep(delay)
+        else:
+            lock_file.parent.mkdir(parents=True, exist_ok=True)
+            lock_file.write_text(str(time.time() + 300), encoding="utf-8")
+            print("Access Denied. Too many failed attempts.")
             return
 
     console = Console()

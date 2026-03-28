@@ -80,6 +80,7 @@ services:
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
       - OMNIPARSER_SERVER_URL=http://omniparser:8000
+      - NOVA_STARTUP_DELAY_SECONDS=8
     env_file:
       - .env
     volumes:

@@ -27,11 +27,8 @@ class ContextTrimmer:
 
             older = history[: -self.max_raw_turns]
             recent = history[-self.max_raw_turns :]
-
-            # Fix 3.3: Only recompute summary when the number of older turns changes
             last_count = self._last_summarized_count.get(session_id, 0)
             if len(older) == last_count and summary:
-                # No new turns to summarize, reuse existing summary
                 return summary, recent
 
             snippet = " ".join(
@@ -39,16 +36,17 @@ class ContextTrimmer:
                 for turn in older
                 if turn.get("content")
             )
-            compressed = summarizer(snippet) if summarizer else snippet[:700]
-            if not str(compressed).strip():
-                # Fallback when async summarizer cache is not ready yet.
-                compressed = snippet[:700]
 
-            if summary:
-                summary = (summary + " " + compressed).strip()[:1200]
+        compressed = summarizer(snippet) if summarizer else snippet[:700]
+        if not str(compressed).strip():
+            compressed = snippet[:700]
+
+        with self._lock:
+            latest = self.summaries.get(session_id, "")
+            if latest:
+                latest = (latest + " " + compressed).strip()[:1200]
             else:
-                summary = compressed[:1200]
-
-            self.summaries[session_id] = summary
+                latest = compressed[:1200]
+            self.summaries[session_id] = latest
             self._last_summarized_count[session_id] = len(older)
-            return summary, recent
+            return latest, recent

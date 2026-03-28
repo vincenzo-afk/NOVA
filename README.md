@@ -744,6 +744,7 @@ Each phase produces something **fully working and testable** before you move on.
      def my_tool_function(**kwargs): ...
      ```
    - Auto-registers into dispatcher — no core edits needed
+   - Security note: plugins are trusted local code; sandboxing is best-effort, not a complete isolation boundary
 
 **Testable milestone:** Give GitHub token → *"List my open PRs"* → done. Drop a custom plugin file → restart → new tool available automatically.
 

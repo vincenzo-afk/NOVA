@@ -121,11 +121,8 @@ def run_tray(agent: Any) -> None:
     def on_health(_icon, _item):
         try:
             _notify("NOVA Health", _format_health_summary(agent))
-        except Exception:
-            try:
-                _notify("NOVA Health", _format_health_summary(agent))
-            except Exception as exc:
-                _notify("NOVA Health", f"Health unavailable: {exc}")
+        except Exception as exc:
+            _notify("NOVA Health", f"Health unavailable: {exc}")
 
     def on_goals(_icon, _item):
         try:

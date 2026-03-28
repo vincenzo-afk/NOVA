@@ -81,7 +81,7 @@ class Dispatcher:
             return
         kwargs = {field_name: None for field_name in schema.model_fields.keys()}
         try:
-            signature.bind_partial(**kwargs)
+            signature.bind(**kwargs)
         except TypeError as exc:
             raise TypeError(
                 f"Tool registration failed for '{name}': function signature does not "

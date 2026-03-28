@@ -18,10 +18,11 @@ class QRPairing:
 
     def local_ip(self) -> str:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.connect(("8.8.8.8", 80))
-        ip = sock.getsockname()[0]
-        sock.close()
-        return ip
+        try:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+        finally:
+            sock.close()
 
     def resolve_target_ip(self, prefer_remote: bool = False) -> str:
         if prefer_remote:

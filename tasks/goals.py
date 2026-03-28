@@ -75,6 +75,13 @@ class GoalRunner:
         self.step_delay_seconds = max(0.0, step_delay_seconds)  # fix 1.7
         self.step_timeout_seconds = max(1.0, float(step_timeout_seconds))
         self._sleep_fn = sleep_fn
+        self._executor = ThreadPoolExecutor(max_workers=1)
+
+    def close(self) -> None:
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            self._executor.shutdown(wait=False)
 
     def run(
         self,
@@ -129,8 +136,7 @@ class GoalRunner:
                 )
 
             guard.record(tool, args)
-            pool = ThreadPoolExecutor(max_workers=1)
-            future = pool.submit(self.dispatcher.execute, call, None, None, dry_run, True)
+            future = self._executor.submit(self.dispatcher.execute, call, None, None, dry_run, True)
             try:
                 result = future.result(timeout=self.step_timeout_seconds)
             except FuturesTimeout:
@@ -141,11 +147,6 @@ class GoalRunner:
                     results=results,
                     next_index=idx,
                 )
-            finally:
-                try:
-                    pool.shutdown(wait=False, cancel_futures=True)
-                except TypeError:
-                    pool.shutdown(wait=False)
             results.append(result)
             if on_step is not None:
                 try:

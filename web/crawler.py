@@ -58,6 +58,7 @@ def crawl(seed_url: str, max_pages: int = 5, max_depth: int = 2) -> list[str]:
         for link in soup.find_all("a", href=True):
             nxt = urljoin(url, link["href"])
             if urlparse(nxt).netloc == domain and nxt not in seen:
-                queue.append((nxt, depth + 1))
+                if len(queue) < max_pages * 10:
+                    queue.append((nxt, depth + 1))
 
     return pages

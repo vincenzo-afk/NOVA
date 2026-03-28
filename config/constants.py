@@ -21,3 +21,8 @@ DEFAULT_MEMORY_TOP_K = 5
 DEFAULT_RATE_LIMIT_TTL = 60
 DEFAULT_HEARTBEAT_SECONDS = 60
 MAX_CONTEXT_TOKENS = 12000
+
+# Auth / security
+CLI_PIN_HASH_FILE = ".jarvis/cli_pin_hash"
+CLI_PIN_LEGACY_FILE = ".jarvis/cli_pin"
+CLI_PIN_LOCK_FILE = ".jarvis/cli_pin.lock"
