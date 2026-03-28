@@ -18,6 +18,7 @@ class UsageTracker:
         self._daily: dict[date, dict[str, dict[str, UsageEntry]]] = defaultdict(
             lambda: defaultdict(lambda: defaultdict(UsageEntry))
         )
+        self._max_days = 8
 
     def add(
         self,
@@ -27,7 +28,12 @@ class UsageTracker:
         session_id: str = "default",
         when: date | None = None,
     ) -> None:
-        entry = self._daily[when or date.today()][session_id][provider]
+        today = when or date.today()
+        cutoff = today - timedelta(days=self._max_days - 1)
+        for day_key in list(self._daily.keys()):
+            if day_key < cutoff:
+                self._daily.pop(day_key, None)
+        entry = self._daily[today][session_id][provider]
         entry.input_tokens += input_tokens
         entry.output_tokens += output_tokens
 

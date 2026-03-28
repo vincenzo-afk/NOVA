@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+MAX_DOC_SIZE_BYTES = 50 * 1024 * 1024  # 50MB
+
 
 class DocumentLoader:
     @staticmethod
@@ -22,6 +24,10 @@ class DocumentLoader:
         path = Path(filepath)
         if not path.exists():
             raise FileNotFoundError(f"Document not found: {filepath}")
+        if path.stat().st_size > MAX_DOC_SIZE_BYTES:
+            raise ValueError(
+                f"Document too large: {path.stat().st_size} bytes exceeds {MAX_DOC_SIZE_BYTES} byte limit"
+            )
 
         suffix = path.suffix.lower()
 

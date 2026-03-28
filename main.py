@@ -6,6 +6,9 @@ import json
 import signal
 import time
 import hashlib
+import ipaddress
+import os
+import socket
 from pathlib import Path
 import re
 import threading
@@ -360,7 +363,9 @@ class NOVAApp:
         # Add summary cache tracking (fix 6.1, 11)
         self._summary_cache = OrderedDict()  # Fix 11
         self._summary_cache_lock = threading.Lock()  # fix 3.2
-        self._last_snippet_hash: str | None = None
+        self._last_snippet_hashes: dict[str, str] = {}
+        self._summary_submit_lock = threading.Lock()
+        self._summary_inflight: set[str] = set()
 
         # Add single thread for TTS execution (fix 5.1)
         self._tts_queue = queue.Queue()
@@ -379,6 +384,7 @@ class NOVAApp:
         )
         self.docs = DocumentStore()
         self._browser: Browser | None = None
+        self._browser_lock = threading.RLock()
         self._mouse_keyboard: Any | None = None
         self._omniparser_client: Any | None = None
         # Fix 7: ADB client connection validation
@@ -422,6 +428,7 @@ class NOVAApp:
         self._autonomy_stop = threading.Event()
         self._autonomy_thread: threading.Thread | None = None
         self._autonomy_start_lock = threading.Lock()
+        self._boot_time = time.monotonic()
         self._emergency_hotkey_listener: Any | None = None
         self.screen_watcher = ScreenWatcher(
             interval_seconds=settings.PROACTIVE_WATCHER_INTERVAL,
@@ -480,7 +487,8 @@ class NOVAApp:
     def switch_session(self, name: str):
         state = self.session.switch(name)
         # Session isolation: reset stateful tool clients on session switch.
-        self._browser_close()
+        with self._browser_lock:
+            self._browser_close()
         self._mouse_keyboard = None
         if getattr(self, "adb", None):
             try:
@@ -663,38 +671,46 @@ class NOVAApp:
         }
 
     def _browser_open(self, url: str) -> str:
-        self._get_browser().open(url)
+        with self._browser_lock:
+            self._get_browser().open(url)
         return f"opened {url}"
 
     def _browser_click(self, selector: str) -> str:
-        self._get_browser().click(selector)
+        with self._browser_lock:
+            self._get_browser().click(selector)
         return f"clicked {selector}"
 
     def _browser_fill(self, selector: str, value: str) -> str:
-        self._get_browser().fill(selector, value)
+        with self._browser_lock:
+            self._get_browser().fill(selector, value)
         return f"filled {selector}"
 
     def _browser_extract_text(self) -> str:
-        return self._get_browser().extract_text()
+        with self._browser_lock:
+            return self._get_browser().extract_text()
 
     def _browser_get_links(self) -> list[str]:
-        return self._get_browser().get_links()
+        with self._browser_lock:
+            return self._get_browser().get_links()
 
     def _browser_wait_for_text(self, text: str, timeout_ms: int = 10_000) -> bool:
-        return self._get_browser().wait_for_text(text, timeout_ms=timeout_ms)
+        with self._browser_lock:
+            return self._get_browser().wait_for_text(text, timeout_ms=timeout_ms)
 
     def _browser_screenshot(self, path: str = "assets/browser_screen.png") -> str:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        self._get_browser().screenshot(path=str(target))
+        with self._browser_lock:
+            self._get_browser().screenshot(path=str(target))
         return str(target)
 
     def _browser_close(self) -> str:
-        if self._browser is None:
-            return "browser not running"
-        self._browser.close()
-        self._browser = None
-        return "browser closed"
+        with self._browser_lock:
+            if self._browser is None:
+                return "browser not running"
+            self._browser.close()
+            self._browser = None
+            return "browser closed"
 
     def _schedule_prompt(self, schedule_text: str, prompt: str, job_id: str | None = None) -> dict:
         job_id = job_id or f"job_{int(time.time())}"
@@ -817,6 +833,34 @@ class NOVAApp:
         self._goal_plan_executor.submit(background_plan)
         return record
 
+    def _on_goal_step_completed(self, goal_id: str, step_index: int, step_result: dict[str, Any]) -> None:
+        with self._goal_lock:
+            for item in self._goals:
+                if item.get("id") != goal_id:
+                    continue
+                item["cursor"] = step_index + 1
+                item["last_step_result"] = step_result
+                item["updated_at"] = time.time()
+                self._persist_goals()
+                break
+
+    def _doc_ingest(self, filepath: str) -> dict:
+        raw = filepath.strip()
+        if ".." in raw.replace("\\", "/").split("/"):
+            return {"status": "error", "reason": "path_traversal_blocked"}
+        target = Path(raw).expanduser().resolve()
+        protected_prefixes = [Path("/etc"), Path("/proc"), Path("/sys"), Path("/dev")]
+        if any(str(target).startswith(str(p)) for p in protected_prefixes):
+            return {"status": "error", "reason": "path_not_allowed"}
+        allowed_roots = [
+            Path(os.getenv("NOVA_DOCS_ROOT", str(Path.cwd()))).expanduser().resolve(),
+            Path.home().resolve(),
+            Path(Path(os.getenv("TMPDIR", "/tmp")).resolve()),
+        ]
+        if not any(str(target).startswith(str(root)) for root in allowed_roots):
+            return {"status": "error", "reason": "path_outside_allowed_roots"}
+        return self.docs.ingest(str(target))
+
     def _persist_goals(self) -> None:
         try:
             self._goals_file.write_text(json.dumps(self._goals, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -888,14 +932,29 @@ class NOVAApp:
             except Exception:
                 pass
             is_local = parsed_host in {"localhost", "127.0.0.1", "::1"}
-            if key and parsed_scheme == "http" and not is_local:
-                return {
-                    "status": "error",
-                    "reason": (
-                        "Refusing to inject Authorization header over plain HTTP. "
-                        "Use an HTTPS endpoint or a localhost address."
-                    ),
-                }
+            if key and parsed_scheme == "http":
+                resolved_private = False
+                try:
+                    addrs = {row[4][0] for row in socket.getaddrinfo(parsed_host, None)}
+                    resolved_private = True
+                    for ip in addrs:
+                        parsed_ip = ipaddress.ip_address(ip)
+                        mapped = getattr(parsed_ip, "ipv4_mapped", None)
+                        if mapped is not None:
+                            parsed_ip = mapped
+                        if not (parsed_ip.is_private or parsed_ip.is_loopback):
+                            resolved_private = False
+                            break
+                except Exception:
+                    resolved_private = False
+                if not (is_local or resolved_private):
+                    return {
+                        "status": "error",
+                        "reason": (
+                            "Refusing to inject Authorization header over plain HTTP. "
+                            "Use an HTTPS endpoint or a local/private address."
+                        ),
+                    }
             merged_headers = dict(headers or {})
             if key and "Authorization" not in merged_headers:
                 merged_headers["Authorization"] = f"Bearer {key}"
@@ -990,6 +1049,8 @@ class NOVAApp:
         # Critical fix (5.3): Register LLM engine health — previously Ollama crashes had
         # no health check, so failures were silent with no auto-restart attempted.
         def _check_llm_engine() -> bool:
+            if (time.monotonic() - self._boot_time) < 90:
+                return True
             try:
                 import requests as _req
                 resp = _req.get(
@@ -1123,12 +1184,24 @@ class NOVAApp:
             with self._execution_lock:
                 if approved_for_step:
                     # Bypass guardrails for just ONE step.
-                    self.autonomy_runner.confirm_callback = lambda p: True
-                    result = self.autonomy_runner.run(steps, max_steps=max_steps, start_index=start_index)
-                    # Restore callback
-                    self.autonomy_runner.confirm_callback = self._autonomy_confirm_callback
+                    try:
+                        self.autonomy_runner.confirm_callback = lambda p: True
+                        result = self.autonomy_runner.run(
+                            steps,
+                            max_steps=max_steps,
+                            start_index=start_index,
+                            on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
+                        )
+                    finally:
+                        # Restore callback even if run() raises.
+                        self.autonomy_runner.confirm_callback = self._autonomy_confirm_callback
                 else:
-                    result = self.autonomy_runner.run(steps, max_steps=max_steps, start_index=start_index)
+                    result = self.autonomy_runner.run(
+                        steps,
+                        max_steps=max_steps,
+                        start_index=start_index,
+                        on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
+                    )
 
             status = "completed" if result.status == "completed" else "paused"
             if result.status == "stopped" and "Cycle detected" in result.reason:
@@ -1184,13 +1257,14 @@ class NOVAApp:
                 self._emergency_hotkey_listener.stop()
             except Exception:
                 pass
-        self._browser_close()
+        with self._browser_lock:
+            self._browser_close()
         try:
             self.omniparser.stop()
         except Exception:
             pass
         self._summarize_executor.shutdown(wait=False)
-        self._goal_plan_executor.shutdown(wait=True)
+        self._goal_plan_executor.shutdown(wait=False, cancel_futures=True)
         # Bug fix: drain TTS queue on shutdown so the worker thread exits cleanly
         try:
             self._tts_queue.put(None)   # sentinel to stop the worker
@@ -1286,7 +1360,7 @@ class NOVAApp:
         self.dispatcher.register("web.search", search, WebSearchArgs)
         self.dispatcher.register("web.scrape", scrape_text, WebScrapeArgs)
         self.dispatcher.register("web.crawl", crawl, WebCrawlArgs)
-        self.dispatcher.register("doc.ingest", self.docs.ingest, DocIngestArgs)
+        self.dispatcher.register("doc.ingest", self._doc_ingest, DocIngestArgs)
         self.dispatcher.register("doc.query", self.docs.query, DocQueryArgs)
         self.dispatcher.register("doc.list", self.docs.list_docs, EmptyArgs)
         self.dispatcher.register("session.switch", lambda name: self.switch_session(name).name, SessionSwitchArgs)
@@ -1375,11 +1449,20 @@ class NOVAApp:
             )
             # Trigger background summarization if snippet changed
             snippet_hash = hashlib.sha256(snippet.encode("utf-8")).hexdigest()
-            if not hasattr(self, '_last_snippet_hash') or snippet_hash != self._last_snippet_hash:
-                self._last_snippet_hash = snippet_hash
-                self._summarize_executor.submit(
-                    self._summarize_history_background, snippet, session_id
-                )
+            with self._summary_submit_lock:
+                last_hash = self._last_snippet_hashes.get(session_id)
+                if snippet_hash != last_hash and session_id not in self._summary_inflight:
+                    self._last_snippet_hashes[session_id] = snippet_hash
+                    self._summary_inflight.add(session_id)
+
+                    def _job(sn=snippet, sid=session_id):
+                        try:
+                            self._summarize_history_background(sn, sid)
+                        finally:
+                            with self._summary_submit_lock:
+                                self._summary_inflight.discard(sid)
+
+                    self._summarize_executor.submit(_job)
         
         summary, recent = self.trimmer.trim(
             history,
@@ -1573,48 +1656,71 @@ class NOVAApp:
 
         output_chunks: list[str] = []
         stream = self.engine.ask_stream(prompt=user_text, system=system_prompt, history=history)
+        user_added = False
+        committed = False
+        assistant_text = ""
 
-        # Fix 4: Only commit user history after successfully starting to stream response
         try:
-            first_token = next(stream)
-            self.session.add_turn("user", user_text)
-            output_chunks.append(first_token)
-            yield first_token
-            for token in stream:
-                output_chunks.append(token)
-                yield token
-        except StopIteration:
-            self.session.add_turn("user", user_text)
-            self.session.add_turn("assistant", "")
+            try:
+                first_token = next(stream)
+                self.session.add_turn("user", user_text)
+                user_added = True
+                output_chunks.append(first_token)
+                yield first_token
+                for token in stream:
+                    output_chunks.append(token)
+                    yield token
+            except StopIteration:
+                if not user_added:
+                    self.session.add_turn("user", user_text)
+                    user_added = True
+            except RuntimeError as exc:
+                # PEP 479: inner StopIteration may surface as RuntimeError.
+                if "StopIteration" in str(exc):
+                    if not user_added:
+                        self.session.add_turn("user", user_text)
+                        user_added = True
+                else:
+                    raise
+
+            assistant_text = "".join(output_chunks).strip()
+            self._track_usage(system_prompt, history, user_text, assistant_text)
+            tool_call = self.dispatcher.try_parse_tool_call(assistant_text) if allow_tools else None
+            if tool_call:
+                result = self.dispatcher.execute(tool_call, dry_run=dry_run_tools)
+                tool_result_text = f"[tool_result] {json.dumps(result, ensure_ascii=False)}"
+                if output_chunks:
+                    yield "\n"
+                yield tool_result_text
+                assistant_text = tool_result_text
+
+            self.session.add_turn("assistant", assistant_text)
             self.memory.add(
-                text=f"User: {user_text}\nAssistant: ",
+                text=f"User: {user_text}\nAssistant: {assistant_text}",
                 session_id=self.session.current.session_id,
                 metadata={"source": "conversation"},
             )
             self.memory.sync_pending(self.session.current.session_id)
-            return
+            committed = True
         except Exception as exc:
             yield f"[ERROR] Generation failed: {exc}"
-            return
-
-        assistant_text = "".join(output_chunks).strip()
-        self._track_usage(system_prompt, history, user_text, assistant_text)
-        tool_call = self.dispatcher.try_parse_tool_call(assistant_text) if allow_tools else None
-        if tool_call:
-            result = self.dispatcher.execute(tool_call, dry_run=dry_run_tools)
-            tool_result_text = f"[tool_result] {json.dumps(result, ensure_ascii=False)}"
-            if output_chunks:
-                yield "\n"
-            yield tool_result_text
-            assistant_text = tool_result_text
-
-        self.session.add_turn("assistant", assistant_text)
-        self.memory.add(
-            text=f"User: {user_text}\nAssistant: {assistant_text}",
-            session_id=self.session.current.session_id,
-            metadata={"source": "conversation"},
-        )
-        self.memory.sync_pending(self.session.current.session_id)
+        finally:
+            # If caller abandons this generator mid-stream, persist partial output.
+            if not committed and (user_added or output_chunks):
+                partial = assistant_text or "".join(output_chunks).strip()
+                if not user_added:
+                    self.session.add_turn("user", user_text)
+                try:
+                    self._track_usage(system_prompt, history, user_text, partial)
+                except Exception:
+                    pass
+                self.session.add_turn("assistant", partial)
+                self.memory.add(
+                    text=f"User: {user_text}\nAssistant: {partial}",
+                    session_id=self.session.current.session_id,
+                    metadata={"source": "conversation"},
+                )
+                self.memory.sync_pending(self.session.current.session_id)
 
     def _adb_send_sms(self, phone_number: str, body: str) -> str:
         """Fix 10: Enforce allowlist for SMS delivery."""

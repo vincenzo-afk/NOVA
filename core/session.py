@@ -44,16 +44,23 @@ class SessionManager:
             import json
             from pathlib import Path
             import tempfile
+            import shutil
             sessions_dir = Path(".jarvis_sessions")
             sessions_dir.mkdir(exist_ok=True)
             safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in session.name)
             path = sessions_dir / f"{safe_name}.json"
+            backup_path = sessions_dir / f"{safe_name}.json.bak"
             with session._lock:
                 history_snapshot = list(session.history)
                 session_name = session.name
                 session_id = session.session_id
             data = {"name": session_name, "session_id": session_id, "history": history_snapshot}
             payload = json.dumps(data, ensure_ascii=False, indent=2)
+            if path.exists():
+                try:
+                    shutil.copy2(path, backup_path)
+                except Exception:
+                    pass
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
@@ -73,14 +80,26 @@ class SessionManager:
         try:
             import json
             from pathlib import Path
+            import logging
             sessions_dir = Path(".jarvis_sessions")
             safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in name)
             path = sessions_dir / f"{safe_name}.json"
-            if path.exists():
-                data = json.loads(path.read_text(encoding="utf-8"))
-                session = SessionState(name=data["name"], session_id=data["session_id"])
-                session.history = data.get("history", [])
-                return session
+            backup_path = sessions_dir / f"{safe_name}.json.bak"
+            candidates = [path, backup_path]
+            for candidate in candidates:
+                if not candidate.exists():
+                    continue
+                try:
+                    data = json.loads(candidate.read_text(encoding="utf-8"))
+                    session = SessionState(name=data["name"], session_id=data["session_id"])
+                    session.history = data.get("history", [])
+                    return session
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        "Failed to load session file %s: %s",
+                        candidate,
+                        exc,
+                    )
         except Exception:
             pass
         return None

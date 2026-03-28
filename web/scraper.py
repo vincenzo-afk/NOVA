@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from urllib.parse import urlparse
 
 import requests
@@ -45,7 +46,20 @@ def _is_private_ip(ip: str) -> bool:
         return False
 
 
-def _validate_url(url: str) -> None:
+def _resolve_host(hostname: str, timeout_seconds: float = 5.0) -> list[str]:
+    def _run() -> list[str]:
+        addr_info = socket.getaddrinfo(hostname, None)
+        return [info[4][0] for info in addr_info]
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(_run)
+        try:
+            return fut.result(timeout=timeout_seconds)
+        except FuturesTimeout as exc:
+            raise ValueError(f"DNS resolution timed out for {hostname!r}") from exc
+
+
+def _validate_url(url: str) -> tuple[str, str, str]:
     """Raise ValueError if the URL resolves to a private/internal IP (SSRF guard)."""
     parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
@@ -55,20 +69,33 @@ def _validate_url(url: str) -> None:
     if not hostname:
         raise ValueError("URL has no hostname")
     try:
-        addr_info = socket.getaddrinfo(hostname, None)
-        resolved_ips = [info[4][0] for info in addr_info]
-    except socket.gaierror as exc:
+        resolved_ips = _resolve_host(hostname, timeout_seconds=5.0)
+    except (socket.gaierror, ValueError) as exc:
         raise ValueError(f"DNS resolution failed for {hostname!r}: {exc}") from exc
     for ip in resolved_ips:
         if _is_private_ip(ip):
             raise ValueError(
                 f"SSRF blocked: {hostname!r} resolves to private/internal IP {ip}"
             )
+    return scheme, hostname, resolved_ips[0]
 
 
 def scrape_text(url: str) -> str:
-    _validate_url(url)
-    response = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 (JARVIS/1.0)"})
+    scheme, hostname, resolved_ip = _validate_url(url)
+    headers = {"User-Agent": "Mozilla/5.0 (JARVIS/1.0)"}
+    request_url = url
+    # Mitigate DNS rebinding: for plain HTTP, connect directly to validated IP.
+    if scheme == "http":
+        parsed = urlparse(url)
+        netloc = resolved_ip
+        if parsed.port:
+            netloc = f"{resolved_ip}:{parsed.port}"
+        request_url = parsed._replace(netloc=netloc).geturl()
+        headers["Host"] = hostname
+    else:
+        # Re-validate just before HTTPS request to reduce DNS TOCTOU risk.
+        _validate_url(url)
+    response = requests.get(request_url, timeout=20, headers=headers)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
