@@ -4,8 +4,6 @@ Fixes applied:
 - 2.2: Added threading.Lock() around all _pending_sync mutations to prevent race conditions.
 - 2.14: Only remove items from _pending_sync after confirmed successful sync.
 - 7.2: Sanitize text before storage to strip prompt-injection patterns.
-- NOVA-FIX-1: Guard all self.mem0 calls with None check — MemoryRouter now
-  accepts Mem0Client | None so it works when MEM0_API_KEY is absent.
 """
 
 from __future__ import annotations
@@ -14,7 +12,6 @@ from collections import defaultdict
 import hashlib
 import re
 import threading
-from typing import TYPE_CHECKING
 
 try:
     from rank_bm25 import BM25Okapi
@@ -45,9 +42,7 @@ def _sanitize_memory_text(text: str) -> str:
 
 
 class MemoryRouter:
-    # NOVA-FIX-1: Accept Optional[Mem0Client] — mem0 may be None when
-    # MEM0_API_KEY is not configured, which is the default/offline mode.
-    def __init__(self, mem0: Mem0Client | None, local: LocalMemoryStore):
+    def __init__(self, mem0: Mem0Client, local: LocalMemoryStore):
         self.mem0 = mem0
         self.local = local
         self._online = True
@@ -73,10 +68,9 @@ class MemoryRouter:
 
         local_result = self.local.add(safe_text, session_id, metadata)
 
-        # NOVA-FIX-1: Only call mem0 if it is not None
-        if self._online and self.mem0 is not None:
+        if self._online:
             self.mem0.add(safe_text, session_id, metadata)
-        elif not self._online:
+        else:
             with self._sync_lock:
                 self._pending_sync[session_id].append({"text": safe_text, "metadata": metadata or {}})
 
@@ -84,8 +78,7 @@ class MemoryRouter:
 
     def sync_pending(self, session_id: str) -> int:
         """Sync pending items for a session. Only removes items after successful sync (fix 2.14)."""
-        # NOVA-FIX-1: Skip sync if mem0 client is not configured
-        if not self._online or self.mem0 is None:
+        if not self._online:
             return 0
 
         with self._sync_lock:
@@ -111,8 +104,7 @@ class MemoryRouter:
 
     def sync_all_pending(self) -> int:
         """Sync all sessions. Thread-safe snapshot of keys before iterating (fix 2.2)."""
-        # NOVA-FIX-1: Skip sync entirely if mem0 client is not configured
-        if not self._online or self.mem0 is None:
+        if not self._online:
             return 0
         with self._sync_lock:
             session_ids = list(self._pending_sync.keys())

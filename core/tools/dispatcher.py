@@ -27,8 +27,7 @@ class ToolCall(BaseModel):
     args: dict[str, Any]
 
 
-# Matches ```json ... ``` or ``` ... ``` with optional trailing whitespace
-_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL | re.IGNORECASE)
+_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
 
 class Dispatcher:
@@ -36,7 +35,7 @@ class Dispatcher:
         self.registry: dict[str, Callable[..., Any]] = {}
         self.schemas: dict[str, type[BaseModel]] = {}
 
-        # Token bucket for rate limiting tool executions
+        # Fix Perf 3: Token bucket for rate limiting tool executions
         self._max_tokens = rate_limit_rpm
         self._tokens = float(rate_limit_rpm)
         self._last_refill = time.time()
@@ -52,6 +51,7 @@ class Dispatcher:
         self._last_refill = now
 
         if self._tokens < 1.0:
+            # Non-blocking: raise an error instead of sleeping on the main thread
             raise RateLimitedError(
                 f"Dispatcher rate limit hit ({self._max_tokens} rpm). "
                 "Retry in a moment."
@@ -77,7 +77,7 @@ class Dispatcher:
     def try_parse_tool_call(self, raw_text: str) -> ToolCall | None:
         """Parse a tool call from LLM output.
 
-        Strip markdown code fences (```json ... ```) before attempting JSON parsing.
+        Fix Bug 2: Strip markdown code fences (```json ... ```) before attempting JSON parsing.
         LLMs frequently wrap JSON in markdown blocks; without stripping, all such responses
         silently lose the tool call.
         """
@@ -145,7 +145,7 @@ class Dispatcher:
             guardrails.log(tool_call, auth, result=result, status="dry_run", confirmed_by="system")
             return result
 
-        # Non-blocking rate limit — raise instead of sleeping
+        # Fix Perf 3: Non-blocking rate limit — raise instead of sleeping
         try:
             self._consume_token()
         except RateLimitedError as exc:

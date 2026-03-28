@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import math
 import os
 from pathlib import Path
 
@@ -11,7 +10,7 @@ from dotenv import load_dotenv
 
 
 class SettingsError(RuntimeError):
-    """Raised when startup configuration is invalid — NOVA cannot run."""
+    """Raised when startup configuration is invalid — JARVIS cannot run."""
 
 
 def _csv_to_list(value: str) -> list[str]:
@@ -45,7 +44,7 @@ class Settings:
     # ADB / Android
     TAILSCALE_PHONE_IP: str = ""
     ADB_PORT: int = 5555
-    ALLOWED_PHONE_NUMBERS: list[str] = field(default_factory=list)
+    ALLOWED_PHONE_NUMBERS: list[str] = field(default_factory=list)  # Fix 17
 
     # OmniParser
     OMNIPARSER_SERVER_URL: str = "http://localhost:8000"
@@ -59,12 +58,12 @@ class Settings:
 
     # Usage alerts
     DAILY_TOKEN_ALERT_THRESHOLD: int = 100_000
-    DAILY_TOKEN_HARD_CAP: int = 500_000  # 0 = disabled
+    DAILY_TOKEN_HARD_CAP: int = 500000  # 0 = disabled; set e.g. 500000 to hard-cap spend
 
-    # Ambiguity / reasoning
+    # Ambiguity / reasoning (fix 6.1)
     AMBIGUITY_THRESHOLD: float = 0.6
 
-    # Privacy / context injection
+    # Privacy / context injection (fix 2.13)
     INCLUDE_CLIPBOARD_IN_CONTEXT: bool = False
 
     # Voice
@@ -79,7 +78,7 @@ class Settings:
 
     # Proactive screen watcher
     PROACTIVE_WATCHER_ENABLED: bool = True
-    PROACTIVE_WATCHER_INTERVAL: float = 30.0  # seconds (was 6.0 — too aggressive)
+    PROACTIVE_WATCHER_INTERVAL: float = 30.0
     PROACTIVE_WATCHER_COOLDOWN: float = 120.0
 
     # Phone watcher
@@ -97,6 +96,7 @@ class Settings:
         """Load from .env file; warn prominently if missing."""
         env_path = Path(env_file)
         if not env_path.exists():
+            # Bug fix (Deployment/2): Log a clear warning instead of silently starting degraded
             import sys
             print(
                 "[NOVA] WARNING: .env file not found. Running with defaults only. "
@@ -136,9 +136,8 @@ class Settings:
             GEMINI_API_KEYS=_csv_to_list(env("GEMINI_API_KEYS")),
             MEM0_API_KEY=env("MEM0_API_KEY"),
             PORCUPINE_ACCESS_KEY=env("PORCUPINE_ACCESS_KEY"),
-            # Fixed: default now matches dataclass field (Hey-Nova, not Hey-Jarvis)
             PORCUPINE_KEYWORD_PATH=env(
-                "PORCUPINE_KEYWORD_PATH", "./assets/Hey-Nova_en_windows_v3_0_0.ppn"
+                "PORCUPINE_KEYWORD_PATH", "./assets/Hey-Jarvis_en_windows_v3_0_0.ppn"
             ),
             PORCUPINE_SENSITIVITY=env_float("PORCUPINE_SENSITIVITY", 0.6),
             TELEGRAM_BOT_TOKEN=env("TELEGRAM_BOT_TOKEN"),
@@ -149,10 +148,9 @@ class Settings:
             OMNIPARSER_SERVER_URL=env("OMNIPARSER_SERVER_URL", "http://localhost:8000"),
             OMNIPARSER_REPO_DIR=env("OMNIPARSER_REPO_DIR", ""),
             RISK_CONFIRM_THRESHOLD=env_int("RISK_CONFIRM_THRESHOLD", 7),
-            # Fixed: default matches NOVA naming, not jarvis_personal
-            DEFAULT_SESSION=env("DEFAULT_SESSION", "nova_personal"),
+            DEFAULT_SESSION=env("DEFAULT_SESSION", "jarvis_personal"),
             DAILY_TOKEN_ALERT_THRESHOLD=env_int("DAILY_TOKEN_ALERT_THRESHOLD", 100_000),
-            DAILY_TOKEN_HARD_CAP=env_int("DAILY_TOKEN_HARD_CAP", 500_000),
+            DAILY_TOKEN_HARD_CAP=env_int("DAILY_TOKEN_HARD_CAP", 500000),
             AMBIGUITY_THRESHOLD=env_float("AMBIGUITY_THRESHOLD", 0.6),
             INCLUDE_CLIPBOARD_IN_CONTEXT=env_bool("INCLUDE_CLIPBOARD_IN_CONTEXT", "false"),
             DEFAULT_LANG=env("DEFAULT_LANG", "en"),
@@ -174,19 +172,16 @@ class Settings:
             AUTONOMY_NOTIFY_TTS=env_bool("AUTONOMY_NOTIFY_TTS", "false"),
         )
 
-    _PLACEHOLDER_KEYS = {
-        "key1", "key2", "key3", "key_a", "key_b",
-        "ghp_test_key", "your_key_here", "",
-        "change_me", "xxx", "todo", "placeholder",
-    }
+    _PLACEHOLDER_KEYS = {"key1", "key2", "key3", "key_a", "key_b", "ghp_test_key", "your_key_here", ""}
     _MIN_REAL_KEY_LENGTH = 20  # Real API keys are typically 20+ characters
 
     def _is_placeholder_key(self, key: str) -> bool:
         """Return True if a key looks like a placeholder.
 
-        Checks static allowlist, minimum length, and character entropy.
-        Real API keys have 20+ chars and at least 6 unique characters.
+        Bug fix (Minor/2): Static allowlist missed novel placeholders like CHANGE_ME or xxx.
+        Now also rejects keys that are too short or have insufficient entropy.
         """
+        import math
         k = key.strip()
         if k.lower() in self._PLACEHOLDER_KEYS:
             return True
@@ -202,13 +197,14 @@ class Settings:
         """Fail fast with clear errors for required startup keys.
 
         Phases:
-          minimal  – only Ollama required (offline mode, no cloud LLM)
-          cloud    – cloud LLM keys required (OPENAI_*)
-          phase3   – additionally requires Porcupine wake-word keys
-          all      – all subsystems required
+          minimal – only Ollama required (offline mode, no cloud LLM)
+          cloud   – cloud LLM keys required (OPENAI_*)
+          phase3  – additionally requires Porcupine wake-word keys
+          all     – all subsystems required
         """
         errors: list[str] = []
 
+        # Ollama is always required as the fallback LLM
         if not self.OLLAMA_BASE_URL:
             errors.append("OLLAMA_BASE_URL is required (used as fallback LLM)")
         if not self.OLLAMA_MODEL:
@@ -227,6 +223,7 @@ class Settings:
                     "placeholder values were detected"
                 )
 
+            # Validate Gemini keys too
             real_gemini = [k for k in self.GEMINI_API_KEYS if not self._is_placeholder_key(k)]
             if not real_gemini and self.GEMINI_API_KEYS:
                 errors.append(
@@ -234,7 +231,7 @@ class Settings:
                     "placeholder values were detected"
                 )
 
-            # Validate Telegram credentials: token without chat_id = permanently deaf bot
+            # Bug fix (Connectivity): Validate Telegram credentials if bot token is set
             if self.TELEGRAM_BOT_TOKEN and not self.TELEGRAM_CHAT_ID:
                 errors.append(
                     "TELEGRAM_CHAT_ID must be set when TELEGRAM_BOT_TOKEN is configured. "
@@ -253,19 +250,19 @@ class Settings:
 
     @property
     def has_cloud_llm(self) -> bool:
-        """True if cloud LLM is configured with real (non-placeholder) keys."""
+        """True if cloud LLM is configured."""
         real_keys = [k for k in self.OPENAI_API_KEYS if not self._is_placeholder_key(k)]
         return bool(real_keys and self.OPENAI_BASE_URL)
 
     @property
     def has_gemini(self) -> bool:
-        """True if any real Gemini API key is present."""
+        """True if any Gemini API key is present."""
         real_keys = [k for k in self.GEMINI_API_KEYS if not self._is_placeholder_key(k)]
         return bool(real_keys)
 
     @property
     def has_telegram(self) -> bool:
-        """True if Telegram bot is fully configured."""
+        """True if Telegram bot is configured."""
         return bool(self.TELEGRAM_BOT_TOKEN and self.TELEGRAM_CHAT_ID)
 
     @property

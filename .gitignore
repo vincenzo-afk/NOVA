@@ -10,19 +10,19 @@ __pycache__/
 .jarvis_docs/
 
 # APScheduler job database
-*.sqlite
+jarvis_jobs.sqlite
 
-# Persisted session history (contains conversation content)
+# Persisted session history (contains conversation content) (fix 2.6)
 .jarvis_sessions/
 
-# Emergency stop persistence file
+# Emergency stop persistence file (fix 1.9)
 .jarvis/
 
-# Logs — may contain sensitive action audit trails
+# Logs — may contain sensitive action audit trails (Security 4.1)
 logs/
 *.jsonl
 
-# Session exports — contain full conversation history
+# Session exports — contain full conversation history (Security 4.1)
 exports/
 
 # OmniParser vendor checkout — handled as submodule or download
