@@ -416,7 +416,10 @@ class NOVAApp:
                         goal["status"] = "pending"
             except Exception as exc:
                 import logging
-                logging.getLogger(__name__).warning("Failed to load goals from disk: %s — starting with empty goals list", exc)
+                logging.getLogger(__name__).warning(
+                    "Failed to load goals from %s: %s — starting with empty list",
+                    self._goals_file, exc
+                )
         self._goal_lock = threading.Lock()
         self._autonomy_stop = threading.Event()
         self._autonomy_thread: threading.Thread | None = None
@@ -669,11 +672,11 @@ class NOVAApp:
     def _schedule_prompt(self, schedule_text: str, prompt: str, job_id: str | None = None) -> dict:
         job_id = job_id or f"job_{int(time.time())}"
 
-        def _run() -> None:
-            response = "".join(self.ask_stream(prompt, allow_tools=False))
-            print(f"\n[scheduled:{job_id}] {response}")
+        def _run(p=prompt, jid=job_id) -> None:
+            response = "".join(self.ask_stream(p, allow_tools=False))
+            print(f"\n[scheduled:{jid}] {response}")
             # Bug fix: scheduled tasks now notify via Telegram/TTS (previously silent)
-            self._notify_autonomy_event(f"[scheduled:{job_id}] {response}")
+            self._notify_autonomy_event(f"[scheduled:{jid}] {response}")
 
         cron = self.scheduler.add_from_text(_run, schedule_text, job_id=job_id)
         return {"job_id": job_id, "schedule": cron}
@@ -746,7 +749,7 @@ class NOVAApp:
         return {"goal": goal, "status": "ok", "steps": steps, "raw": raw}
         
     def _goal_plan_wrapper(self, goal: str, max_steps: int = 10) -> dict:
-        return self._add_goal(goal, max_steps)
+        return self._add_goal(goal, max_steps=max_steps)
 
     def _add_goal(self, goal: str, max_steps: int = 20) -> dict:
         goal_id = f"goal_{int(time.time())}"
@@ -842,16 +845,12 @@ class NOVAApp:
         if endpoint:
             # Security fix (4.3): Never inject an Authorization Bearer token over plain HTTP.
             # If a key is present and the endpoint is not HTTPS or localhost, reject it.
-            parsed_scheme = ""
+            parsed_scheme, parsed_host = "", ""
             try:
-                from urllib.parse import urlparse as _up
-                parsed_scheme = _up(endpoint).scheme.lower()
-            except Exception:
-                pass
-            parsed_host = ""
-            try:
-                from urllib.parse import urlparse as _up2
-                parsed_host = (_up2(endpoint).hostname or "").lower()
+                from urllib.parse import urlparse
+                parsed = urlparse(endpoint)
+                parsed_scheme = parsed.scheme.lower()
+                parsed_host = (parsed.hostname or "").lower()
             except Exception:
                 pass
             is_local = parsed_host in {"localhost", "127.0.0.1", "::1"}
@@ -1129,6 +1128,7 @@ class NOVAApp:
             self.omniparser.stop()
         except Exception:
             pass
+        self._summarize_executor.shutdown(wait=False)
         # Bug fix: drain TTS queue on shutdown so the worker thread exits cleanly
         try:
             self._tts_queue.put(None)   # sentinel to stop the worker
@@ -1354,7 +1354,7 @@ class NOVAApp:
         # Fix 2.9: Check total token count and trim if needed
         all_messages = [context_message, *recent]
         try:
-            total_tokens = estimate_tokens_from_messages(all_messages) + estimate_tokens(system_prompt)
+            total_tokens = estimate_tokens_from_messages([{"role": "system", "content": system_prompt}] + all_messages)
             # If exceeding MAX_CONTEXT_TOKENS, drop oldest raw turns beyond what ContextTrimmer handles
             if total_tokens > MAX_CONTEXT_TOKENS and len(recent) > 2:
                 # Naive approximation: 1 turn = 500 tokens
@@ -1444,7 +1444,7 @@ class NOVAApp:
             now_muted = self.toggle_mute()
             return "Muted." if now_muted else "Unmuted."
         if re.match(r"^switch session\s+.+$", text):
-            name = text.split(maxsplit=2)[-1]
+            name = text[len("switch session "):].strip()
             state = self.switch_session(name)
             return f"Switched to {state.name} ({state.session_id})."
         return None
@@ -1596,4 +1596,5 @@ if __name__ == "__main__":
 
 
 # Backward-compatibility alias so any code/tests referencing JarvisApp still work.
+# JarvisApp is NOVAApp — same class, not a subclass.
 JarvisApp = NOVAApp
