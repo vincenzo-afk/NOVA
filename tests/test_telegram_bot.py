@@ -20,7 +20,7 @@ def test_format_status_message_renders_table_like_summary():
         }
         """
     )
-    assert "JARVIS Status" in text
+    assert "NOVA Status" in text
     assert "Session            | jarvis_work" in text
     assert "Health             | ok=3 down=1" in text
     assert "Usage Today" in text

@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+from control import os_layer
+from config.constants import DEFAULT_SESSION_PERSONAL, DEFAULT_SESSION_WORK
 from utils.events import format_event_log
 from utils.goals import format_goal_list
 from utils.health import summarize_health
@@ -81,6 +83,12 @@ def run_tray(agent: Any) -> None:
     running = {"value": True}
     gui_thread = {"ref": None}
 
+    def _notify(title: str, message: str) -> None:
+        try:
+            os_layer.send_notification(title, message)
+        except Exception:
+            pass
+
     def on_open_gui(_icon, _item):
         if gui_thread["ref"] is not None and gui_thread["ref"].is_alive():
             print("Tray action: GUI already running")
@@ -99,45 +107,44 @@ def run_tray(agent: Any) -> None:
         print("Tray action: opening GUI")
 
     def on_switch_work(_icon, _item):
-        state = agent.switch_session("jarvis_work")
-        print(f"Tray action: switched to {state.name}")
+        state = agent.switch_session(DEFAULT_SESSION_WORK)
+        _notify("NOVA", f"Switched to session: {state.name}")
 
     def on_switch_personal(_icon, _item):
-        state = agent.switch_session("jarvis_personal")
-        print(f"Tray action: switched to {state.name}")
+        state = agent.switch_session(DEFAULT_SESSION_PERSONAL)
+        _notify("NOVA", f"Switched to session: {state.name}")
 
     def on_toggle_mute(_icon, _item):
         muted = bool(agent.toggle_mute())
-        print("Tray action: muted" if muted else "Tray action: unmuted")
+        _notify("NOVA", "Muted proactive alerts" if muted else "Unmuted proactive alerts")
 
     def on_health(_icon, _item):
         try:
-            print(agent.status_text())
+            _notify("NOVA Health", _format_health_summary(agent))
         except Exception:
             try:
-                print(_format_health_summary(agent))
-                print(format_goal_list(agent.list_goals()))
+                _notify("NOVA Health", _format_health_summary(agent))
             except Exception as exc:
-                print(f"Tray action: health unavailable: {exc}")
+                _notify("NOVA Health", f"Health unavailable: {exc}")
 
     def on_goals(_icon, _item):
         try:
-            print(format_goal_list(agent.list_goals()))
+            _notify("NOVA Goals", format_goal_list(agent.list_goals()))
         except Exception as exc:
-            print(f"Tray action: goals unavailable: {exc}")
+            _notify("NOVA Goals", f"Goals unavailable: {exc}")
 
     def on_alerts(_icon, _item):
         try:
-            print(format_event_log(agent.recent_events()))
+            _notify("NOVA Alerts", format_event_log(agent.recent_events()))
         except Exception as exc:
-            print(f"Tray action: alerts unavailable: {exc}")
+            _notify("NOVA Alerts", f"Alerts unavailable: {exc}")
 
     def on_export(_icon, _item):
         try:
             path = agent.export_session("md")
-            print(f"Tray action: exported session -> {path}")
+            _notify("NOVA", f"Exported session -> {path}")
         except Exception as exc:
-            print(f"Tray action: export failed: {exc}")
+            _notify("NOVA", f"Export failed: {exc}")
 
     def on_quit(icon, _item):
         running["value"] = False

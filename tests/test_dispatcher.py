@@ -60,3 +60,29 @@ def test_dispatcher_high_risk_respects_confirmation_callback():
     call = ToolCall(tool="win32_api.delete", args={"a": 2, "b": 3})
     result = d.execute(call, confirm_callback=lambda _: False)
     assert result["status"] in {"blocked", "cancelled"}
+
+
+def test_dispatcher_register_rejects_schema_signature_mismatch():
+    d = Dispatcher()
+
+    def only_one_arg(a: int) -> int:
+        return a
+
+    try:
+        d.register("math.bad", only_one_arg, SumArgs)
+        assert False, "Expected TypeError for schema/signature mismatch"
+    except TypeError as exc:
+        assert "math.bad" in str(exc)
+
+
+def test_dispatcher_execute_returns_structured_type_error():
+    d = Dispatcher()
+
+    def bad_runtime(a: int, b: int) -> int:
+        raise TypeError("boom")
+
+    d.register("math.bad_runtime", bad_runtime, SumArgs)
+    call = ToolCall(tool="math.bad_runtime", args={"a": 1, "b": 2})
+    result = d.execute(call)
+    assert result["error"] == "tool_signature_error"
+    assert result["tool"] == "math.bad_runtime"

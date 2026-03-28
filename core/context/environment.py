@@ -183,9 +183,26 @@ def snapshot_environment(include_clipboard: bool = True) -> dict:
                 ).start()
             return cached
 
-    # First call has no cache yet; compute synchronously.
-    result = _compute_snapshot(include_clipboard=include_clipboard)
+    # First call has no cache yet; return quickly with a lightweight snapshot and refresh async.
+    fallback = {
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "cwd": os.getcwd(),
+        "os": platform.platform(),
+        "hostname": socket.gethostname(),
+        "network": "unknown",
+        "foreground_app": "unknown",
+        "window_title": "unknown",
+        "battery_pct": _battery_pct(),
+        "last_active_file": None,
+    }
+    if include_clipboard:
+        fallback["clipboard"] = ""
     with _ENVIRONMENT_LOCK:
-        _ENVIRONMENT_CACHE = dict(result)
-        _ENVIRONMENT_CACHE_TIME = time.monotonic()
-    return result
+        if not _REFRESH_INFLIGHT:
+            _REFRESH_INFLIGHT = True
+            threading.Thread(
+                target=_refresh_background,
+                args=(include_clipboard,),
+                daemon=True,
+            ).start()
+    return fallback

@@ -12,6 +12,7 @@ import json
 import re
 import time
 import threading
+import inspect
 from typing import Any, Callable
 
 from pydantic import BaseModel, ValidationError
@@ -62,8 +63,30 @@ class Dispatcher:
             self._tokens -= 1.0
 
     def register(self, name: str, fn: Callable[..., Any], schema: type[BaseModel]) -> None:
+        self._validate_registration_signature(name=name, fn=fn, schema=schema)
         self.registry[name] = fn
         self.schemas[name] = schema
+
+    @staticmethod
+    def _validate_registration_signature(
+        name: str,
+        fn: Callable[..., Any],
+        schema: type[BaseModel],
+    ) -> None:
+        """Fail fast if a tool schema can't be passed to the registered function."""
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            # Builtins/callables without inspectable signatures are accepted.
+            return
+        kwargs = {field_name: None for field_name in schema.model_fields.keys()}
+        try:
+            signature.bind_partial(**kwargs)
+        except TypeError as exc:
+            raise TypeError(
+                f"Tool registration failed for '{name}': function signature does not "
+                f"match schema fields {sorted(kwargs.keys())}. {exc}"
+            ) from exc
 
     def get_tool_schema_prompt(self) -> str:
         tools = [
@@ -160,6 +183,13 @@ class Dispatcher:
         except RateLimitedError as exc:
             return {"status": "rate_limited", "reason": str(exc)}
 
-        result = fn(**validated.model_dump())
+        try:
+            result = fn(**validated.model_dump())
+        except TypeError as exc:
+            return {
+                "error": "tool_signature_error",
+                "tool": tool_call.tool,
+                "details": str(exc),
+            }
         guardrails.log(tool_call, auth, result=result, status="ok", confirmed_by="user")
         return {"status": "ok", "tool": tool_call.tool, "result": result, "risk": auth.score}

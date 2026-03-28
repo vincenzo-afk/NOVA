@@ -51,12 +51,18 @@ def _resolve_host(hostname: str, timeout_seconds: float = 5.0) -> list[str]:
         addr_info = socket.getaddrinfo(hostname, None)
         return [info[4][0] for info in addr_info]
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        fut = pool.submit(_run)
+    pool = ThreadPoolExecutor(max_workers=1)
+    fut = pool.submit(_run)
+    try:
+        return fut.result(timeout=timeout_seconds)
+    except FuturesTimeout as exc:
+        fut.cancel()
+        raise ValueError(f"DNS resolution timed out for {hostname!r}") from exc
+    finally:
         try:
-            return fut.result(timeout=timeout_seconds)
-        except FuturesTimeout as exc:
-            raise ValueError(f"DNS resolution timed out for {hostname!r}") from exc
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            pool.shutdown(wait=False)
 
 
 def _validate_url(url: str) -> tuple[str, str, str]:
@@ -82,7 +88,7 @@ def _validate_url(url: str) -> tuple[str, str, str]:
 
 def scrape_text(url: str) -> str:
     scheme, hostname, resolved_ip = _validate_url(url)
-    headers = {"User-Agent": "Mozilla/5.0 (JARVIS/1.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (NOVA/1.0)"}
     request_url = url
     # Mitigate DNS rebinding: for plain HTTP, connect directly to validated IP.
     if scheme == "http":

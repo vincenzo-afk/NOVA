@@ -23,6 +23,7 @@ class EmbeddingBackend:
         self.config = config or EmbeddingConfig()
         self._lock = threading.Lock()
         self._model = None
+        self._preload_started = False
 
     @staticmethod
     def is_available() -> bool:
@@ -43,6 +44,23 @@ class EmbeddingBackend:
         except Exception as exc:  # pragma: no cover - depends on optional deps
             raise RuntimeError(f"SentenceTransformer unavailable: {exc}") from exc
 
+    def preload_async(self) -> None:
+        with self._lock:
+            if self._preload_started or self._model is not None:
+                return
+            self._preload_started = True
+
+        def _job() -> None:
+            try:
+                with self._lock:
+                    if self._model is None:
+                        self._load()
+            except Exception:
+                # Preload is best-effort; encode() will surface errors on demand.
+                pass
+
+        threading.Thread(target=_job, daemon=True).start()
+
     def encode(self, texts: Iterable[str]) -> List[list[float]]:
         # Fix 3.1: Release lock after model loading - SentenceTransformer.encode() is thread-safe
         with self._lock:
@@ -59,6 +77,12 @@ class EmbeddingBackend:
             return [list(vec) for vec in embeddings]
 
 
+_GET_EMBEDDER_LOCK = threading.Lock()
+
+
 @lru_cache(maxsize=4)
 def get_embedder(model_name: str = "all-MiniLM-L6-v2") -> EmbeddingBackend:
-    return EmbeddingBackend(EmbeddingConfig(model_name=model_name))
+    with _GET_EMBEDDER_LOCK:
+        backend = EmbeddingBackend(EmbeddingConfig(model_name=model_name))
+        backend.preload_async()
+        return backend

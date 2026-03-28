@@ -8,7 +8,7 @@ Fixes applied:
 from __future__ import annotations
 
 from io import BytesIO
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 import json
 import time
 from typing import Any
@@ -26,6 +26,7 @@ from utils.logger import get_logger
 _log = get_logger(__name__)
 _TELEGRAM_RATE_WINDOW_SECONDS = 60
 _TELEGRAM_RATE_LIMIT = 12
+_TELEGRAM_HEAVY_RATE_LIMIT = 2
 
 
 def is_whitelisted(user_id: str | int, allowed_chat_id: str | None = None) -> bool:
@@ -47,7 +48,7 @@ def format_status_message(status_text: str) -> str:
 
     health_summary = payload.get("health_summary") or {}
     lines = [
-        "JARVIS Status",
+        "NOVA Status",
         f"Session            | {payload.get('session', 'unknown')}",
         f"Session ID         | {payload.get('session_id', '')}",
         f"Provider           | {payload.get('provider_last', 'unknown')}",
@@ -142,16 +143,39 @@ def run_telegram_bot(
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("python-telegram-bot is not installed") from exc
 
-    command_windows: dict[int, deque[float]] = defaultdict(deque)
+    command_windows: OrderedDict[int, deque[float]] = OrderedDict()
+    heavy_command_windows: OrderedDict[int, deque[float]] = OrderedDict()
 
     def _allow_command(user_id: int) -> bool:
         if len(command_windows) > 1000:
-            command_windows.clear()
+            command_windows.popitem(last=False)
         now = time.monotonic()
-        window = command_windows[user_id]
+        window = command_windows.get(user_id)
+        if window is None:
+            window = deque()
+            command_windows[user_id] = window
+        else:
+            command_windows.move_to_end(user_id)
         while window and (now - window[0]) > _TELEGRAM_RATE_WINDOW_SECONDS:
             window.popleft()
         if len(window) >= _TELEGRAM_RATE_LIMIT:
+            return False
+        window.append(now)
+        return True
+
+    def _allow_heavy_command(user_id: int) -> bool:
+        if len(heavy_command_windows) > 1000:
+            heavy_command_windows.popitem(last=False)
+        now = time.monotonic()
+        window = heavy_command_windows.get(user_id)
+        if window is None:
+            window = deque()
+            heavy_command_windows[user_id] = window
+        else:
+            heavy_command_windows.move_to_end(user_id)
+        while window and (now - window[0]) > _TELEGRAM_RATE_WINDOW_SECONDS:
+            window.popleft()
+        if len(window) >= _TELEGRAM_HEAVY_RATE_LIMIT:
             return False
         window.append(now)
         return True
@@ -199,6 +223,10 @@ def run_telegram_bot(
 
     async def on_export(update, _context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
+            return
+        user = update.effective_user
+        if user and not _allow_heavy_command(int(user.id)):
+            await update.message.reply_text("This command is rate-limited to 2 requests per minute.")
             return
         path = agent.export_session("md")
         with open(path, "rb") as file_handle:
@@ -280,6 +308,10 @@ def run_telegram_bot(
     async def on_screenshot(update, _context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
             return
+        user = update.effective_user
+        if user and not _allow_heavy_command(int(user.id)):
+            await update.message.reply_text("This command is rate-limited to 2 requests per minute.")
+            return
         try:
             png = capture_screen_png()
             await update.message.reply_photo(photo=InputFile(telegram_photo_from_png(png), filename="screenshot.png"))
@@ -288,6 +320,10 @@ def run_telegram_bot(
 
     async def on_qr(update, context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
+            return
+        user = update.effective_user
+        if user and not _allow_heavy_command(int(user.id)):
+            await update.message.reply_text("This command is rate-limited to 2 requests per minute.")
             return
         prefer_remote = bool(context.args and context.args[0].strip().lower() == "remote")
         try:
@@ -344,11 +380,17 @@ def run_telegram_bot(
     # Graceful shutdown path for embedding in a managed app lifecycle.
     app.initialize()
     app.start()
-    app.updater.start_polling()
+    updater = getattr(app, "updater", None)
+    if updater is not None:
+        updater.start_polling()
+    else:
+        app.run_polling(stop_signals=None, close_loop=False)
+        return
     try:
         while not stop_event.is_set():
             time.sleep(0.2)
     finally:
-        app.updater.stop()
+        if updater is not None:
+            updater.stop()
         app.stop()
         app.shutdown()

@@ -40,6 +40,9 @@ class ContextTrimmer:
                 if turn.get("content")
             )
             compressed = summarizer(snippet) if summarizer else snippet[:700]
+            if not str(compressed).strip():
+                # Fallback when async summarizer cache is not ready yet.
+                compressed = snippet[:700]
 
             if summary:
                 summary = (summary + " " + compressed).strip()[:1200]

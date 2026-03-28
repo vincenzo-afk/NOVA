@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""One-command installer for JARVIS."""
+"""One-command installer for NOVA."""
 
 import os
 import platform
@@ -52,7 +52,7 @@ def ensure_env_file() -> Path:
             f"OPENAI_BASE_URL={openai_base}\n"
             "OLLAMA_BASE_URL=http://localhost:11434\n"
             "OLLAMA_MODEL=llama3\n"
-            "DEFAULT_SESSION=jarvis_personal\n"
+            "DEFAULT_SESSION=nova_personal\n"
             "WHISPER_MODEL=base\n"
             "PORCUPINE_KEYWORD_PATH=./assets/Hey-Jarvis_en_windows_v3_0_0.ppn\n"
         ),
@@ -86,7 +86,8 @@ def ensure_env_key(env_path: Path, key: str, value: str) -> None:
 
 
 def install_dependencies() -> None:
-    run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+    req_file = "requirements.lock" if (REPO_ROOT / "requirements.lock").exists() else "requirements.txt"
+    run([sys.executable, "-m", "pip", "install", "-r", req_file])
 
 
 def install_playwright() -> None:
@@ -410,7 +411,7 @@ def verify_wakeword_asset(env_values: dict[str, str]) -> None:
 
     print("\n⚠️ Wake word setup required:")
     print("1. Go to console.picovoice.ai")
-    print("2. Create custom 'Hey JARVIS' keyword")
+    print("2. Create custom 'Hey NOVA' keyword")
     print(f"3. Put the .ppn file at: {resolved}")
     print("4. Confirm PORCUPINE_KEYWORD_PATH in .env")
 
@@ -455,7 +456,10 @@ def main() -> None:
     download_omniparser_weights(omniparser_repo)
     maybe_install_ollama_model(env_values)
     verify_wakeword_asset(env_values)
-    register_startup_entry()
+    if os.getenv("NOVA_REGISTER_STARTUP", "").strip().lower() in {"1", "true", "yes", "y"}:
+        register_startup_entry()
+    else:
+        print("Skipping startup registration (set NOVA_REGISTER_STARTUP=true to enable).")
     post_install_health_check(env_values)
 
     print("\nSetup complete. Run: python3 main.py")

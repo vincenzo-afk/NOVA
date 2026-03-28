@@ -46,9 +46,17 @@ _SENSITIVE_ARG_KEYS = {
     "private_key", "auth_token", "bearer_token", "api_secret",
 }
 
-# Path for persistent emergency-stop flag (fix 18)
-_EMERGENCY_STOP_FILE = Path.home() / ".jarvis" / "emergency_stop"
-_EMERGENCY_STOP_FILE_FALLBACK = Path.cwd() / ".jarvis" / "emergency_stop"
+def _emergency_stop_paths() -> tuple[Path, Path]:
+    configured = (settings.EMERGENCY_STOP_FILE or ".jarvis/emergency_stop").strip()
+    primary = Path(configured).expanduser()
+    if not primary.is_absolute():
+        primary = (Path.cwd() / primary).resolve()
+    fallback = (Path.cwd() / ".jarvis" / "emergency_stop").resolve()
+    return primary, fallback
+
+
+# Backward-compatible module-level aliases for tests/patching.
+_EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths()
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +138,9 @@ class Guardrails:
 
         # Fix 1.9: load persisted emergency stop on startup
         self._emergency_stop = threading.Event()
-        if _EMERGENCY_STOP_FILE.exists() or _EMERGENCY_STOP_FILE_FALLBACK.exists():
+        self._emergency_stop_file = _EMERGENCY_STOP_FILE
+        self._emergency_stop_file_fallback = _EMERGENCY_STOP_FILE_FALLBACK
+        if self._emergency_stop_file.exists() or self._emergency_stop_file_fallback.exists():
             self._emergency_stop.set()
 
         # Fix 2.12: use loguru rotating sink (10 MB / 7 days)
@@ -270,14 +280,14 @@ class Guardrails:
         """Activate emergency stop and persist to disk so it survives restarts (fix 1.9)."""
         self._emergency_stop.set()
         try:
-            _EMERGENCY_STOP_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _EMERGENCY_STOP_FILE.write_text("1", encoding="utf-8")
+            self._emergency_stop_file.parent.mkdir(parents=True, exist_ok=True)
+            self._emergency_stop_file.write_text("1", encoding="utf-8")
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Failed to write to primary emergency stop file: %s", exc)
             try:
-                _EMERGENCY_STOP_FILE_FALLBACK.parent.mkdir(parents=True, exist_ok=True)
-                _EMERGENCY_STOP_FILE_FALLBACK.write_text("1", encoding="utf-8")
+                self._emergency_stop_file_fallback.parent.mkdir(parents=True, exist_ok=True)
+                self._emergency_stop_file_fallback.write_text("1", encoding="utf-8")
             except Exception:
                 pass
 
@@ -285,11 +295,11 @@ class Guardrails:
         """Clear the emergency stop and remove the persistence file (fix 1.9)."""
         self._emergency_stop.clear()
         try:
-            _EMERGENCY_STOP_FILE.unlink(missing_ok=True)
+            self._emergency_stop_file.unlink(missing_ok=True)
         except Exception:
             pass
         try:
-            _EMERGENCY_STOP_FILE_FALLBACK.unlink(missing_ok=True)
+            self._emergency_stop_file_fallback.unlink(missing_ok=True)
         except Exception:
             pass
 

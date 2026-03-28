@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import time
+import tempfile
 from pathlib import Path
 
 
@@ -41,7 +42,18 @@ def _backup_chromadb(chroma_dir: str = ".jarvis_chroma", export_dir: str = "expo
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = int(time.time())
         out_path = out_dir / f"memory_backup_{ts}.json"
-        out_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload = json.dumps(snapshot, ensure_ascii=False, indent=2)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(out_dir),
+            delete=False,
+            suffix=".tmp",
+        ) as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            tmp_path = Path(tmp.name)
+        tmp_path.replace(out_path)
 
         # Keep only the last 7 snapshots
         existing = sorted(out_dir.glob("memory_backup_*.json"))

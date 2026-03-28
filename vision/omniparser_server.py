@@ -65,9 +65,10 @@ class OmniParserServer:
             self.command = self._build_default_command()
 
     def is_running(self) -> bool:
+        token_q = f"?token={self.auth_token}" if self.auth_token else ""
         for path in ("/health", "/probe", "/probe/"):
             try:
-                response = requests.get(f"{self.url}{path}", timeout=2)
+                response = requests.get(f"{self.url}{path}{token_q}", timeout=2)
                 if response.ok:
                     return True
             except Exception:
@@ -80,6 +81,13 @@ class OmniParserServer:
         Fix 2.11: polls with exponential backoff for up to `startup_timeout` seconds.
         Fix 1.4: passes only a safe, secret-free environment to the subprocess.
         """
+        if self.proc is not None and self.proc.poll() is not None and not self.is_running():
+            try:
+                print(f"[omniparser] previous process exited with code {self.proc.returncode}; restarting")
+            except Exception:
+                pass
+            self.proc = None
+
         if self.is_running():
             return
         if self.proc and self.proc.poll() is None:

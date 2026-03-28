@@ -19,6 +19,7 @@ from datetime import date
 import copy
 import queue
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from pydantic import BaseModel, Field
 
@@ -76,6 +77,7 @@ class WebScrapeArgs(BaseModel):
 class WebCrawlArgs(BaseModel):
     seed_url: str
     max_pages: int = Field(default=5, ge=1, le=50)
+    max_depth: int = Field(default=2, ge=0, le=10)
 
 
 class DocIngestArgs(BaseModel):
@@ -114,6 +116,8 @@ class FileSearchArgs(BaseModel):
     root: str
     name_pattern: str = "*"
     content_query: str | None = None
+    max_depth: int = Field(default=8, ge=0, le=64)
+    max_results: int = Field(default=500, ge=1, le=5000)
 
 
 class ClipboardSetArgs(BaseModel):
@@ -357,6 +361,7 @@ class NOVAApp:
         self.usage = UsageTracker()
         self._usage_alerted_day = None
         self._hard_cap_hit = False  # fix 7.1: set True when daily hard-cap is reached
+        self._hard_cap_warning_day = None
         
         # Add tracking for daily resets (fix 1.5)
         self._hard_cap_hit_date: date | None = None
@@ -374,9 +379,13 @@ class NOVAApp:
         self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         self._tts_thread.start()
 
-        # Separate executors so goal planning cannot block context summarization.
+        # Separate executors so goal planning and memory sync cannot block summarization.
         self._summarize_executor = ThreadPoolExecutor(max_workers=1)
+        self._memory_executor = ThreadPoolExecutor(max_workers=1)
         self._goal_plan_executor = ThreadPoolExecutor(max_workers=2)
+        self._shutting_down = threading.Event()
+        self._health_http_server: ThreadingHTTPServer | None = None
+        self._health_http_thread: threading.Thread | None = None
 
         self._event_lock = threading.Lock()
         self._events = deque(maxlen=100)
@@ -453,9 +462,14 @@ class NOVAApp:
         self.base_system_prompt = DEFAULT_SYSTEM_PROMPT
         self._register_builtin_tools()
         
-        # Bug 2 & Missing 1: execution lock and separate autonomy runner
-        self._execution_lock = threading.Semaphore(1)
-        self.goal_runner = GoalRunner(self.dispatcher, confirm_callback=self._interactive_confirm)
+        # Separate manual-goal execution from autonomy-goal execution to avoid cross-blocking.
+        self._goal_execution_lock = threading.Semaphore(1)
+        self._autonomy_execution_lock = threading.Semaphore(1)
+        self.goal_runner = GoalRunner(
+            self.dispatcher,
+            confirm_callback=self._interactive_confirm,
+            step_timeout_seconds=settings.GOAL_STEP_TIMEOUT_SECONDS,
+        )
 
         def _autonomy_confirm(prompt: str) -> bool:
             if settings.AUTONOMY_NOTIFY_TELEGRAM:
@@ -463,7 +477,11 @@ class NOVAApp:
             return False
 
         self._autonomy_confirm_callback = _autonomy_confirm
-        self.autonomy_runner = GoalRunner(self.dispatcher, confirm_callback=self._autonomy_confirm_callback)
+        self.autonomy_runner = GoalRunner(
+            self.dispatcher,
+            confirm_callback=self._autonomy_confirm_callback,
+            step_timeout_seconds=settings.GOAL_STEP_TIMEOUT_SECONDS,
+        )
         
         try:
             load_plugins(self.dispatcher)
@@ -491,14 +509,23 @@ class NOVAApp:
             import logging
             logging.getLogger(__name__).warning("Emergency hotkey startup failed: %s", exc)
         try:
+            self._start_probe_server()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Health probe startup failed: %s", exc)
+        try:
             self.scheduler.start()
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Scheduler startup failed: %s", exc)
         # Missing feature fix: schedule daily ChromaDB backup to prevent data loss on corruption
         try:
-            from core.memory.backup import schedule_daily_backup
-            schedule_daily_backup(self.scheduler)
+            if self.scheduler.scheduler.running:
+                from core.memory.backup import schedule_daily_backup
+                schedule_daily_backup(self.scheduler)
+            else:
+                import logging
+                logging.getLogger(__name__).warning("Skipping backup registration because scheduler is not running.")
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Failed to schedule ChromaDB backup: %s", exc)
@@ -531,7 +558,10 @@ class NOVAApp:
         session_id = self.session.current.session_id
         # fix 7.4: auto-backup session before clearing
         try:
-            self.export_session("md")
+            session = self.session.current
+            with session._lock:
+                history_snapshot = list(session.history)
+            self.export_session("md", history=history_snapshot)
         except Exception:
             pass
         self.session.reset_context()
@@ -586,15 +616,16 @@ class NOVAApp:
         with self._event_lock:
             return [dict(item) for item in list(self._events)[: max(1, int(limit))]]
 
-    def export_session(self, fmt: str = "md") -> str:
+    def export_session(self, fmt: str = "md", history: list[dict] | None = None) -> str:
         session = self.session.current
         timestamp = int(time.time())
         safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", session.name).strip("_") or "session"
+        payload = history if history is not None else session.history
         if fmt.lower() == "json":
             path = f"exports/{safe_name}_{timestamp}.json"
-            return export_json(session.history, path)
+            return export_json(payload, path)
         path = f"exports/{safe_name}_{timestamp}.md"
-        return export_markdown(session.history, path)
+        return export_markdown(payload, path)
 
     def status_text(self) -> str:
         health_items = self.health.status_table()
@@ -747,8 +778,11 @@ class NOVAApp:
             # Bug fix: scheduled tasks now notify via Telegram/TTS (previously silent)
             self._notify_autonomy_event(f"[scheduled:{jid}] {response}")
 
-        cron = self.scheduler.add_from_text(_run, schedule_text, job_id=job_id)
-        return {"job_id": job_id, "schedule": cron}
+        try:
+            cron = self.scheduler.add_from_text(_run, schedule_text, job_id=job_id)
+            return {"job_id": job_id, "schedule": cron}
+        except ValueError as exc:
+            return {"status": "error", "reason": str(exc), "job_id": job_id}
 
     def _list_jobs(self) -> list[dict]:
         return self.scheduler.list_jobs_detailed()
@@ -759,7 +793,7 @@ class NOVAApp:
 
     def _run_goal(self, goal: str, steps: list[GoalStepArgs], max_steps: int = 20, dry_run: bool = False) -> dict:
         step_dicts = [{"tool": step.tool, "args": step.args} for step in steps]
-        with self._execution_lock:
+        with self._goal_execution_lock:
             result = self.goal_runner.run(step_dicts, max_steps=max_steps, dry_run=dry_run)
         
         return {
@@ -799,6 +833,11 @@ class NOVAApp:
                     return []
             if isinstance(data, dict) and "steps" in data:
                 data = data["steps"]
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except json.JSONDecodeError:
+                    return []
             if not isinstance(data, list):
                 return []
             steps = []
@@ -843,10 +882,14 @@ class NOVAApp:
             self._persist_goals()
 
         def background_plan():
+            if self._shutting_down.is_set():
+                return
             try:
                 plan = self._plan_goal(goal, max_steps=min(max_steps, 30))
             except Exception as exc:
                 plan = {"status": "failed", "reason": f"planning_exception:{exc}"}
+            if self._shutting_down.is_set():
+                return
             with self._goal_lock:
                 for item in self._goals:
                     if item.get("id") == goal_id:
@@ -964,12 +1007,18 @@ class NOVAApp:
                 rows = _socket.getaddrinfo(hostname, None)
                 return [r[4][0] for r in rows]
 
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                fut = pool.submit(_run)
+            pool = ThreadPoolExecutor(max_workers=1)
+            fut = pool.submit(_run)
+            try:
+                return fut.result(timeout=timeout_seconds)
+            except FuturesTimeout:
+                fut.cancel()
+                return []
+            finally:
                 try:
-                    return fut.result(timeout=timeout_seconds)
-                except FuturesTimeout:
-                    return []
+                    pool.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    pool.shutdown(wait=False)
 
         svc = service.strip().lower()
         if not svc:
@@ -1092,7 +1141,11 @@ class NOVAApp:
         self.health.register_subsystem("memory_router", lambda: self.memory is not None)
         self.health.register_subsystem(
             "mem0_client",
-            lambda: bool(getattr(self.memory.mem0, "_remote_enabled", False)) or not bool(settings.MEM0_API_KEY),
+            lambda: (
+                not bool(settings.MEM0_API_KEY)
+                or not bool(getattr(self.memory.mem0, "_remote_enabled", False))
+                or bool(self.memory.mem0.get_all(self.session.current.session_id) is not None)
+            ),
         )
         self.health.register_subsystem(
             "scheduler",
@@ -1212,6 +1265,48 @@ class NOVAApp:
         if self._autonomy_thread and self._autonomy_thread.is_alive():
             self._autonomy_thread.join(timeout=2)
 
+    def _start_probe_server(self) -> None:
+        if self._health_http_server is not None:
+            return
+
+        app = self
+
+        class _ProbeHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                if self.path.rstrip("/") not in {"/health", "/ready"}:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                status = b'{"status":"ok"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(status)))
+                self.end_headers()
+                self.wfile.write(status)
+
+            def log_message(self, format, *args):  # noqa: A003
+                _ = (app, format, args)
+                return
+
+        server = ThreadingHTTPServer(("0.0.0.0", int(settings.NOVA_HEALTH_PORT)), _ProbeHandler)
+        server.daemon_threads = True
+        self._health_http_server = server
+        self._health_http_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        self._health_http_thread.start()
+
+    def _stop_probe_server(self) -> None:
+        if self._health_http_server is None:
+            return
+        try:
+            self._health_http_server.shutdown()
+            self._health_http_server.server_close()
+        except Exception:
+            pass
+        if self._health_http_thread and self._health_http_thread.is_alive():
+            self._health_http_thread.join(timeout=2)
+        self._health_http_server = None
+        self._health_http_thread = None
+
     def _autonomy_loop(self) -> None:
         poll = max(2.0, float(settings.AUTONOMY_POLL_SECONDS))
         while not self._autonomy_stop.is_set():
@@ -1236,7 +1331,7 @@ class NOVAApp:
                             item["started_at"] = time.time()
                             break
             if not goal:
-                self._autonomy_stop.wait(poll)
+                self._autonomy_stop.wait(min(1.0, poll))
                 continue
 
             steps = goal.get("steps") or []
@@ -1244,7 +1339,7 @@ class NOVAApp:
             start_index = int(goal.get("cursor") or 0)
             
             approved_for_step = goal.get("status") == "approved_for_step"
-            with self._execution_lock:
+            with self._autonomy_execution_lock:
                 if approved_for_step:
                     result = self.autonomy_runner.run(
                         steps,
@@ -1272,6 +1367,9 @@ class NOVAApp:
             if result.status == "blocked":
                 status = "awaiting_confirmation"
 
+            if self._shutting_down.is_set():
+                break
+
             with self._goal_lock:
                 for item in self._goals:
                     if item.get("id") == goal.get("id"):
@@ -1291,6 +1389,8 @@ class NOVAApp:
                         self._persist_goals()
                         break
 
+            if self._shutting_down.is_set():
+                break
             message = build_goal_status_message(
                 goal_id=str(goal.get("id")),
                 goal=str(goal.get("goal")),
@@ -1300,10 +1400,12 @@ class NOVAApp:
                 total_steps=len(steps),
             )
             print(f"\n[autonomy] {message}")
-            self.session.add_turn("assistant", message)
+            if not self._shutting_down.is_set():
+                self.session.add_turn("assistant", message)
             self._notify_autonomy_event(message)
 
     def shutdown(self) -> None:
+        self._shutting_down.set()
         self.health.stop()
         if settings.PROACTIVE_WATCHER_ENABLED:
             self.screen_watcher.stop()
@@ -1311,6 +1413,7 @@ class NOVAApp:
             self.phone_watcher.stop()
         self.scheduler.stop()
         self._stop_autonomy_loop()
+        self._stop_probe_server()
         if self._emergency_hotkey_listener is not None:
             try:
                 self._emergency_hotkey_listener.stop()
@@ -1322,10 +1425,11 @@ class NOVAApp:
             self.omniparser.stop()
         except Exception:
             pass
-        self._summarize_executor.shutdown(wait=False)
         import sys as _sys
         kwargs = {"cancel_futures": True} if _sys.version_info >= (3, 9) else {}
-        self._goal_plan_executor.shutdown(wait=False, **kwargs)
+        self._summarize_executor.shutdown(wait=False, **kwargs)
+        self._memory_executor.shutdown(wait=False, **kwargs)
+        self._goal_plan_executor.shutdown(wait=True, **kwargs)
         # Bug fix: drain TTS queue on shutdown so the worker thread exits cleanly
         try:
             self._tts_queue.put(None)   # sentinel to stop the worker
@@ -1776,6 +1880,8 @@ class NOVAApp:
                 self._commit_memory_async(user_text, partial)
 
     def _commit_memory_async(self, user_text: str, assistant_text: str) -> None:
+        if self._shutting_down.is_set():
+            return
         session_id = self.session.current.session_id
 
         def _job() -> None:
@@ -1787,17 +1893,15 @@ class NOVAApp:
             self.memory.sync_pending(session_id)
 
         try:
-            self._summarize_executor.submit(_job)
+            self._memory_executor.submit(_job)
         except Exception:
             # Fallback to sync path if executor is unavailable.
             _job()
 
     def _adb_send_sms(self, phone_number: str, body: str) -> str:
-        """Fix 10: Enforce allowlist for SMS delivery."""
+        """Send SMS via ADB client."""
         if not self.adb:
             return "Error: ADB not available"
-        if phone_number not in settings.ALLOWED_PHONE_NUMBERS:
-            return f"Error: {phone_number} is not in settings.ALLOWED_PHONE_NUMBERS"
         return self.adb.send_sms(phone_number, body)
 
     def _track_usage(self, system_prompt: str, history: list[dict], user_text: str, assistant_text: str) -> None:
@@ -1815,7 +1919,23 @@ class NOVAApp:
             if self._hard_cap_hit_date != today:
                 self._hard_cap_hit = False
                 self._hard_cap_hit_date = None
+            if self._hard_cap_warning_day != today:
+                self._hard_cap_warning_day = None
             hardcap = settings.DAILY_TOKEN_HARD_CAP
+            warning_pct = max(0, min(100, int(settings.DAILY_TOKEN_HARD_CAP_WARNING_PCT)))
+            if hardcap > 0 and warning_pct > 0 and self._hard_cap_warning_day != today:
+                threshold = int(hardcap * (warning_pct / 100.0))
+                if total >= threshold:
+                    self._hard_cap_warning_day = today
+                    warn_msg = (
+                        f"[usage] Warning: daily token usage {total} reached {warning_pct}% "
+                        f"of hard cap {hardcap}."
+                    )
+                    print(warn_msg)
+                    try:
+                        self._notify_telegram(warn_msg)
+                    except Exception:
+                        pass
             if hardcap > 0 and total >= hardcap and not self._hard_cap_hit:
                 self._hard_cap_hit = True
                 self._hard_cap_hit_date = today
