@@ -365,7 +365,6 @@ class JarvisApp:
         self._summary_cache_lock = threading.Lock()
         self._last_snippet_hash: int | None = None
 
-        # Fix #2: Use proper top-level queue import instead of __import__ anti-pattern
         self._tts_queue: queue.Queue = queue.Queue()
         self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         self._tts_thread.start()
@@ -375,7 +374,7 @@ class JarvisApp:
         self._event_lock = threading.Lock()
         self._events = deque(maxlen=100)
 
-        # Fix #7: Guard Mem0Client init — skip if key is missing to avoid crash at startup
+        # Guard Mem0Client init — skip if key is missing to avoid crash at startup
         _mem0_key = settings.MEM0_API_KEY
         _mem0_client = Mem0Client(api_key=_mem0_key) if _mem0_key else None
 
@@ -494,7 +493,7 @@ class JarvisApp:
         session = self.session.current
         timestamp = int(time.time())
         safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", session.name).strip("_") or "session"
-        # Fix #12: Ensure exports/ directory exists before writing
+        # Ensure exports/ directory exists before writing
         Path("exports").mkdir(parents=True, exist_ok=True)
         if fmt.lower() == "json":
             path = f"exports/{safe_name}_{timestamp}.json"
@@ -504,11 +503,13 @@ class JarvisApp:
 
     def status_text(self) -> str:
         health_items = self.health.status_table()
+        # NOVA-FIX-2: Guard pool access — pool may be None when no cloud keys set
+        active_cloud_keys = self.engine.pool.active_count() if self.engine.pool is not None else 0
         return json.dumps(
             {
                 "session": self.session.current.name,
                 "session_id": self.session.current.session_id,
-                "active_cloud_keys": self.engine.pool.active_count(),
+                "active_cloud_keys": active_cloud_keys,
                 "memory_mode": "online" if self.memory.online else "offline",
                 "provider_last": self.engine.last_provider,
                 "emotion": self.emotion.state,
@@ -911,7 +912,6 @@ class JarvisApp:
         self._autonomy_thread.start()
 
     def _start_emergency_hotkey(self) -> None:
-        # Fix #15: Log warning instead of silently swallowing failures
         try:
             from pynput import keyboard
 
@@ -1013,7 +1013,7 @@ class JarvisApp:
             self.omniparser.stop()
         except Exception:
             pass
-        # Gracefully drain the TTS queue
+        # Gracefully drain the TTS queue with sentinel
         self._tts_queue.put(None)
 
     def _handle_proactive_alert(self, message: str) -> None:
@@ -1053,12 +1053,22 @@ class JarvisApp:
         return result
 
     def _tts_worker(self) -> None:
-        """TTS executed on a single dedicated background thread."""
-        # Fix #4: Log import failure so user knows TTS is unavailable
+        """TTS executed on a single dedicated background thread.
+
+        NOVA-FIX-4: If voice.tts_offline import fails, we must still drain
+        the queue so shutdown() does not hang forever on queue.join().
+        The fallback loop discards all items but always calls task_done().
+        """
         try:
             from voice.tts_offline import speak as speak_offline
         except Exception as exc:
             logger.warning("TTS offline module unavailable — voice output disabled: %s", exc)
+            # Drain queue without speaking so shutdown sentinel is consumed
+            while True:
+                text = self._tts_queue.get()
+                self._tts_queue.task_done()
+                if text is None:
+                    break
             return
 
         while True:
@@ -1174,7 +1184,6 @@ class JarvisApp:
                 for turn in older
                 if turn.get("content")
             )
-            # Fix #3: Remove redundant 'import threading' — already imported at top level
             if not hasattr(self, '_last_snippet_hash') or hash(snippet) != self._last_snippet_hash:
                 self._last_snippet_hash = hash(snippet)
                 thread = threading.Thread(
@@ -1300,7 +1309,6 @@ class JarvisApp:
         allow_tools: bool = True,
         dry_run_tools: bool = False,
     ) -> Generator[str, None, None]:
-        # Fix #8: Check hard cap BEFORE any LLM call (was checked after, one turn too late)
         if self._hard_cap_hit:
             today = date.today()
             if self._hard_cap_hit_date != today:
@@ -1400,7 +1408,6 @@ def main() -> int:
         print(str(exc))
         return 1
 
-    # Graceful shutdown on SIGTERM and SIGINT
     def _shutdown_handler(*_):
         print("\n[signal] Shutdown signal received — cleaning up…")
         app.shutdown()
