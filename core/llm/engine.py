@@ -7,10 +7,6 @@ from typing import Generator, Iterable
 
 import requests
 
-# NOVA-FIX-3: Move settings import to module level — importing inside
-# _cloud_stream on every streamed token was causing repeated import overhead.
-from config.settings import settings as _settings
-
 from core.llm.roundrobin import RoundRobinPool
 
 
@@ -35,17 +31,22 @@ class LLMEngine:
         self.ollama_model = ollama_model
         self.openai_model = openai_model
         self.timeout = timeout
-        # NOVA-FIX-2: pool is Optional — only initialise if keys are provided.
-        # All callers must guard with `if self.pool is not None` before use.
+        # Only initialise pool if we have keys; otherwise cloud path is effectively disabled
         self.pool: RoundRobinPool | None = None
         if openai_keys:
             try:
                 self.pool = RoundRobinPool(openai_keys)
             except ValueError:
                 self.pool = None
-        self.last_provider = "unknown"
-        # Fix 7.1: Track session tokens used by this engine locally
-        self.session_tokens_used: float = 0.0
+        self._thread_local = __import__("threading").local()
+
+    @property
+    def last_provider(self) -> str:
+        return getattr(self._thread_local, "last_provider", "unknown")
+
+    @last_provider.setter
+    def last_provider(self, val: str) -> None:
+        self._thread_local.last_provider = val
 
     def ask(self, prompt: str, system: str, history: list[dict] | None = None) -> str:
         return "".join(self.ask_stream(prompt, system, history))
@@ -58,20 +59,15 @@ class LLMEngine:
     ) -> Generator[str, None, None]:
         messages = self._build_messages(prompt=prompt, system=system, history=history or [])
 
-        # NOVA-FIX-2: Guard pool access — pool is None when no cloud keys configured
+        # Attempt cloud keys if pool is available
         if self.pool is not None:
-            hard_cap = _settings.DAILY_TOKEN_HARD_CAP
-            if hard_cap > 0 and self.session_tokens_used >= hard_cap:
-                yield f"[ERROR] Daily token hard cap of {hard_cap} reached (autonomy/generation blocked)."
-                return
-
             tried: set[str] = set()
             while True:
                 key = self.pool.get_next()
                 if not key or key in tried:
                     break
                 tried.add(key)
-                self.last_provider = f"cloud \u2022 {self.pool.key_label(key)}"
+                self.last_provider = f"cloud • {self.pool.key_label(key)}"
                 try:
                     for token in self._cloud_stream(messages=messages, api_key=key):
                         yield token
@@ -90,10 +86,13 @@ class LLMEngine:
                     self.pool.mark_dead(key)
 
         # Fallback to Ollama
-        self.last_provider = "local \u2022 ollama"
+        self.last_provider = "local • ollama"
         try:
             for token in self._ollama_stream(messages=messages, system=system):
                 yield token
+        except (requests.RequestException, OSError) as exc:
+            yield f"[ERROR] Fallback LLM connection failed: {exc}"
+            # Bug 6 fixed: Explicitly caught OSError for Ollama fallback
         except Exception as exc:
             yield f"[ERROR] Fallback LLM failed: {exc}"
 
@@ -105,11 +104,6 @@ class LLMEngine:
             if role in {"user", "assistant", "system"} and content:
                 msgs.append({"role": role, "content": content})
         msgs.append({"role": "user", "content": prompt})
-
-        # Fix 7.1: Track input tokens
-        if _settings.DAILY_TOKEN_HARD_CAP > 0:
-            total_chars = sum(len(str(m.get("content", ""))) for m in msgs)
-            self.session_tokens_used += total_chars / 4.0
 
         return msgs
 
@@ -142,13 +136,6 @@ class LLMEngine:
                 continue
             token = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
             if token:
-                # Fix 7.1: Track output tokens (uses module-level _settings)
-                if _settings.DAILY_TOKEN_HARD_CAP > 0:
-                    self.session_tokens_used += len(token) / 4.0
-                    if self.session_tokens_used >= _settings.DAILY_TOKEN_HARD_CAP:
-                        raise RuntimeError(
-                            f"Daily token hard cap of {_settings.DAILY_TOKEN_HARD_CAP} reached during stream."
-                        )
                 yield token
 
     def _ollama_stream(self, messages: list[dict], system: str) -> Iterable[str]:

@@ -34,8 +34,18 @@ def format_usage_message(title: str, summary: dict) -> str:
 
 
 def run_cli(agent) -> None:
+    # Fix 29: Simple Authentication on CLI
+    import getpass
+    import os
+    pin = os.getenv("CLI_PIN")
+    if pin:
+        entered = getpass.getpass("Enter CLI_PIN to unlock NOVA: ")
+        if entered != pin:
+            print("Access Denied.")
+            return
+
     console = Console()
-    banner = "[bold cyan]JARVIS CLI[/bold cyan]  Type /exit to quit" if HAS_RICH else "JARVIS CLI  Type /exit to quit"
+    banner = "[bold cyan]NOVA CLI[/bold cyan]  Type /exit to quit" if HAS_RICH else "NOVA CLI  Type /exit to quit"
     console.print(banner)
 
     while True:

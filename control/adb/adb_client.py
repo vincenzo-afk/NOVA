@@ -80,6 +80,10 @@ class ADBClient:
         which was vulnerable to injection via backticks, $(), or newlines.
         Now uses ADB's own argument parser through a proper arg list.
         """
+        from config.settings import settings
+        if settings.ALLOWED_PHONE_NUMBERS and phone_number not in settings.ALLOWED_PHONE_NUMBERS:
+            raise ValueError(f"Phone number {phone_number} is not in ALLOWED_PHONE_NUMBERS.")
+        
         return self.shell(
             "am", "start",
             "-a", "android.intent.action.SENDTO",

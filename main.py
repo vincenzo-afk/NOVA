@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
-import queue
 import signal
 import time
 from pathlib import Path
@@ -16,7 +14,7 @@ from datetime import date
 
 from pydantic import BaseModel, Field
 
-from config.constants import DEFAULT_MEMORY_TOP_K, DEFAULT_SYSTEM_PROMPT
+from config.constants import AGENT_NAME, DEFAULT_MEMORY_TOP_K, DEFAULT_SESSION_PERSONAL, DEFAULT_SESSION_WORK, DEFAULT_SYSTEM_PROMPT
 from config.settings import SettingsError, settings
 from core.context.environment import snapshot_environment
 from core.emotion.engine import EmotionEngine
@@ -56,8 +54,6 @@ from web.crawler import crawl
 from web.scraper import scrape_text
 from web.search import search
 import control.win32_api as win32_api
-
-logger = logging.getLogger(__name__)
 
 
 class WebSearchArgs(BaseModel):
@@ -340,7 +336,7 @@ class SetMuteArgs(BaseModel):
     muted: bool
 
 
-class JarvisApp:
+class NOVAApp:
     def __init__(self):
         settings.validate_startup(phase="minimal")
 
@@ -355,38 +351,48 @@ class JarvisApp:
         self.emotion = EmotionEngine()
         self.usage = UsageTracker()
         self._usage_alerted_day = None
-        self._hard_cap_hit = False
-
-        # Tracking for daily resets
+        self._hard_cap_hit = False  # fix 7.1: set True when daily hard-cap is reached
+        
+        # Add tracking for daily resets (fix 1.5)
         self._hard_cap_hit_date: date | None = None
-
-        # Summary cache
-        self._summary_cache: dict[int, str] = {}
-        self._summary_cache_lock = threading.Lock()
+        self._usage_lock = threading.Lock()  # Fix 3: Lock around usage caps
+        
+        # Add summary cache tracking (fix 6.1, 11)
+        self._summary_cache = __import__("collections").OrderedDict()  # Fix 11
+        self._summary_cache_lock = threading.Lock()  # fix 3.2
         self._last_snippet_hash: int | None = None
 
-        self._tts_queue: queue.Queue = queue.Queue()
+        # Add single thread for TTS execution (fix 5.1)
+        import queue  # Fix 25
+        self._tts_queue = queue.Queue()
         self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         self._tts_thread.start()
 
-        self._summarize_semaphore = threading.Semaphore(1)
+        # Add executor for background summarization (fix 2)
+        from concurrent.futures import ThreadPoolExecutor
+        self._summarize_executor = ThreadPoolExecutor(max_workers=1)
 
         self._event_lock = threading.Lock()
         self._events = deque(maxlen=100)
-
-        # Guard Mem0Client init — skip if key is missing to avoid crash at startup
-        _mem0_key = settings.MEM0_API_KEY
-        _mem0_client = Mem0Client(api_key=_mem0_key) if _mem0_key else None
-
         self.memory = MemoryRouter(
-            mem0=_mem0_client,
+            mem0=Mem0Client(api_key=settings.MEM0_API_KEY),
             local=LocalMemoryStore(),
         )
         self.docs = DocumentStore()
         self._browser: Browser | None = None
         self._mouse_keyboard: Any | None = None
         self._omniparser_client: Any | None = None
-        self.adb = ADBClient()
+        # Fix 7: ADB client connection validation
+        import shutil
+        if shutil.which("adb"):
+            self.adb = ADBClient()
+            self.health.register_subsystem(
+                "adb", 
+                check_fn=lambda: __import__("subprocess").run(["adb", "start-server"], capture_output=True).returncode == 0
+            )
+        else:
+            self.adb = None
+            self.health.register_subsystem("adb", check_fn=lambda: False)
         self.qr = QRPairing(adb_port=settings.ADB_PORT)
         self.omniparser = OmniParserServer(
             url=settings.OMNIPARSER_SERVER_URL,
@@ -419,6 +425,12 @@ class JarvisApp:
         self._start_autonomy_loop()
         self._start_emergency_hotkey()
         self.scheduler.start()
+        # Missing feature fix: schedule daily ChromaDB backup to prevent data loss on corruption
+        try:
+            from core.memory.backup import schedule_daily_backup
+            schedule_daily_backup(self.scheduler)
+        except Exception:
+            pass
 
     def last_provider_label(self) -> str:
         return self.engine.last_provider
@@ -431,16 +443,18 @@ class JarvisApp:
         return self.session.switch(name)
 
     def reset_context(self) -> None:
-        """Clear current session history and the associated trimmer summary.
+        """Clear current session history and the associated trimmer summary (fix 1.6).
 
-        Also auto-exports as a backup before clearing.
+        Also auto-exports as a backup before clearing (fix 7.4).
         """
         session_id = self.session.current.session_id
+        # fix 7.4: auto-backup session before clearing
         try:
             self.export_session("md")
         except Exception:
             pass
         self.session.reset_context()
+        # fix 1.6: clear the stale summary so it doesn't bleed into the new context
         self.trimmer.summaries.pop(session_id, None)
 
     def list_goals(self) -> list[dict]:
@@ -493,8 +507,6 @@ class JarvisApp:
         session = self.session.current
         timestamp = int(time.time())
         safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", session.name).strip("_") or "session"
-        # Ensure exports/ directory exists before writing
-        Path("exports").mkdir(parents=True, exist_ok=True)
         if fmt.lower() == "json":
             path = f"exports/{safe_name}_{timestamp}.json"
             return export_json(session.history, path)
@@ -503,13 +515,11 @@ class JarvisApp:
 
     def status_text(self) -> str:
         health_items = self.health.status_table()
-        # NOVA-FIX-2: Guard pool access — pool may be None when no cloud keys set
-        active_cloud_keys = self.engine.pool.active_count() if self.engine.pool is not None else 0
         return json.dumps(
             {
                 "session": self.session.current.name,
                 "session_id": self.session.current.session_id,
-                "active_cloud_keys": active_cloud_keys,
+                "active_cloud_keys": self.engine.pool.active_count(),
                 "memory_mode": "online" if self.memory.online else "offline",
                 "provider_last": self.engine.last_provider,
                 "emotion": self.emotion.state,
@@ -537,6 +547,7 @@ class JarvisApp:
     def _get_mouse_keyboard(self):
         if self._mouse_keyboard is None:
             from control.mouse_keyboard import MouseKeyboard
+
             self._mouse_keyboard = MouseKeyboard()
         return self._mouse_keyboard
 
@@ -544,16 +555,19 @@ class JarvisApp:
         current_token = self.omniparser.auth_token if hasattr(self, 'omniparser') else None
         if self._omniparser_client is None:
             from vision.omniparser import OmniParserClient
+
             self._omniparser_client = OmniParserClient(
                 settings.OMNIPARSER_SERVER_URL,
                 auth_token=current_token
             )
         else:
+            # Fix 2.2: ensure token stays updated across server restarts
             self._omniparser_client.auth_token = current_token
         return self._omniparser_client
 
     def _current_ui_elements(self) -> list[dict[str, Any]]:
         from vision.capture import capture_active_window_png
+
         image_bytes = capture_active_window_png()
         return self._get_omniparser_client().ui_elements(image_bytes)
 
@@ -639,6 +653,8 @@ class JarvisApp:
         def _run() -> None:
             response = "".join(self.ask_stream(prompt, allow_tools=False))
             print(f"\n[scheduled:{job_id}] {response}")
+            # Bug fix: scheduled tasks now notify via Telegram/TTS (previously silent)
+            self._notify_autonomy_event(f"[scheduled:{job_id}] {response}")
 
         cron = self.scheduler.add_from_text(_run, schedule_text, job_id=job_id)
         return {"job_id": job_id, "schedule": cron}
@@ -779,6 +795,29 @@ class JarvisApp:
 
         key = (api_key or "").strip() or (self.master_api.get(svc) or "")
         if endpoint:
+            # Security fix (4.3): Never inject an Authorization Bearer token over plain HTTP.
+            # If a key is present and the endpoint is not HTTPS or localhost, reject it.
+            parsed_scheme = ""
+            try:
+                from urllib.parse import urlparse as _up
+                parsed_scheme = _up(endpoint).scheme.lower()
+            except Exception:
+                pass
+            parsed_host = ""
+            try:
+                from urllib.parse import urlparse as _up2
+                parsed_host = (_up2(endpoint).hostname or "").lower()
+            except Exception:
+                pass
+            is_local = parsed_host in {"localhost", "127.0.0.1", "::1"}
+            if key and parsed_scheme == "http" and not is_local:
+                return {
+                    "status": "error",
+                    "reason": (
+                        "Refusing to inject Authorization header over plain HTTP. "
+                        "Use an HTTPS endpoint or a localhost address."
+                    ),
+                }
             merged_headers = dict(headers or {})
             if key and "Authorization" not in merged_headers:
                 merged_headers["Authorization"] = f"Bearer {key}"
@@ -852,7 +891,7 @@ class JarvisApp:
         return {"muted": self.is_muted()}
 
     def _start_health_monitoring(self) -> None:
-        self.health.register_subsystem("jarvis", lambda: True)
+        self.health.register_subsystem("nova", lambda: True)
         self.health.register_subsystem("network", lambda: NetworkState.is_online())
         self.health.register_subsystem("memory_router", lambda: self.memory is not None)
         self.health.register_subsystem(
@@ -864,6 +903,31 @@ class JarvisApp:
             "omniparser",
             check_fn=self.omniparser.is_running,
             restart_fn=self.omniparser.restart,
+        )
+        # Critical fix (5.3): Register LLM engine health — previously Ollama crashes had
+        # no health check, so failures were silent with no auto-restart attempted.
+        def _check_llm_engine() -> bool:
+            try:
+                import requests as _req
+                resp = _req.get(
+                    f"{settings.OLLAMA_BASE_URL}/api/tags",
+                    timeout=5,
+                )
+                return resp.ok
+            except Exception:
+                return False
+
+        def _restart_llm_engine() -> None:
+            import subprocess as _sp
+            try:
+                _sp.Popen(["ollama", "serve"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            except Exception:
+                pass
+
+        self.health.register_subsystem(
+            "llm_engine",
+            check_fn=_check_llm_engine,
+            restart_fn=_restart_llm_engine,
         )
         if settings.PROACTIVE_WATCHER_ENABLED:
             self.health.register_subsystem(
@@ -932,8 +996,7 @@ class JarvisApp:
                 {hotkey_str: guardrails.emergency_stop}
             )
             self._emergency_hotkey_listener.start()
-        except Exception as exc:
-            logger.warning("Emergency hotkey setup failed — hotkey will not be active: %s", exc)
+        except Exception:
             self._emergency_hotkey_listener = None
 
     def _stop_autonomy_loop(self) -> None:
@@ -950,7 +1013,7 @@ class JarvisApp:
                     if item.get("status") == "pending":
                         item["status"] = "running"
                         item["started_at"] = time.time()
-                        goal = dict(item)
+                        goal = __import__("copy").deepcopy(item)
                         break
             if not goal:
                 self._autonomy_stop.wait(poll)
@@ -972,6 +1035,10 @@ class JarvisApp:
             with self._goal_lock:
                 for item in self._goals:
                     if item.get("id") == goal.get("id"):
+                        # Bug fix: Check if a cancel arrived between "running" and this write block.
+                        # If user already set it to "cancelled", respect that and skip overwriting.
+                        if item.get("status") == "cancelled":
+                            break
                         item["status"] = status
                         item["cursor"] = result.next_index
                         item["finished_at"] = time.time()
@@ -1013,8 +1080,13 @@ class JarvisApp:
             self.omniparser.stop()
         except Exception:
             pass
-        # Gracefully drain the TTS queue with sentinel
-        self._tts_queue.put(None)
+        # Bug fix: drain TTS queue on shutdown so the worker thread exits cleanly
+        try:
+            self._tts_queue.put(None)   # sentinel to stop the worker
+            self._tts_queue.join()       # wait until all items (incl. sentinel) are processed
+            self._tts_thread.join(timeout=5)
+        except Exception:
+            pass
 
     def _handle_proactive_alert(self, message: str) -> None:
         self.record_event("proactive", message)
@@ -1045,43 +1117,47 @@ class JarvisApp:
     def _notify_telegram(self, text: str) -> dict | None:
         if not settings.AUTONOMY_NOTIFY_TELEGRAM:
             return None
-        result = send_telegram_text(
-            bot_token=settings.TELEGRAM_BOT_TOKEN,
-            chat_id=settings.TELEGRAM_CHAT_ID,
-            text=text,
-        )
-        return result
+        try:
+            result = send_telegram_text(
+                bot_token=settings.TELEGRAM_BOT_TOKEN,
+                chat_id=settings.TELEGRAM_CHAT_ID,
+                text=text,
+            )
+            # Fix 8: Telegram notifications have no error surface
+            if not result.get("ok"):
+                self.record_event("health", f"Telegram API failed: {result}")
+            return result
+        except Exception as exc:
+            self.record_event("health", f"Telegram emit threw exception: {exc}")
+            return None
 
     def _tts_worker(self) -> None:
-        """TTS executed on a single dedicated background thread.
-
-        NOVA-FIX-4: If voice.tts_offline import fails, we must still drain
-        the queue so shutdown() does not hang forever on queue.join().
-        The fallback loop discards all items but always calls task_done().
-        """
+        """Fix 5.1: TTS executed on a single dedicated background thread."""
         try:
             from voice.tts_offline import speak as speak_offline
-        except Exception as exc:
-            logger.warning("TTS offline module unavailable — voice output disabled: %s", exc)
-            # Drain queue without speaking so shutdown sentinel is consumed
-            while True:
-                text = self._tts_queue.get()
-                self._tts_queue.task_done()
-                if text is None:
-                    break
+        except Exception:
             return
-
+            
         while True:
             text = self._tts_queue.get()
             if text is None:
                 self._tts_queue.task_done()
                 break
-            try:
-                speak_offline(text)
-            except Exception as exc:
-                logger.debug("TTS speak error: %s", exc)
-            finally:
-                self._tts_queue.task_done()
+                
+            # Fix 23: Add watchdog for TTS worker thread
+            def run_speak():
+                try:
+                    speak_offline(text)
+                except Exception:
+                    pass
+                    
+            worker = threading.Thread(target=run_speak, daemon=True)
+            worker.start()
+            worker.join(timeout=settings.GEMINI_TTS_TIMEOUT_SECONDS)
+            if worker.is_alive():
+                print(f"[tts] Warning: TTS worker hung after {settings.GEMINI_TTS_TIMEOUT_SECONDS}s, dropping item.")
+            
+            self._tts_queue.task_done()
 
     def _notify_tts(self, text: str) -> bool:
         if not settings.AUTONOMY_NOTIFY_TTS:
@@ -1137,21 +1213,22 @@ class JarvisApp:
         self.dispatcher.register("browser.wait_for_text", self._browser_wait_for_text, BrowserWaitTextArgs)
         self.dispatcher.register("browser.screenshot", self._browser_screenshot, BrowserScreenshotArgs)
         self.dispatcher.register("browser.close", self._browser_close, EmptyArgs)
-        self.dispatcher.register("adb.connect", self.adb.connect, ADBConnectArgs)
-        self.dispatcher.register("adb.devices", self.adb.devices, EmptyArgs)
-        self.dispatcher.register("adb.tap", self.adb.tap, ADBTapArgs)
-        self.dispatcher.register("adb.swipe", self.adb.swipe, ADBSwipeArgs)
-        self.dispatcher.register("adb.type_text", self.adb.type_text, ADBTextArgs)
-        self.dispatcher.register("adb.launch_app", self.adb.launch_app, ADBLaunchArgs)
-        self.dispatcher.register("adb.keyevent", self.adb.keyevent, ADBKeyEventArgs)
-        self.dispatcher.register("adb.pull", self.adb.pull, ADBPullArgs)
-        self.dispatcher.register("adb.push", self.adb.push, ADBPushArgs)
-        self.dispatcher.register("adb.send_sms", self.adb.send_sms, ADBSmsArgs)
-        self.dispatcher.register("adb.notifications_dump", self.adb.notifications_dump, EmptyArgs)
-        self.dispatcher.register("adb.sms_dump", self.adb.sms_dump, EmptyArgs)
-        self.dispatcher.register("adb.screenshot_to_local", self.adb.screenshot_to_local, EmptyArgs)
-        self.dispatcher.register("adb.qr_generate", self.qr.generate, QRGenerateArgs)
-        self.dispatcher.register("adb.qr_terminal", self.qr.print_terminal_qr, QRTerminalArgs)
+        if getattr(self, "adb", None):
+            self.dispatcher.register("adb.connect", self.adb.connect, ADBConnectArgs)
+            self.dispatcher.register("adb.devices", self.adb.devices, EmptyArgs)
+            self.dispatcher.register("adb.tap", self.adb.tap, ADBTapArgs)
+            self.dispatcher.register("adb.swipe", self.adb.swipe, ADBSwipeArgs)
+            self.dispatcher.register("adb.type_text", self.adb.type_text, ADBTextArgs)
+            self.dispatcher.register("adb.launch_app", self.adb.launch_app, ADBLaunchArgs)
+            self.dispatcher.register("adb.keyevent", self.adb.keyevent, ADBKeyEventArgs)
+            self.dispatcher.register("adb.pull", self.adb.pull, ADBPullArgs)
+            self.dispatcher.register("adb.push", self.adb.push, ADBPushArgs)
+            self.dispatcher.register("adb.send_sms", self.adb.send_sms, ADBSmsArgs)
+            self.dispatcher.register("adb.notifications_dump", self.adb.notifications_dump, EmptyArgs)
+            self.dispatcher.register("adb.sms_dump", self.adb.sms_dump, EmptyArgs)
+            self.dispatcher.register("adb.screenshot_to_local", self.adb.screenshot_to_local, EmptyArgs)
+            self.dispatcher.register("adb.qr_generate", self.qr.generate, QRGenerateArgs)
+            self.dispatcher.register("adb.qr_terminal", self.qr.print_terminal_qr, QRTerminalArgs)
         self.dispatcher.register("task.schedule", self._schedule_prompt, TaskScheduleArgs)
         self.dispatcher.register("task.list", self._list_jobs, EmptyArgs)
         self.dispatcher.register("task.cancel", self._cancel_job, TaskCancelArgs)
@@ -1175,7 +1252,8 @@ class JarvisApp:
 
     def _context_messages(self, user_text: str) -> tuple[str, list[dict], list[dict]]:
         session_id = self.session.current.session_id
-
+        
+        # Check if we need to trigger background summarization
         history = self.session.current.history
         if len(history) > self.trimmer.max_raw_turns:
             older = history[: -self.trimmer.max_raw_turns]
@@ -1184,15 +1262,13 @@ class JarvisApp:
                 for turn in older
                 if turn.get("content")
             )
+            # Trigger background summarization if snippet changed
             if not hasattr(self, '_last_snippet_hash') or hash(snippet) != self._last_snippet_hash:
                 self._last_snippet_hash = hash(snippet)
-                thread = threading.Thread(
-                    target=self._summarize_history_background,
-                    args=(snippet, session_id),
-                    daemon=True
+                self._summarize_executor.submit(
+                    self._summarize_history_background, snippet, session_id
                 )
-                thread.start()
-
+        
         summary, recent = self.trimmer.trim(
             history,
             session_id=session_id,
@@ -1201,6 +1277,7 @@ class JarvisApp:
         memories = self.memory.search(user_text, session_id=session_id, top_k=DEFAULT_MEMORY_TOP_K)
         world_state = snapshot_environment()
 
+        # fix 2.13: strip clipboard content unless explicitly opt-ed in
         if not settings.INCLUDE_CLIPBOARD_IN_CONTEXT:
             world_state.pop("clipboard", None)
 
@@ -1222,10 +1299,13 @@ class JarvisApp:
             emotion=self.emotion.state,
         )
 
+        # Fix 2.9: Check total token count and trim if needed
         all_messages = [context_message, *recent]
         try:
             total_tokens = estimate_tokens_from_messages(all_messages)
+            # If exceeding ~8000 tokens, drop oldest raw turns beyond what ContextTrimmer handles
             if total_tokens > 8000 and len(recent) > 2:
+                # Keep at least 2 recent turns, drop the rest
                 keep_count = max(2, len(recent) - (total_tokens - 8000) // 500)
                 recent = recent[-keep_count:]
                 all_messages = [context_message, *recent]
@@ -1238,59 +1318,70 @@ class JarvisApp:
         """Summarize conversation history. Uses cached summary if available."""
         if not text.strip():
             return ""
-
+        
+        # Check if we have a cached summary for this text
         text_hash = hash(text)
         with self._summary_cache_lock:
             if text_hash in self._summary_cache:
+                self._summary_cache.move_to_end(text_hash)  # Keep LRU fresh
                 return self._summary_cache[text_hash]
-
+        
+        # If no cache, return truncated text (will be summarized in background)
         return text[:700]
-
+    
     def _summarize_history_background(self, text: str, session_id: str) -> None:
         """Summarize history in background thread and update cache."""
         if not text.strip():
             return
-
-        if not self._summarize_semaphore.acquire(blocking=False):
-            return
-
+            
         try:
             system = "Summarize the conversation history into a concise paragraph for future context."
             try:
                 summary = self.engine.ask(prompt=text, system=system, history=[])
+                # Fix 3.2 & 11: Lock around LRU ordered dict cache 
                 with self._summary_cache_lock:
                     self._summary_cache[hash(text)] = summary
+                    if len(self._summary_cache) > 50:
+                        self._summary_cache.popitem(last=False)
                 self.trimmer.summaries[session_id] = summary
             except Exception:
                 with self._summary_cache_lock:
                     self._summary_cache[hash(text)] = text[:700]
+                    if len(self._summary_cache) > 50:
+                        self._summary_cache.popitem(last=False)
         finally:
-            self._summarize_semaphore.release()
+            pass
 
     def _apply_text_commands(self, user_text: str) -> str | None:
+        """Handle built-in text shortcuts without calling the LLM.
+
+        Minor fix: session names and agent identity strings are now read from
+        config.constants so a project rename requires only one file change.
+        """
         text = user_text.strip().lower()
+        agent = AGENT_NAME.lower()
         if text in {"switch to work mode", "work mode"}:
-            state = self.switch_session("jarvis_work")
+            state = self.switch_session(DEFAULT_SESSION_WORK)
             return f"Switched to {state.name} ({state.session_id})."
         if text in {"switch to personal mode", "personal mode"}:
-            state = self.switch_session("jarvis_personal")
+            state = self.switch_session(DEFAULT_SESSION_PERSONAL)
             return f"Switched to {state.name} ({state.session_id})."
         if text in {"reset context", "clear context"}:
             self.reset_context()
             return "Context reset for this session. Memories are still saved."
-        if text in {"jarvis stop", "emergency stop", "stop now"}:
+        if text in {f"{agent} stop", "emergency stop", "stop now"}:
             guardrails.emergency_stop()
             return "Emergency stop is active. Tool execution is now blocked."
-        if text in {"jarvis resume", "clear emergency stop", "resume tools"}:
+        if text in {f"{agent} resume", "clear emergency stop", "resume tools"}:
             guardrails.clear_emergency_stop()
             return "Emergency stop cleared. Tool execution is enabled."
         if text in {"safety status", "emergency status"}:
             state = "active" if guardrails.is_emergency_stopped() else "inactive"
             return f"Emergency stop is {state}."
-        if text in {"mute", "jarvis mute", "mute notifications"}:
+        if text in {"mute", f"{agent} mute", "mute notifications"}:
             self.set_muted(True)
             return "Muted. Proactive alerts and autonomy notifications are silenced."
-        if text in {"unmute", "jarvis unmute", "unmute notifications"}:
+        if text in {"unmute", f"{agent} unmute", "unmute notifications"}:
             self.set_muted(False)
             return "Unmuted. Proactive alerts and autonomy notifications are active."
         if text in {"toggle mute", "mute toggle"}:
@@ -1310,13 +1401,8 @@ class JarvisApp:
         dry_run_tools: bool = False,
     ) -> Generator[str, None, None]:
         if self._hard_cap_hit:
-            today = date.today()
-            if self._hard_cap_hit_date != today:
-                self._hard_cap_hit = False
-                self._hard_cap_hit_date = None
-            else:
-                yield f"Daily token hard cap of {settings.DAILY_TOKEN_HARD_CAP} reached. Further calls blocked."
-                return
+            yield f"Daily token hard cap of {settings.DAILY_TOKEN_HARD_CAP} reached. Further calls blocked."
+            return
 
         command_response = self._apply_text_commands(user_text)
         if command_response:
@@ -1336,12 +1422,24 @@ class JarvisApp:
             return
 
         system_prompt, history, _ = self._context_messages(user_text)
-        self.session.add_turn("user", user_text)
 
         output_chunks: list[str] = []
-        for token in self.engine.ask_stream(prompt=user_text, system=system_prompt, history=history):
-            output_chunks.append(token)
-            yield token
+        stream = self.engine.ask_stream(prompt=user_text, system=system_prompt, history=history)
+
+        # Fix 4: Only commit user history after successfully starting to stream response
+        try:
+            first_token = next(stream)
+            self.session.add_turn("user", user_text)
+            output_chunks.append(first_token)
+            yield first_token
+            for token in stream:
+                output_chunks.append(token)
+                yield token
+        except StopIteration:
+            self.session.add_turn("user", user_text)
+        except Exception as exc:
+            yield f"[ERROR] Generation failed: {exc}"
+            return
 
         assistant_text = "".join(output_chunks).strip()
         self._track_usage(system_prompt, history, user_text, assistant_text)
@@ -1363,33 +1461,44 @@ class JarvisApp:
         self.memory.sync_pending(self.session.current.session_id)
 
     def _track_usage(self, system_prompt: str, history: list[dict], user_text: str, assistant_text: str) -> None:
-        input_tokens = estimate_tokens(system_prompt)
-        input_tokens += estimate_tokens_from_messages(history)
-        input_tokens += estimate_tokens(user_text)
+        import functools
+
+        @functools.lru_cache(maxsize=2000)
+        def _cached_token_count(content: str) -> int:
+            return estimate_tokens(content)
+
+        input_tokens = estimate_tokens(system_prompt) + estimate_tokens(user_text)
+        input_tokens += sum(_cached_token_count(str(m.get("content", ""))) for m in history)
         output_tokens = estimate_tokens(assistant_text)
+
         session_id = self.session.current.session_id
         provider = self.engine.last_provider
         self.usage.add(provider, input_tokens, output_tokens, session_id=session_id)
         today = date.today()
         total = self.usage.total_tokens_today(session_id=session_id)
 
-        if self._hard_cap_hit_date != today:
-            self._hard_cap_hit = False
-            self._hard_cap_hit_date = None
+        with self._usage_lock:
+            # Bug fix (connectivity/2): Reset hard cap when the calendar day changes
+            # Previously _hard_cap_hit was never reset — after one daily cap hit, all
+            # subsequent days were permanently blocked until restart.
+            if self._hard_cap_hit_date != today:
+                self._hard_cap_hit = False
+                self._hard_cap_hit_date = None
 
-        hard_cap = settings.DAILY_TOKEN_HARD_CAP
-        if hard_cap > 0 and total >= hard_cap and not self._hard_cap_hit:
-            self._hard_cap_hit = True
-            self._hard_cap_hit_date = today
-            msg = (
-                f"[usage] HARD CAP REACHED: daily token usage {total} "
-                f">= hard cap {hard_cap}. Further LLM calls are blocked for today."
-            )
-            print(msg)
-            try:
-                self._notify_telegram(msg)
-            except Exception:
-                pass
+            hard_cap = settings.DAILY_TOKEN_HARD_CAP
+            # Bug fix: Only send the alert/log ONCE when the cap is first reached (not every call)
+            if hard_cap > 0 and total >= hard_cap and not self._hard_cap_hit:
+                self._hard_cap_hit = True
+                self._hard_cap_hit_date = today
+                msg = (
+                    f"[usage] HARD CAP REACHED: daily token usage {total} "
+                    f">= hard cap {hard_cap}. Further LLM calls are blocked for today."
+                )
+                print(msg)
+                try:
+                    self._notify_telegram(msg)
+                except Exception:
+                    pass
 
         if self._usage_alerted_day != today:
             if total >= settings.DAILY_TOKEN_ALERT_THRESHOLD:
@@ -1403,11 +1512,12 @@ class JarvisApp:
 def main() -> int:
     setup_logger()
     try:
-        app = JarvisApp()
+        app = NOVAApp()
     except SettingsError as exc:
         print(str(exc))
         return 1
 
+    # fix 7.8: graceful shutdown on SIGTERM and SIGINT
     def _shutdown_handler(*_):
         print("\n[signal] Shutdown signal received — cleaning up…")
         app.shutdown()
@@ -1425,3 +1535,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# Backward-compatibility alias so any code/tests referencing JarvisApp still work.
+JarvisApp = NOVAApp

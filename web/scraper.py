@@ -23,6 +23,7 @@ _PRIVATE_NETWORKS = [
     ipaddress.ip_network("100.64.0.0/10"),    # Tailscale / CGNAT
     ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
 ]
 
 
@@ -44,13 +45,15 @@ def _validate_url(url: str) -> None:
     if not hostname:
         raise ValueError("URL has no hostname")
     try:
-        resolved_ip = socket.gethostbyname(hostname)
+        addr_info = socket.getaddrinfo(hostname, None)
+        resolved_ips = [info[4][0] for info in addr_info]
     except socket.gaierror as exc:
         raise ValueError(f"DNS resolution failed for {hostname!r}: {exc}") from exc
-    if _is_private_ip(resolved_ip):
-        raise ValueError(
-            f"SSRF blocked: {hostname!r} resolves to private/internal IP {resolved_ip}"
-        )
+    for ip in resolved_ips:
+        if _is_private_ip(ip):
+            raise ValueError(
+                f"SSRF blocked: {hostname!r} resolves to private/internal IP {ip}"
+            )
 
 
 def scrape_text(url: str) -> str:
@@ -60,4 +63,12 @@ def scrape_text(url: str) -> str:
     soup = BeautifulSoup(response.text, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
-    return soup.get_text("\n", strip=True)
+    
+    import re
+    text = soup.get_text("\n", strip=True)
+    
+    # Fix 16: Prompt Injection Guard
+    text = re.sub(r"\[/?tool_call\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r'\{[^{}]*"tool"\s*:\s*"[^"]+"[^{}]*\}', "", text, flags=re.IGNORECASE)
+    
+    return "[Content from web (untrusted)]\n" + text.strip()
