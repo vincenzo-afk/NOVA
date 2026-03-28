@@ -80,7 +80,11 @@ def scrape_text(url: str) -> str:
     text = soup.get_text("\n", strip=True)
     
     # Fix 16 & Sec 3: Prompt Injection Guard
-    is_injected, reason = detect_prompt_injection(text)
+    detected = detect_prompt_injection(text)
+    if isinstance(detected, tuple):
+        is_injected, reason = bool(detected[0]), str(detected[1] or "injection_detected")
+    else:
+        is_injected, reason = bool(detected), "injection_detected"
     if is_injected:
         return f"[Content from web (untrusted) - BLOCKED due to prompt injection: {reason}]"
         

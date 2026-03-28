@@ -89,7 +89,7 @@ class HealthMonitor:
                     self.heartbeat(name, "restart_failed")
                     self._emit_change(name, "restart_failed", "down")
 
-    def start(self, interval_seconds: int = 60) -> None:
+    def start(self, interval_seconds: float = 60.0) -> None:
         if self._running:
             return
         self._running = True

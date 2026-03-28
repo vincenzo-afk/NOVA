@@ -52,9 +52,10 @@ def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
         module = module_from_spec(spec)
         # Fix 4.4: Execute plugin in restricted namespace
         import builtins
+        safe_builtins = {k: v for k, v in vars(builtins).items() if k != "__import__"}
+        safe_builtins["__import__"] = _restricted_import
         restricted_globals = {
-            "__builtins__": {k: v for k, v in vars(builtins).items() if k != "__import__"},
-            "__import__": _restricted_import,
+            "__builtins__": safe_builtins,
         }
         try:
             source = path.read_text(encoding="utf-8")

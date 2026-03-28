@@ -53,14 +53,23 @@ def _backup_chromadb(chroma_dir: str = ".jarvis_chroma", export_dir: str = "expo
         return f"backup_failed: {exc}"
 
 
-def schedule_daily_backup(scheduler, chroma_dir: str = ".jarvis_chroma") -> None:
-    """Register a daily 02:00 cron job in the given TaskScheduler to back up ChromaDB."""
-    def _run():
-        path = _backup_chromadb(chroma_dir=chroma_dir)
+def schedule_daily_backup(
+    scheduler,
+    chroma_dir: str = ".jarvis_chroma",
+    docs_dir: str = ".jarvis_docs",
+) -> None:
+    """Register daily backup jobs for both memory and document Chroma stores."""
+    def _run_memory():
+        path = _backup_chromadb(chroma_dir=chroma_dir, export_dir="exports/memory")
         print(f"[memory_backup] Snapshot written: {path}")
 
+    def _run_docs():
+        path = _backup_chromadb(chroma_dir=docs_dir, export_dir="exports/docs")
+        print(f"[docs_backup] Snapshot written: {path}")
+
     try:
-        scheduler.add_from_text(_run, "every day at 2:00 am", job_id="nova_memory_backup")
+        scheduler.add_from_text(_run_memory, "every day at 2:00 am", job_id="nova_memory_backup")
+        scheduler.add_from_text(_run_docs, "every day at 2:15 am", job_id="nova_docs_backup")
     except Exception:
         # Non-fatal — best-effort
         pass

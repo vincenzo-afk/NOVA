@@ -124,9 +124,9 @@ class Dispatcher:
                 "details": json.loads(exc.json()),
             }
 
-        # Auth and risk default to None for bypass scenarios
-        from safety.guardrails import Authorization
-        auth = Authorization(blocked=False, reason="guard_bypass", score=0, level="low", plan="")
+        # Default auth for bypass scenarios
+        from safety.guardrails import RiskResult
+        auth = RiskResult(blocked=False, reason="guard_bypass", score=0, level="low", plan="")
 
         if not _skip_guardrails:
             risk = guardrails.check(tool_call)

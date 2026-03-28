@@ -87,8 +87,15 @@ def clarifying_question(user_text: str) -> str:
 _INJECTION_PATTERNS = [
     re.compile(r"ignore (all |previous )?instructions?", re.IGNORECASE),
     re.compile(r"you are now", re.IGNORECASE),
+    re.compile(r"\bact as\b", re.IGNORECASE),
+    re.compile(r"\bfrom now on\b", re.IGNORECASE),
+    re.compile(r"\byour new instructions?\b", re.IGNORECASE),
     re.compile(r"system prompt", re.IGNORECASE),
+    re.compile(r"\[inst\]", re.IGNORECASE),
+    re.compile(r"###\s*instructions?", re.IGNORECASE),
+    re.compile(r"^\s*(system|assistant|user)\s*:", re.IGNORECASE | re.MULTILINE),
     re.compile(r"<\|.*?\|>"),  # token delimiters
+    re.compile(r"```(?:json)?\s*\{[\s\S]*\"tool\"\s*:\s*\"[^\"]+\"[\s\S]*\}\s*```", re.IGNORECASE),
     re.compile(r"\{\s*\"tool\"\s*:\s*\""),  # JSON tool call in user input
 ]
 

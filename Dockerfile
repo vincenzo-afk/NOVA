@@ -48,8 +48,6 @@ ENV PYTHONUNBUFFERED=1 \
     PHONE_WATCHER_ENABLED=false \
     AUTONOMY_ENABLED=false
 
-EXPOSE 7860
-
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD ps aux | grep 'python3 main.py' | grep -v grep || exit 1
 

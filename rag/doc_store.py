@@ -7,6 +7,7 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
+from core.think.reasoning import detect_prompt_injection
 from rag.chunker import chunk_text
 from rag.doc_loader import DocumentLoader
 from utils.embeddings import EmbeddingBackend, get_embedder
@@ -117,6 +118,16 @@ class DocumentStore:
         return {"filename": filename, "chunks": len(chunks), **self._doc_meta[filename]}
 
     def query(self, question: str, filename: str | None = None, top_k: int = 5) -> list[str]:
+        def _sanitize_chunks(chunks: list[str]) -> list[str]:
+            out: list[str] = []
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                if detect_prompt_injection(chunk):
+                    continue
+                out.append("[Content from document (unverified)]\n" + chunk)
+            return out
+
         if self._use_chroma and self._collection and self._embedder:
             try:
                 embedding = self._embedder.encode([question])[0]
@@ -125,7 +136,7 @@ class DocumentStore:
                     query_kwargs["where"] = {"filename": filename}
                 results = self._collection.query(**query_kwargs)
                 docs = results.get("documents", [[]])[0]
-                return [doc for doc in docs if doc]
+                return _sanitize_chunks([doc for doc in docs if doc])
             except Exception:
                 self._use_chroma = False
 
@@ -143,7 +154,7 @@ class DocumentStore:
             if score:
                 scored.append((score, chunk.text))
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [text for _, text in scored[:top_k]]
+        return _sanitize_chunks([text for _, text in scored[:top_k]])
 
     def list_docs(self) -> list[dict[str, Any]]:
         return [

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Generator, Iterable
 
 import requests
@@ -38,7 +39,7 @@ class LLMEngine:
                 self.pool = RoundRobinPool(openai_keys)
             except ValueError:
                 self.pool = None
-        self._thread_local = __import__("threading").local()
+        self._thread_local = threading.local()
 
     @property
     def last_provider(self) -> str:
@@ -90,9 +91,11 @@ class LLMEngine:
         try:
             for token in self._ollama_stream(messages=messages, system=system):
                 yield token
-        except (requests.RequestException, OSError) as exc:
-            yield f"[ERROR] Fallback LLM connection failed: {exc}"
-            # Bug 6 fixed: Explicitly caught OSError for Ollama fallback
+        except (requests.RequestException, OSError):
+            yield (
+                f"[ERROR] Could not connect to local Ollama. "
+                f"Is it running at {self.ollama_base_url}?"
+            )
         except Exception as exc:
             yield f"[ERROR] Fallback LLM failed: {exc}"
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import signal
 import time
+import hashlib
 from pathlib import Path
 import re
 import threading
@@ -359,15 +360,16 @@ class NOVAApp:
         # Add summary cache tracking (fix 6.1, 11)
         self._summary_cache = OrderedDict()  # Fix 11
         self._summary_cache_lock = threading.Lock()  # fix 3.2
-        self._last_snippet_hash: int | None = None
+        self._last_snippet_hash: str | None = None
 
         # Add single thread for TTS execution (fix 5.1)
         self._tts_queue = queue.Queue()
         self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         self._tts_thread.start()
 
-        # Add executor for background summarization (fix 2)
+        # Separate executors so goal planning cannot block context summarization.
         self._summarize_executor = ThreadPoolExecutor(max_workers=1)
+        self._goal_plan_executor = ThreadPoolExecutor(max_workers=2)
 
         self._event_lock = threading.Lock()
         self._events = deque(maxlen=100)
@@ -384,8 +386,8 @@ class NOVAApp:
         if shutil.which("adb"):
             self.adb = ADBClient()
             self.health.register_subsystem(
-                "adb", 
-                check_fn=lambda: __import__("subprocess").run(["adb", "start-server"], capture_output=True).returncode == 0
+                "adb",
+                check_fn=lambda: __import__("subprocess").run(["adb", "version"], capture_output=True).returncode == 0,
             )
         else:
             self.adb = None
@@ -439,13 +441,14 @@ class NOVAApp:
         # Bug 2 & Missing 1: execution lock and separate autonomy runner
         self._execution_lock = threading.Semaphore(1)
         self.goal_runner = GoalRunner(self.dispatcher)
-        
+
         def _autonomy_confirm(prompt: str) -> bool:
             if settings.AUTONOMY_NOTIFY_TELEGRAM:
                 self._notify_telegram(f"Autonomy paused for high-risk step.\n{prompt}\nReply with: /approve_goal")
             return False
-            
-        self.autonomy_runner = GoalRunner(self.dispatcher, confirm_callback=_autonomy_confirm)
+
+        self._autonomy_confirm_callback = _autonomy_confirm
+        self.autonomy_runner = GoalRunner(self.dispatcher, confirm_callback=self._autonomy_confirm_callback)
         
         load_plugins(self.dispatcher)
         self._start_health_monitoring()
@@ -469,7 +472,16 @@ class NOVAApp:
         return self.emotion.state
 
     def switch_session(self, name: str):
-        return self.session.switch(name)
+        state = self.session.switch(name)
+        # Session isolation: reset stateful tool clients on session switch.
+        self._browser_close()
+        self._mouse_keyboard = None
+        if getattr(self, "adb", None):
+            try:
+                self.adb.device = None
+            except Exception:
+                pass
+        return state
 
     def reset_context(self) -> None:
         """Clear current session history and the associated trimmer summary (fix 1.6).
@@ -484,7 +496,9 @@ class NOVAApp:
             pass
         self.session.reset_context()
         # fix 1.6: clear the stale summary so it doesn't bleed into the new context
-        self.trimmer.summaries.pop(session_id, None)
+        with self.trimmer._lock:
+            self.trimmer.summaries.pop(session_id, None)
+            self.trimmer._last_summarized_count.pop(session_id, None)
 
     def list_goals(self) -> list[dict]:
         return self._list_goals()
@@ -793,7 +807,7 @@ class NOVAApp:
                         self._persist_goals()
                         break
 
-        self._summarize_executor.submit(background_plan)
+        self._goal_plan_executor.submit(background_plan)
         return record
 
     def _persist_goals(self) -> None:
@@ -1071,7 +1085,7 @@ class NOVAApp:
                 
             candidate_id = None
             for item in goals_snapshot:
-                if item.get("status") == "pending" and item.get("steps"):
+                if item.get("status") in {"pending", "approved_for_step"} and item.get("steps"):
                     candidate_id = item.get("id")
                     break
                     
@@ -1092,13 +1106,14 @@ class NOVAApp:
             max_steps = int(goal.get("max_steps") or settings.AUTONOMY_MAX_STEPS)
             start_index = int(goal.get("cursor") or 0)
             
+            approved_for_step = goal.get("status") == "approved_for_step"
             with self._execution_lock:
-                if goal.get("status") == "approved_for_step":
-                    # Bypass guardrails for just ONE step
+                if approved_for_step:
+                    # Bypass guardrails for just ONE step.
                     self.autonomy_runner.confirm_callback = lambda p: True
                     result = self.autonomy_runner.run(steps, max_steps=max_steps, start_index=start_index)
                     # Restore callback
-                    self.autonomy_runner.confirm_callback = _autonomy_confirm
+                    self.autonomy_runner.confirm_callback = self._autonomy_confirm_callback
                 else:
                     result = self.autonomy_runner.run(steps, max_steps=max_steps, start_index=start_index)
 
@@ -1162,6 +1177,7 @@ class NOVAApp:
         except Exception:
             pass
         self._summarize_executor.shutdown(wait=False)
+        self._goal_plan_executor.shutdown(wait=False)
         # Bug fix: drain TTS queue on shutdown so the worker thread exits cleanly
         try:
             self._tts_queue.put(None)   # sentinel to stop the worker
@@ -1189,11 +1205,7 @@ class NOVAApp:
         self.record_event("health", message)
         print(f"\n[health] {message}")
         if status in {"down", "restart_failed"}:
-            _ = send_telegram_text(
-                bot_token=settings.TELEGRAM_BOT_TOKEN,
-                chat_id=settings.TELEGRAM_CHAT_ID,
-                text=message,
-            )
+            self._notify_telegram(message)
 
     def _notify_telegram(self, text: str) -> dict | None:
         if not settings.AUTONOMY_NOTIFY_TELEGRAM:
@@ -1335,10 +1347,12 @@ class NOVAApp:
         self.dispatcher.register("assistant.mute_status", self._mute_status_tool, EmptyArgs)
 
     def _context_messages(self, user_text: str) -> tuple[str, list[dict], list[dict]]:
-        session_id = self.session.current.session_id
-        
+        current_session = self.session.current
+        session_id = current_session.session_id
+        with current_session._lock:
+            history = list(current_session.history)
+
         # Check if we need to trigger background summarization
-        history = self.session.current.history
         if len(history) > self.trimmer.max_raw_turns:
             older = history[: -self.trimmer.max_raw_turns]
             snippet = " ".join(
@@ -1347,8 +1361,9 @@ class NOVAApp:
                 if turn.get("content")
             )
             # Trigger background summarization if snippet changed
-            if not hasattr(self, '_last_snippet_hash') or hash(snippet) != self._last_snippet_hash:
-                self._last_snippet_hash = hash(snippet)
+            snippet_hash = hashlib.sha256(snippet.encode("utf-8")).hexdigest()
+            if not hasattr(self, '_last_snippet_hash') or snippet_hash != self._last_snippet_hash:
+                self._last_snippet_hash = snippet_hash
                 self._summarize_executor.submit(
                     self._summarize_history_background, snippet, session_id
                 )
@@ -1387,15 +1402,10 @@ class NOVAApp:
         all_messages = [context_message, *recent]
         try:
             total_tokens = estimate_tokens_from_messages([{"role": "system", "content": system_prompt}] + all_messages)
-            # If exceeding MAX_CONTEXT_TOKENS, drop oldest raw turns beyond what ContextTrimmer handles
-            if total_tokens > MAX_CONTEXT_TOKENS and len(recent) > 2:
-                # Naive approximation: 1 turn = 500 tokens
-                keep_count = max(2, len(recent) - (total_tokens - MAX_CONTEXT_TOKENS) // 500)
-                recent = recent[-keep_count:]
-                all_messages = [context_message, *recent]
-                
-            if total_tokens > MAX_CONTEXT_TOKENS and len(recent) <= 2:
-                recent = recent[-1:]
+            # If we overflow, drop oldest turns using real per-turn token estimates.
+            while total_tokens > MAX_CONTEXT_TOKENS and len(recent) > 1:
+                dropped = recent.pop(0)
+                total_tokens -= estimate_tokens_from_messages([dropped])
                 all_messages = [context_message, *recent]
         except Exception:
             pass
@@ -1406,15 +1416,15 @@ class NOVAApp:
         """Summarize conversation history. Uses cached summary if available."""
         if not text.strip():
             return ""
-        
-        text_hash = hash(text)
+
+        stable_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         with self._summary_cache_lock:
-            if text_hash in self._summary_cache:
-                self._summary_cache.move_to_end(text_hash)  # Keep LRU fresh
-                return self._summary_cache[text_hash]
-        
-        # If no cache, return truncated text (will be summarized in background)
-        return text[:700]
+            if stable_hash in self._summary_cache:
+                self._summary_cache.move_to_end(stable_hash)  # Keep LRU fresh
+                return self._summary_cache[stable_hash]
+
+        # No cached summary yet; background worker will populate it.
+        return ""
     
     def _summarize_history_background(self, text: str, session_id: str) -> None:
         """Summarize history in background thread and update cache."""
@@ -1426,15 +1436,18 @@ class NOVAApp:
             summary = self.engine.ask(prompt=text, system=system, history=[])
             # Fix 3.2 & 11: Lock around LRU ordered dict cache 
             with self._summary_cache_lock:
-                self._summary_cache[hash(text)] = summary
+                stable_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                self._summary_cache[stable_hash] = summary
                 if len(self._summary_cache) > 50:
                     self._summary_cache.popitem(last=False)
-            self.trimmer.summaries[session_id] = summary
+            with self.trimmer._lock:
+                self.trimmer.summaries[session_id] = summary
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning("Summarizer thread failed unconditionally: %s", e)
             with self._summary_cache_lock:
-                self._summary_cache[hash(text)] = text[:700]
+                stable_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                self._summary_cache[stable_hash] = ""
                 if len(self._summary_cache) > 50:
                     self._summary_cache.popitem(last=False)
 
@@ -1456,11 +1469,11 @@ class NOVAApp:
                 for goal in self._goals:
                     if candidate_id and goal["id"] == candidate_id and goal["status"] == "awaiting_confirmation":
                         goal["status"] = "approved_for_step"
-                        self._save_goals()
+                        self._persist_goals()
                         return f"Goal {candidate_id} approved for next step."
                     elif not candidate_id and goal["status"] == "awaiting_confirmation":
                         goal["status"] = "approved_for_step"
-                        self._save_goals()
+                        self._persist_goals()
                         return f"Goal {goal['id']} approved for next step."
             return "No matching goal awaiting confirmation."
 

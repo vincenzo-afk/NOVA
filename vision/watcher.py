@@ -7,6 +7,7 @@ import time
 from typing import Callable
 
 from core.llm.fallback import NetworkState
+from core.think.reasoning import detect_prompt_injection
 from vision.capture import capture_screen_png
 from vision.gemini_vision import analyze_image
 from vision.omniparser import OmniParserClient
@@ -112,6 +113,9 @@ class ScreenWatcher:
                 ocr_text,
             ]
         ).lower()
+
+        if detect_prompt_injection(combined):
+            return ""
 
         if any(keyword in combined for keyword in _ERROR_KEYWORDS):
             return "I detected a possible error dialog on your screen. Want me to take a look?"
