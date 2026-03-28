@@ -7,7 +7,7 @@ google-generativeai
 pvporcupine
 pyaudio
 sounddevice
-silero-vad
+silero
 faster-whisper
 pyttsx3
 gTTS
@@ -40,7 +40,6 @@ python-docx
 
 # ADB & Networking
 pure-python-adb
-adb-wifi-py
 qrcode[pil]
 
 # Interfaces
