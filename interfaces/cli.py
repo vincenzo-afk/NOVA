@@ -65,7 +65,7 @@ def run_cli(agent) -> None:
     pin_hash = ""
     pin_hash_file = Path(CLI_PIN_HASH_FILE)
     legacy_pin_file = Path(CLI_PIN_LEGACY_FILE)
-    lock_file = Path(CLI_PIN_LOCK_FILE)
+    lock_file = Path.home() / CLI_PIN_LOCK_FILE.lstrip("./")
     if pin_hash_file.exists():
         try:
             pin_hash = pin_hash_file.read_text(encoding="utf-8").strip()

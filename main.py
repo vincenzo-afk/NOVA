@@ -49,7 +49,7 @@ from mcp.master_mcp import BUILTIN_SERVICES, MasterMCP
 from rag.doc_store import DocumentStore
 from safety.guardrails import guardrails
 from tasks.scheduler import TaskScheduler
-from tasks.goals import GoalRunner
+from tasks.goals import GoalResult, GoalRunner
 from utils.exporter import export_json, export_markdown
 from utils.goals import format_goal_list
 from utils.health import format_health_table, summarize_health
@@ -389,15 +389,13 @@ class NOVAApp:
         self._summary_cache_lock = threading.Lock()  # fix 3.2
         self._last_snippet_hashes: dict[str, str] = {}
         self._summary_submit_lock = threading.Lock()
+        self._memory_submit_lock = threading.Lock()
         self._summary_inflight: set[str] = set()
 
         # Add single thread for TTS execution (fix 5.1)
         self._tts_thread.start()
 
         # Separate executors so goal planning and memory sync cannot block summarization.
-        self._summarize_executor.shutdown(wait=False)
-        self._memory_executor.shutdown(wait=False)
-        self._goal_plan_executor.shutdown(wait=False)
         self._summarize_executor = ThreadPoolExecutor(max_workers=1)
         self._memory_executor = ThreadPoolExecutor(max_workers=1)
         self._goal_plan_executor = ThreadPoolExecutor(max_workers=2)
@@ -977,7 +975,20 @@ class NOVAApp:
 
     def _persist_goals(self) -> None:
         try:
-            self._goals_file.write_text(json.dumps(self._goals, ensure_ascii=False, indent=2), encoding="utf-8")
+            import tempfile
+            payload = json.dumps(self._goals, ensure_ascii=False, indent=2)
+            self._goals_file.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(self._goals_file.parent),
+                delete=False,
+                suffix=".tmp",
+            ) as tmp:
+                tmp.write(payload)
+                tmp.flush()
+                tmp_path = Path(tmp.name)
+            tmp_path.replace(self._goals_file)
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning("Failed to persist goals: %s", e)
@@ -1298,7 +1309,8 @@ class NOVAApp:
     def _stop_autonomy_loop(self) -> None:
         self._autonomy_stop.set()
         if self._autonomy_thread and self._autonomy_thread.is_alive():
-            self._autonomy_thread.join(timeout=2)
+            timeout = max(2.0, float(getattr(settings, "GOAL_STEP_TIMEOUT_SECONDS", 60.0)) + 2.0)
+            self._autonomy_thread.join(timeout=timeout)
 
     def _start_probe_server(self) -> None:
         if self._health_http_server is not None:
@@ -1376,14 +1388,17 @@ class NOVAApp:
             approved_for_step = goal.get("status") == "approved_for_step"
             with self._autonomy_execution_lock:
                 if approved_for_step:
-                    result = self.autonomy_runner.run(
-                        steps[start_index : start_index + 1],
-                        max_steps=1,
-                        start_index=0,
-                        on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
-                        confirm_callback=lambda _p: True,
-                    )
-                    result.next_index = start_index + (1 if result.status == "completed" else 0)
+                    if start_index >= len(steps):
+                        result = GoalResult(status="completed", reason="no_remaining_steps", results=[], next_index=len(steps))
+                    else:
+                        result = self.autonomy_runner.run(
+                            steps[start_index : start_index + 1],
+                            max_steps=1,
+                            start_index=0,
+                            on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
+                            confirm_callback=lambda _p: True,
+                        )
+                        result.next_index = min(len(steps), start_index + (1 if result.status == "completed" else 0))
                 else:
                     result = self.autonomy_runner.run(
                         steps,
@@ -1417,7 +1432,7 @@ class NOVAApp:
                         if item.get("status") == "cancelled":
                             break
                         item["status"] = status
-                        item["cursor"] = result.next_index
+                        item["cursor"] = min(int(result.next_index), len(steps))
                         item["finished_at"] = time.time()
                         item["last_result"] = {
                             "status": result.status,
@@ -1955,16 +1970,19 @@ class NOVAApp:
                 )
                 self.memory.sync_pending(session_id)
             finally:
-                self._memory_jobs_inflight = max(0, self._memory_jobs_inflight - 1)
+                with self._memory_submit_lock:
+                    self._memory_jobs_inflight = max(0, self._memory_jobs_inflight - 1)
 
         try:
-            if self._memory_jobs_inflight >= self._max_background_memory_jobs:
-                return
-            self._memory_jobs_inflight += 1
+            with self._memory_submit_lock:
+                if self._memory_jobs_inflight >= self._max_background_memory_jobs:
+                    return
+                self._memory_jobs_inflight += 1
             self._memory_executor.submit(_job)
         except Exception:
             # Fallback to sync path if executor is unavailable.
-            self._memory_jobs_inflight = max(0, self._memory_jobs_inflight - 1)
+            with self._memory_submit_lock:
+                self._memory_jobs_inflight = max(0, self._memory_jobs_inflight - 1)
             _job()
 
     def _adb_send_sms(self, phone_number: str, body: str) -> str:

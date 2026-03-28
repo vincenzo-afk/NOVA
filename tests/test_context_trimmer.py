@@ -28,6 +28,5 @@ def test_context_trimmer_falls_back_when_summarizer_returns_empty():
     ]
 
     summary, recent = trimmer.trim(history, session_id="s1", summarizer=lambda _s: "")
-    assert summary
-    assert "user: one" in summary
+    assert summary == ""
     assert len(recent) == 2

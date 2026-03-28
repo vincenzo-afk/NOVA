@@ -87,11 +87,14 @@ async def _stream_text(message: Any, context: Any, agent: Any, prompt_text: str)
     last_edit = 0.0
 
     token_queue: queue.Queue[str | None] = queue.Queue()
+    worker_error: list[str] = []
 
     def _worker() -> None:
         try:
             for token in agent.ask_stream(prompt_text):
                 token_queue.put(token)
+        except Exception as exc:
+            worker_error.append(str(exc))
         finally:
             token_queue.put(None)
 
@@ -115,7 +118,10 @@ async def _stream_text(message: Any, context: Any, agent: Any, prompt_text: str)
             last_edit = now
 
     if not buffer:
-        buffer = "(no output)"
+        if worker_error:
+            buffer = f"(error: {worker_error[-1]})"
+        else:
+            buffer = "(no output)"
     await context.bot.edit_message_text(
         text=buffer,
         chat_id=placeholder.chat_id,
@@ -246,8 +252,11 @@ def run_telegram_bot(
             await update.message.reply_text("This command is rate-limited to 2 requests per minute.")
             return
         path = agent.export_session("md")
-        with open(path, "rb") as file_handle:
-            await update.message.reply_document(document=InputFile(file_handle, filename=path.split("/")[-1]))
+        try:
+            with open(path, "rb") as file_handle:
+                await update.message.reply_document(document=InputFile(file_handle, filename=path.split("/")[-1]))
+        except Exception as exc:
+            await update.message.reply_text(f"Export failed: {exc}")
 
     async def on_goals(update, _context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
@@ -369,6 +378,10 @@ def run_telegram_bot(
 
     async def on_message(update, context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
+            return
+        text = (update.message.text or "").strip() if update.message else ""
+        if len(text) > 50_000:
+            await update.message.reply_text("Input too long. Please keep messages under 50,000 characters.")
             return
         await _stream_reply(update, context, agent)
 
