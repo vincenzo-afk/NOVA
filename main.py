@@ -291,7 +291,7 @@ class GoalPlanArgs(BaseModel):
 
 
 class GoalAddArgs(BaseModel):
-    goal: str
+    goal: str = Field(..., min_length=1)
     max_steps: int = Field(default=20, ge=1, le=50)
 
 
@@ -414,8 +414,9 @@ class NOVAApp:
                 for goal in self._goals:
                     if goal.get("status") in {"planning", "running"}:
                         goal["status"] = "pending"
-            except Exception:
-                pass
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("Failed to load goals from disk: %s — starting with empty goals list", exc)
         self._goal_lock = threading.Lock()
         self._autonomy_stop = threading.Event()
         self._autonomy_thread: threading.Thread | None = None
@@ -745,8 +746,7 @@ class NOVAApp:
         return {"goal": goal, "status": "ok", "steps": steps, "raw": raw}
         
     def _goal_plan_wrapper(self, goal: str, max_steps: int = 10) -> dict:
-        self._summarize_executor.submit(self._plan_goal, goal, max_steps=min(max_steps, 30))
-        return {"goal": goal, "status": "planning"}
+        return self._add_goal(goal, max_steps)
 
     def _add_goal(self, goal: str, max_steps: int = 20) -> dict:
         goal_id = f"goal_{int(time.time())}"
@@ -1056,6 +1056,9 @@ class NOVAApp:
             with self._goal_lock:
                 for item in self._goals:
                     if item.get("status") == "pending":
+                        steps = item.get("steps") or []
+                        if not steps:
+                            continue
                         item["status"] = "running"
                         item["started_at"] = time.time()
                         goal = copy.deepcopy(item)
@@ -1129,7 +1132,6 @@ class NOVAApp:
         # Bug fix: drain TTS queue on shutdown so the worker thread exits cleanly
         try:
             self._tts_queue.put(None)   # sentinel to stop the worker
-            self._tts_queue.join()       # wait until all items (incl. sentinel) are processed
             self._tts_thread.join(timeout=5)
         except Exception:
             pass
@@ -1359,6 +1361,10 @@ class NOVAApp:
                 keep_count = max(2, len(recent) - (total_tokens - MAX_CONTEXT_TOKENS) // 500)
                 recent = recent[-keep_count:]
                 all_messages = [context_message, *recent]
+                
+            if total_tokens > MAX_CONTEXT_TOKENS and len(recent) <= 2:
+                recent = recent[-1:]
+                all_messages = [context_message, *recent]
         except Exception:
             pass
 
@@ -1398,6 +1404,9 @@ class NOVAApp:
                     self._summary_cache[hash(text)] = text[:700]
                     if len(self._summary_cache) > 50:
                         self._summary_cache.popitem(last=False)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Summarizer thread failed unconditionally: %s", e)
 
     def _apply_text_commands(self, user_text: str) -> str | None:
         """Handle built-in text shortcuts without calling the LLM.
@@ -1434,9 +1443,8 @@ class NOVAApp:
         if text in {"toggle mute", "mute toggle"}:
             now_muted = self.toggle_mute()
             return "Muted." if now_muted else "Unmuted."
-        # Fix 13: the match uses lowercased text, but split uses original user_text case
         if re.match(r"^switch session\s+.+$", text):
-            name = user_text.strip().split(maxsplit=2)[-1]
+            name = text.split(maxsplit=2)[-1]
             state = self.switch_session(name)
             return f"Switched to {state.name} ({state.session_id})."
         return None
@@ -1510,6 +1518,8 @@ class NOVAApp:
 
     def _adb_send_sms(self, phone_number: str, body: str) -> str:
         """Fix 10: Enforce allowlist for SMS delivery."""
+        if not self.adb:
+            return "Error: ADB not available"
         if phone_number not in settings.ALLOWED_PHONE_NUMBERS:
             return f"Error: {phone_number} is not in settings.ALLOWED_PHONE_NUMBERS"
         return self.adb.send_sms(phone_number, body)
@@ -1548,13 +1558,13 @@ class NOVAApp:
                 except Exception:
                     pass
 
-        if self._usage_alerted_day != today:
-            if total >= settings.DAILY_TOKEN_ALERT_THRESHOLD:
-                print(
-                    f"\n[usage] Warning: daily token usage {total} "
-                    f"exceeded threshold {settings.DAILY_TOKEN_ALERT_THRESHOLD}."
-                )
-                self._usage_alerted_day = today
+            if self._usage_alerted_day != today:
+                if total >= settings.DAILY_TOKEN_ALERT_THRESHOLD:
+                    print(
+                        f"\n[usage] Warning: daily token usage {total} "
+                        f"exceeded threshold {settings.DAILY_TOKEN_ALERT_THRESHOLD}."
+                    )
+                    self._usage_alerted_day = today
 
 
 def main() -> int:
