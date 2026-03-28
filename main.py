@@ -421,6 +421,7 @@ class NOVAApp:
         self._goal_lock = threading.Lock()
         self._autonomy_stop = threading.Event()
         self._autonomy_thread: threading.Thread | None = None
+        self._autonomy_start_lock = threading.Lock()
         self._emergency_hotkey_listener: Any | None = None
         self.screen_watcher = ScreenWatcher(
             interval_seconds=settings.PROACTIVE_WATCHER_INTERVAL,
@@ -428,7 +429,12 @@ class NOVAApp:
             on_alert=self._handle_proactive_alert,
             omniparser_url=settings.OMNIPARSER_SERVER_URL,
         )
-        self.phone_watcher = PhoneWatcher(adb=self.adb, on_alert=self._handle_proactive_alert)
+        self.phone_watcher = None
+        if self.adb is not None:
+            self.phone_watcher = PhoneWatcher(adb=self.adb, on_alert=self._handle_proactive_alert)
+        elif settings.PHONE_WATCHER_ENABLED:
+            import logging
+            logging.getLogger(__name__).warning("PHONE_WATCHER_ENABLED=true but ADB is unavailable; disabling phone watcher.")
         self.engine = LLMEngine(
             openai_base_url=settings.OPENAI_BASE_URL or "http://localhost:11434",
             openai_keys=settings.OPENAI_API_KEYS,
@@ -440,7 +446,7 @@ class NOVAApp:
         
         # Bug 2 & Missing 1: execution lock and separate autonomy runner
         self._execution_lock = threading.Semaphore(1)
-        self.goal_runner = GoalRunner(self.dispatcher)
+        self.goal_runner = GoalRunner(self.dispatcher, confirm_callback=self._interactive_confirm)
 
         def _autonomy_confirm(prompt: str) -> bool:
             if settings.AUTONOMY_NOTIFY_TELEGRAM:
@@ -767,6 +773,7 @@ class NOVAApp:
         steps = []
         for attempt in range(3):
             raw = self.engine.ask(prompt=f"Goal: {goal}", system=system_prompt, history=[])
+            self._track_usage(system_prompt, [], f"[goal_plan] {goal}", raw)
             steps = _extract_steps(raw)
             if steps:
                 break
@@ -966,6 +973,11 @@ class NOVAApp:
         self.health.register_subsystem("network", lambda: NetworkState.is_online())
         self.health.register_subsystem("memory_router", lambda: self.memory is not None)
         self.health.register_subsystem(
+            "scheduler",
+            lambda: bool(getattr(self.scheduler, "scheduler", None) and self.scheduler.scheduler.running),
+            restart_fn=self.scheduler.start,
+        )
+        self.health.register_subsystem(
             "tailscale",
             lambda: tailscale_status() not in {"down"},
             restart_fn=ensure_tailscale_connected,
@@ -1006,7 +1018,7 @@ class NOVAApp:
                 check_fn=self.screen_watcher.is_running,
                 restart_fn=self.screen_watcher.restart,
             )
-        if settings.PHONE_WATCHER_ENABLED:
+        if settings.PHONE_WATCHER_ENABLED and self.phone_watcher is not None:
             self.health.register_subsystem(
                 "phone_watcher",
                 check_fn=self.phone_watcher.is_running,
@@ -1030,7 +1042,7 @@ class NOVAApp:
                 self.screen_watcher.start()
             except Exception:
                 pass
-        if settings.PHONE_WATCHER_ENABLED:
+        if settings.PHONE_WATCHER_ENABLED and self.phone_watcher is not None:
             try:
                 self.phone_watcher.start()
             except Exception:
@@ -1040,11 +1052,12 @@ class NOVAApp:
         return self._autonomy_thread is not None and self._autonomy_thread.is_alive()
 
     def _start_autonomy_loop(self) -> None:
-        if not settings.AUTONOMY_ENABLED or self._autonomy_is_running():
-            return
-        self._autonomy_stop.clear()
-        self._autonomy_thread = threading.Thread(target=self._autonomy_loop, daemon=True)
-        self._autonomy_thread.start()
+        with self._autonomy_start_lock:
+            if not settings.AUTONOMY_ENABLED or self._autonomy_is_running():
+                return
+            self._autonomy_stop.clear()
+            self._autonomy_thread = threading.Thread(target=self._autonomy_loop, daemon=True)
+            self._autonomy_thread.start()
 
     def _start_emergency_hotkey(self) -> None:
         try:
@@ -1162,7 +1175,7 @@ class NOVAApp:
         self.health.stop()
         if settings.PROACTIVE_WATCHER_ENABLED:
             self.screen_watcher.stop()
-        if settings.PHONE_WATCHER_ENABLED:
+        if settings.PHONE_WATCHER_ENABLED and self.phone_watcher is not None:
             self.phone_watcher.stop()
         self.scheduler.stop()
         self._stop_autonomy_loop()
@@ -1177,7 +1190,7 @@ class NOVAApp:
         except Exception:
             pass
         self._summarize_executor.shutdown(wait=False)
-        self._goal_plan_executor.shutdown(wait=False)
+        self._goal_plan_executor.shutdown(wait=True)
         # Bug fix: drain TTS queue on shutdown so the worker thread exits cleanly
         try:
             self._tts_queue.put(None)   # sentinel to stop the worker
@@ -1374,11 +1387,7 @@ class NOVAApp:
             summarizer=self._summarize_history,
         )
         memories = self.memory.search(user_text, session_id=session_id, top_k=DEFAULT_MEMORY_TOP_K)
-        world_state = snapshot_environment()
-
-        # fix 2.13: strip clipboard content unless explicitly opt-ed in
-        if not settings.INCLUDE_CLIPBOARD_IN_CONTEXT:
-            world_state.pop("clipboard", None)
+        world_state = snapshot_environment(include_clipboard=settings.INCLUDE_CLIPBOARD_IN_CONTEXT)
 
         context_block = {
             "world_state": world_state,
@@ -1388,7 +1397,7 @@ class NOVAApp:
         }
 
         context_message = {
-            "role": "system",
+            "role": "user",
             "content": "Context payload:\n" + json.dumps(context_block, ensure_ascii=False),
         }
 
@@ -1407,6 +1416,17 @@ class NOVAApp:
                 dropped = recent.pop(0)
                 total_tokens -= estimate_tokens_from_messages([dropped])
                 all_messages = [context_message, *recent]
+            # If even context+1 turn overflow, truncate context payload to fit.
+            if total_tokens > MAX_CONTEXT_TOKENS:
+                base = "Context payload:\n"
+                payload = context_message["content"][len(base):]
+                while total_tokens > MAX_CONTEXT_TOKENS and len(payload) > 200:
+                    payload = payload[: int(len(payload) * 0.85)]
+                    context_message["content"] = base + payload
+                    all_messages = [context_message, *recent]
+                    total_tokens = estimate_tokens_from_messages(
+                        [{"role": "system", "content": system_prompt}] + all_messages
+                    )
         except Exception:
             pass
 
@@ -1434,6 +1454,9 @@ class NOVAApp:
         try:
             system = "Summarize the conversation history into a concise paragraph for future context."
             summary = self.engine.ask(prompt=text, system=system, history=[])
+            self._track_usage(system, [], "[history_summary]", summary)
+            if not str(summary).strip():
+                return
             # Fix 3.2 & 11: Lock around LRU ordered dict cache 
             with self._summary_cache_lock:
                 stable_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -1519,6 +1542,12 @@ class NOVAApp:
         allow_tools: bool = True,
         dry_run_tools: bool = False,
     ) -> Generator[str, None, None]:
+        today = date.today()
+        with self._usage_lock:
+            if self._hard_cap_hit_date != today:
+                self._hard_cap_hit = False
+                self._hard_cap_hit_date = None
+
         if self._hard_cap_hit:
             yield f"Daily token hard cap of {settings.DAILY_TOKEN_HARD_CAP} reached. Further calls blocked."
             return
@@ -1556,6 +1585,14 @@ class NOVAApp:
                 yield token
         except StopIteration:
             self.session.add_turn("user", user_text)
+            self.session.add_turn("assistant", "")
+            self.memory.add(
+                text=f"User: {user_text}\nAssistant: ",
+                session_id=self.session.current.session_id,
+                metadata={"source": "conversation"},
+            )
+            self.memory.sync_pending(self.session.current.session_id)
+            return
         except Exception as exc:
             yield f"[ERROR] Generation failed: {exc}"
             return
@@ -1617,6 +1654,16 @@ class NOVAApp:
                 if total >= settings.DAILY_TOKEN_ALERT_THRESHOLD:
                     print(f"\n[usage] Warning: daily token usage {total} exceeded threshold {settings.DAILY_TOKEN_ALERT_THRESHOLD}.")
                     self._usage_alerted_day = today
+
+    def _interactive_confirm(self, prompt: str) -> bool:
+        try:
+            import sys
+            if not sys.stdin or not sys.stdin.isatty():
+                return False
+            answer = input(prompt).strip().lower()
+            return answer in {"y", "yes", "confirm"}
+        except Exception:
+            return False
 
 
 def main() -> int:

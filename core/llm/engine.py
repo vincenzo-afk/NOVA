@@ -35,10 +35,7 @@ class LLMEngine:
         # Only initialise pool if we have keys; otherwise cloud path is effectively disabled
         self.pool: RoundRobinPool | None = None
         if openai_keys:
-            try:
-                self.pool = RoundRobinPool(openai_keys)
-            except ValueError:
-                self.pool = None
+            self.pool = RoundRobinPool(openai_keys)
         self._thread_local = threading.local()
 
     @property

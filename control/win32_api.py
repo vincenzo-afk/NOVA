@@ -56,7 +56,7 @@ def launch_process(command: str) -> int:
     Fix 1.3: Removed shell=True to prevent shell injection. Uses shlex.split() for safe parsing.
     """
     import shlex
-    args = shlex.split(command)
+    args = shlex.split(command, posix=not sys.platform.startswith("win"))
     proc = subprocess.Popen(args)
     return int(proc.pid)
 

@@ -1,483 +1,102 @@
-This is a thorough codebase to audit. Here is the complete technical analysis — every finding is from static analysis of the actual source provided.
-
----
-
-## NOVA/JARVIS — Third Technical Audit
-
----
-
-### Section 1 — Bugs & Runtime Errors
-
-**Bug 1: Double guardrails execution on every autonomy goal step**
-Severity: Critical | Priority: High
-
-`GoalRunner.run()` calls `guardrails.check()` + `guardrails.authorize()` explicitly as fix 1.5, then immediately calls `self.dispatcher.execute()` which calls `guardrails.check()` + `guardrails.authorize()` a second time internally. For medium-risk tools this runs the 5-second auto-confirm countdown twice (10 seconds total per step). For high-risk tools, confirmation is demanded twice. This regression was documented in the previous audit summary but never resolved.
-
-Root cause: `GoalRunner` added its own guardrails pass without suppressing the one inside `dispatcher.execute()`. Fix by passing a flag like `_skip_guardrails=True` to `dispatcher.execute()` when called from a pre-authorized `GoalRunner`, or by having `GoalRunner` call the registered function directly after its own check.
-
----
-
-**Bug 2: Autonomy loop deadlocks when any high-risk step is encountered**
-Severity: Critical | Priority: High
-
-`GoalRunner` is instantiated as `self.goal_runner = GoalRunner(self.dispatcher)` with no `confirm_callback`. Inside `GoalRunner.run()`, when a high-risk step is reached, `guardrails.authorize()` is called with `confirm_callback=None`, which falls through to `input_fn(prompt)` — the stdlib `input()` call. This blocks the autonomy background thread forever waiting for stdin. Since the thread is a daemon it freezes silently without crashing the process. The goal is permanently stuck in `"running"` status.
-
-Root cause: No confirm strategy was provided for the autonomous context. Fix by passing `confirm_callback=lambda _: False` to `GoalRunner` in `_start_autonomy_loop`, which causes high-risk steps to be immediately blocked (returned as `GoalResult(status="blocked")`) rather than deadlocking.
-
----
-
-**Bug 3: OmniParser UI element cache always returns stale data**
-Severity: Major | Priority: High
-
-In `vision/omniparser.py`, the cache key is `base64.b64encode(image_bytes[:64]).decode()`. For PNG screenshots of the same screen, the first 64 bytes contain the PNG magic header (8 bytes), IHDR chunk (25 bytes), and the beginning of fixed metadata. Different screenshots at the same resolution produce identical first-64-byte sequences. After the first call, every subsequent `ui_elements()` call returns the same stale cached element list regardless of what changed on screen. UI automation is functionally broken.
-
-Root cause: The cache key samples only metadata bytes, not pixel data. Fix by using a hash of the full image or at least the first 4096 bytes: `hashlib.sha256(image_bytes[:4096]).hexdigest()`.
-
----
-
-**Bug 4: Plugin loader crashes if `__builtins__` is a module rather than a dict**
-Severity: Major | Priority: High
-
-In `core/plugin_loader.py`, the sandbox is constructed with `{k: v for k, v in __builtins__.items() ...}`. In CPython, `__builtins__` in non-`__main__` modules is normally a dict, but this is an implementation detail. If `plugin_loader.py` is ever executed as the main module (during testing or debugging), `__builtins__` is the `builtins` module object, and calling `.items()` raises `AttributeError`, crashing plugin loading entirely.
-
-Root cause: Reliance on undocumented CPython behavior. Fix by using `import builtins; {k: v for k, v in vars(builtins).items() if k != "__import__"}` which works in all contexts.
-
----
-
-**Bug 5: Plugin sandbox is bypassable via Python MRO class hierarchy**
-Severity: Critical | Priority: High
-
-The sandbox blocks `import subprocess` but does not restrict access to Python's class introspection. A malicious plugin can use `().__class__.__mro__[1].__subclasses__()` to walk the class hierarchy and find `subprocess.Popen` or similar. This is a well-known CPython sandbox escape. The restricted import mechanism provides a false sense of security.
-
-Root cause: Python's object model is deeply interconnected and cannot be safely sandboxed by controlling `__import__` alone. The proper fix is to run plugins in a subprocess with a separate interpreter, or use a proper sandboxing library like `RestrictedPython`. At minimum, add static analysis of plugin source code before execution using `ast.parse()` to reject any use of `__class__`, `__mro__`, `__subclasses__`, `__globals__`, `__builtins__`, `eval`, or `exec`.
-
----
-
-**Bug 6: `session.history` list read without lock in `_context_messages`**
-Severity: Major | Priority: High
-
-In `main.py`, `_context_messages` reads `self.session.current.history` directly with no lock. The screen watcher, phone watcher, autonomy loop, and scheduled tasks all call `session.add_turn()` from background threads, which holds `_current._lock` during writes. A simultaneous read from the main thread during a list append can produce an inconsistent view (truncated history or index errors on iteration).
-
-Root cause: The lock in `SessionState` is only used in write paths. Fix by acquiring `_current._lock` inside `_context_messages` before copying the history list, or by returning a snapshot copy from a locked method.
-
----
-
-**Bug 7: Memory hash registered before local store write, causing permanent data loss on failure**
-Severity: Major | Priority: Medium
-
-In `memory_router.py`, `_seen_hashes.add(hash_id)` is called inside the lock before `self.local.add()` is called outside the lock. If `local.add()` raises (ChromaDB timeout, disk full, etc.), the hash is already in `_seen_hashes`, so every future attempt to add the same text returns `"duplicate"` without retrying the actual store operation. The memory is permanently lost.
-
-Root cause: Optimistic pre-registration. Fix by adding to `_seen_hashes` only after `local.add()` returns successfully.
-
----
-
-**Bug 8: `_summarize_history` returns truncated raw text as the "summary"**
-Severity: Minor | Priority: Medium
-
-When the background summarization cache is empty (fresh start or cache miss), `_summarize_history` returns `text[:700]` — raw conversation text, not an actual summary. `ContextTrimmer.trim()` stores this as the session's official summary and returns it to the LLM prompt. On the next call, this truncated raw text is included in the context as if it were a synthesized summary, which can confuse the LLM and inflate context size unexpectedly.
-
-Root cause: The sync/async summarization handoff doesn't have a clean "no summary yet" state. Fix by returning `""` (empty string) from `_summarize_history` on a cache miss, and letting `ContextTrimmer` handle the empty-summary case gracefully.
-
----
-
-**Bug 9: Shared `_summarize_executor` used for both history compression and goal planning**
-Severity: Minor | Priority: Medium
-
-`ThreadPoolExecutor(max_workers=1)` is used for background summarization via `_summarize_history_background` and for background goal planning via `background_plan` in `_add_goal`. A slow goal-planning LLM call (potentially 30+ seconds) blocks all pending summarizations. During active autonomy use, this creates a queue of background tasks that may never clear before the next conversation turn.
-
-Root cause: Overloading a single-worker executor with unrelated tasks. Fix by using two separate executors: one for summarization (max_workers=1) and one for goal planning (max_workers=2).
-
----
-
-**Bug 10: Dispatcher token bucket has no lock — unsafe under concurrent tool calls**
-Severity: Minor | Priority: Medium
-
-In `core/tools/dispatcher.py`, `_consume_token()` reads and writes `self._tokens` and `self._last_refill` without any locking. Two threads calling `execute()` simultaneously can both read `_tokens = 1.5`, both pass the `< 1.0` check, and both decrement, leaving `_tokens = -0.5`. The rate limit becomes ineffective under concurrent load.
-
-Root cause: Missing `threading.Lock`. Fix by adding a `threading.RLock` to `Dispatcher.__init__` and wrapping `_consume_token` with it.
-
----
-
-**Bug 11: `ContextTrimmer._last_summarized_count` not cleared on session reset**
-Severity: Minor | Priority: Low
-
-`reset_context()` calls `self.trimmer.summaries.pop(session_id, None)` to clear the summary, but does not clear `trimmer._last_summarized_count[session_id]`. On the next conversation, `len(older) == last_count` evaluates to `0 == N` (where N was the previous count), which is False — so the trimmer correctly proceeds to re-summarize. However if the session is reset at exactly `max_raw_turns` turns, `older` will be empty and `snippet` will be an empty string, which produces a blank summary that replaces nothing.
-
-Fix: Add `self.trimmer._last_summarized_count.pop(session_id, None)` inside `reset_context()` alongside the summaries pop.
-
----
-
-### Section 2 — Connectivity & Integration Issues
-
-**Connectivity 1: Ollama error yields a raw exception string to the user**
-Severity: Minor | Priority: Medium
-
-In `core/llm/engine.py`, the fallback catches `requests.RequestException` and `OSError` and yields `f"[ERROR] Fallback LLM connection failed: {exc}"`. The exception message from `requests` often includes raw socket details, errno values, and internal URLs that are not user-friendly and expose internal network topology.
-
-Fix: Map common exception types to user-friendly messages: "Could not connect to local Ollama. Is it running at `{ollama_base_url}`?"
-
----
-
-**Connectivity 2: Health event Telegram notifications bypass error recording**
-Severity: Minor | Priority: Medium
-
-`_handle_health_event` in `main.py` calls `send_telegram_text()` directly rather than `_notify_telegram()`. The latter records failures via `self.record_event("health", ...)`. Failed health-event Telegram notifications are therefore completely silent — they generate no event log entry and no printed warning.
-
-Fix: Replace the direct `send_telegram_text` call inside `_handle_health_event` with `self._notify_telegram(message)`.
-
----
-
-**Connectivity 3: ADB health check has a side effect**
-Severity: Minor | Priority: Low
-
-The ADB health check registered in `NOVAApp.__init__` is `lambda: subprocess.run(["adb", "start-server"], ...).returncode == 0`. Health checks should be read-only probes; starting the ADB server is a write operation. On systems where ADB is not needed (Linux desktop without Android), this spawns an ADB server process every 60 seconds.
-
-Fix: Replace with `lambda: bool(self.adb.devices())` or a non-side-effecting check like verifying the ADB binary is reachable.
-
----
-
-**Connectivity 4: OmniParser log file handle leaks on repeated `ensure_running()` calls**
-Severity: Minor | Priority: Low
-
-If `ensure_running()` is called multiple times (e.g., by the health monitor after a crash), a new `log_path.open("a")` is called each time while `self.log_file` from the previous call may still be open. The old file handle is overwritten without being closed, leaking a file descriptor.
-
-Fix: Add `if self.log_file: self.log_file.close()` before opening a new log file in `ensure_running()`.
-
----
-
-### Section 3 — Performance Problems
-
-**Perf 1: `snapshot_environment()` runs subprocesses on every LLM request**
-Severity: Major | Priority: Medium
-
-`snapshot_environment()` in `core/context/environment.py` makes multiple subprocess calls (`osascript`, `xprop`, `powershell`) and a network connection check on every single call to `_context_messages`, which is every single `ask_stream` invocation. On macOS, AppleScript calls can take 100-400ms. This adds latency to every LLM request before the first token even starts streaming.
-
-Root cause: No caching layer on the environment snapshot. Fix by caching with a TTL of 5-10 seconds using a simple `time.time()` check, or running the snapshot in a background thread that updates every N seconds.
-
----
-
-**Perf 2: `LocalMemoryStore` dedup check is O(n) in the fallback path**
-Severity: Minor | Priority: Low
-
-`_dedup_exists()` in the in-memory fallback iterates `self._items` linearly to check for existing hashes. With tens of thousands of memories (long-running system), this becomes a bottleneck on every `add()` call.
-
-Fix: Maintain a separate `set` of hash IDs in the fallback path for O(1) dedup checks.
-
----
-
-**Perf 3: Context token estimation uses a magic constant of 500 tokens/turn**
-Severity: Minor | Priority: Low
-
-In `_context_messages`, the overflow trimming logic uses `(total_tokens - MAX_CONTEXT_TOKENS) // 500` with a hardcoded 500 tokens-per-turn assumption. Real turns vary dramatically. This can either keep too many turns (still overflowing) or drop too many (losing context unnecessarily).
-
-Fix: Call `estimate_tokens_from_messages([turn])` for each turn to compute actual per-turn token costs.
-
----
-
-**Perf 4: `_UI_ELEMENT_CACHE` is a global module-level dict with no eviction**
-Severity: Minor | Priority: Low
-
-The cache in `vision/omniparser.py` uses a module-level dict with 500ms TTL. Entries are never removed — only overwritten if the same key appears again. Over a long session with screenshots of varying regions, this dict grows without bound.
-
-Fix: Use `functools.lru_cache` with a `maxsize` or implement size-bounded eviction in the cache logic.
-
----
-
-### Section 4 — Security & Vulnerabilities
-
-**Security 1: IPv6-mapped IPv4 addresses bypass SSRF guard**
-Severity: Major | Priority: High
-
-In `web/scraper.py`, `_is_private_ip()` checks `ipaddress.ip_address(ip) in net` where `net` is an `IPv4Network`. An `IPv6Address` object (e.g., `::ffff:192.168.1.1`) is a different type than `IPv4Network` and Python's `in` operator returns `False` for type mismatches rather than raising. An attacker who controls the DNS response for a URL can return an IPv4-mapped IPv6 address to bypass the SSRF guard entirely.
-
-Fix: After resolving the hostname, for each resolved IP, check if it's IPv4-mapped (`addr.ipv4_mapped`) and validate the mapped address against the IPv4 private ranges as well.
-
----
-
-**Security 2: Guardrails action log stores unredacted tool results**
-Severity: Major | Priority: High
-
-In `safety/guardrails.py`, the `log()` method scrubs tool args (`_scrub_args(tool_call.args)`) before writing, but stores `result=result` verbatim. Tool results can contain highly sensitive data: `win32_api.read` returns full file contents, `win32_api.get_clipboard` returns clipboard data, `adb.sms_dump` returns SMS content. All of this is written unredacted to `logs/guardrails_actions.jsonl`.
-
-Fix: Apply a result sanitizer that truncates large results (e.g., over 500 characters) and scrubs known sensitive patterns from result values before logging.
-
----
-
-**Security 3: Incomplete prompt injection guard in web scraper output**
-Severity: Major | Priority: Medium
-
-`web/scraper.py` strips `[/?tool_call]` patterns and JSON blocks matching `{"tool": ...}` from scraped content. However, the following injection vectors are not covered: markdown fenced code blocks containing tool-call JSON (the `try_parse_tool_call` strips fences!), role-injection strings (`\n\n[SYSTEM]:`, `\n\nUser:`, `###Instructions:`), and the OmniParser client path where OCR text is returned raw and passed directly into the LLM via `vision/watcher.py` without any injection filtering.
-
-Fix: Apply `detect_prompt_injection()` from `core/think/reasoning.py` to all externally-sourced text before it enters the LLM context, including web scrape results, OCR text, and RAG query results.
-
----
-
-**Security 4: Memory injection sanitization is incomplete**
-Severity: Major | Priority: Medium
-
-`_sanitize_memory_text()` in `memory_router.py` catches five specific patterns (`ignore instructions`, `you are now`, `system prompt`, token delimiters, JSON tool calls). It does not catch: `"Act as"`, `"From now on"`, `"Your new instructions"`, `"[INST]"`, `"<|system|>"`, `"###"` prompt delimiters, or role-switching patterns. Injections stored in early conversation turns will be retrieved and re-injected into future prompts via memory search.
-
-Fix: Expand the pattern list significantly, or replace pattern matching with a call to `detect_prompt_injection()` which can be extended with a more comprehensive pattern set.
-
----
-
-**Security 5: `_emergency_stop_file` write silently fails in restricted environments**
-Severity: Minor | Priority: Medium
-
-`guardrails.emergency_stop()` writes to `Path.home() / ".jarvis" / "emergency_stop"`. In Docker containers without a writable home directory, CI environments, or systems with restricted file permissions, the write is silently swallowed by the `except Exception: pass` block. The emergency stop appears to activate (in-memory flag is set) but does not persist across restarts, which is the primary purpose of the persistence feature.
-
-Fix: Log a warning if the file write fails, and consider using the app's own working directory (`.jarvis/`) as a fallback location which is already created by `NOVAApp.__init__`.
-
----
-
-**Security 6: Settings module instantiates at import time with no isolation**
-Severity: Minor | Priority: Low
-
-`settings = Settings.from_env()` runs at the bottom of `config/settings.py`. Any test that imports any module that transitively imports `config.settings` will trigger `.env` loading from the working directory. In a monorepo CI environment, a developer's local `.env` with real API keys could be inadvertently loaded during test runs.
-
-Fix: Use a sentinel pattern where `settings` is `None` at import time and lazily initialized via `get_settings()`, or document that tests must set `JARVIS_ENV=test` to skip `.env` loading.
-
----
-
-### Section 5 — Critical System Risks
-
-**Risk 1: Autonomous goal runner and manual tool calls share no execution mutex**
-Severity: Major | Priority: High
-
-The `self.goal_runner` instance in `NOVAApp` is shared between the main conversation thread (via the `goal.run` tool) and the `_autonomy_thread`. When a user types a command that triggers `goal.run` at the same moment the autonomy loop picks up a pending goal, two threads execute `GoalRunner.run()` simultaneously. Both use `self.dispatcher.execute()` which calls the same browser, ADB client, and mouse/keyboard instances concurrently. `Browser._cleanup_on_error()` reinitializes the browser state, which would corrupt the other thread's page reference.
-
-Fix: Add a `threading.Semaphore(1)` acquired by both `GoalRunner.run()` callers to serialize goal execution, or create separate `GoalRunner` instances for autonomy vs interactive use.
-
----
-
-**Risk 2: OmniParser server not killed after startup timeout**
-Severity: Minor | Priority: Medium
-
-After `startup_timeout` seconds, `ensure_running()` logs a warning and returns without killing `self.proc`. If OmniParser's model weights are corrupted and the process is stuck in an infinite loading loop, the zombie process continues consuming CPU and memory. The next health monitor poll will attempt another restart, spawning a second stuck process.
-
-Fix: After the polling deadline, call `self.proc.terminate()` (followed by `self.proc.wait(timeout=5)`) before returning to ensure the stuck process is cleaned up before a restart is attempted.
-
----
-
-**Risk 3: `_persist_session()` holds the session lock during file I/O**
-Severity: Minor | Priority: Medium
-
-`session.add_turn()` acquires `_current._lock` and calls `_persist_session()` while still holding that lock. `_persist_session()` does a synchronous `path.write_text()` call. On a slow or full disk, this blocks the lock for the duration of the I/O, preventing any other thread from reading or writing session history. Under high concurrent load (autonomy + screen watcher + main thread all adding turns), this creates contention.
-
-Fix: Write the session file outside the lock by taking a snapshot of the history inside the lock, releasing it, then writing the snapshot.
-
----
-
-**Risk 4: Scheduled tasks share `_summarize_executor` and run `ask_stream` in APScheduler threads**
-Severity: Minor | Priority: Low
-
-`_schedule_prompt` calls `self.ask_stream(p, allow_tools=False)` from an APScheduler worker thread. `ask_stream` accesses `self.session.current.history` (race, see Bug 6), `self.memory` (lock protected), and `self.trimmer` (not thread-safe). If two scheduled jobs fire simultaneously, `ContextTrimmer`'s `summaries` dict and `_last_summarized_count` dict are accessed concurrently without synchronization.
-
-Fix: Add a `threading.Lock` to `ContextTrimmer` protecting its mutable state, and ensure `_context_messages` takes a snapshot of history while holding the session lock.
-
----
-
-### Section 6 — Minor Issues & Improvements
-
-**Minor 1: Persistent JARVIS vs NOVA naming inconsistency**
-Severity: Minor | Priority: Low
-
-`config/constants.py` defines `AGENT_NAME = "NOVA"` and README.md title is "JARVIS". However `interfaces/cli.py` still prints `"JARVIS > "` as the response prefix (the raw string literal, not using `AGENT_NAME`). Several comments across `core/`, `vision/`, and `control/` still say JARVIS. The Porcupine keyword path default in `.env.example` is `Hey-Jarvis_en_windows_v3_0_0.ppn` while settings defaults to `Hey-Nova_en_windows_v3_0_0.ppn`.
-
-Fix: Replace all hardcoded `"JARVIS"` strings in code with `from config.constants import AGENT_NAME` and audit all string literals in one pass.
-
----
-
-**Minor 2: `speech/tts.py` is a duplicate orphan file**
-Severity: Minor | Priority: Low
-
-`speech/tts.py` implements the same pyttsx3 queue-based TTS as `voice/tts_offline.py` and `voice/tts.py`. The `speech/` directory has no `__init__.py` and nothing in the codebase imports from it. It is dead code.
-
-Fix: Delete `speech/tts.py` or, if intentional, add `speech/__init__.py` and update imports.
-
----
-
-**Minor 3: `_browser_close` tool returns inconsistent types**
-Severity: Minor | Priority: Low
-
-`_browser_close` returns `str` when the browser is open (`"browser closed"`) but when called from `shutdown()`, the return value is discarded. When registered as a tool, the dispatcher wraps it in `{"status": "ok", "result": "browser closed"}`. When the browser is already closed, it returns `"browser not running"` which is also a string — this is consistent. No issue per se, but the method doubles as both a tool handler and an internal cleanup routine which is a design smell.
-
----
-
-**Minor 4: Magic constant `__import__("threading")` in `LLMEngine`**
-Severity: Minor | Priority: Low
-
-`self._thread_local = __import__("threading").local()` in `core/llm/engine.py` is non-idiomatic. `threading` is already imported in many modules in this project. Using `__import__` here appears to be an accidental style choice. It has no functional issue but reduces readability.
-
-Fix: Add `import threading` at the top of `engine.py` and use `threading.local()` directly.
-
----
-
-**Minor 5: `HealthMonitor.start()` type mismatch — float passed where int expected**
-Severity: Minor | Priority: Low
-
-`self.health.start(interval_seconds=settings.HEALTH_MONITOR_INTERVAL)` passes a `float` (defaulting to `60.0`) to a parameter typed as `int`. `time.sleep(float)` works fine, but the type annotation is misleading.
-
-Fix: Change the `start()` signature to `interval_seconds: float = 60.0` or cast in the call site.
-
----
-
-**Minor 6: `_apply_text_commands` only handles agent name in lowercase**
-Severity: Minor | Priority: Low
-
-The emergency stop command is matched against `f"{agent} stop"` where `agent = AGENT_NAME.lower()` = `"nova"`. Users who type `"NOVA stop"` or `"Nova stop"` will not trigger this command — they will instead send the text to the LLM which may or may not invoke the safety tool.
-
-Fix: Compare `text.lower()` (which is already done) against lowercased versions of all command strings. The current code already applies `.lower()` to the input, so the comparison works correctly. Actually this is already handled — `text = user_text.strip().lower()`. No issue.
-
----
-
-**Minor 7: No eviction policy on `_summary_cache` for long-running sessions**
-Severity: Minor | Priority: Low
-
-`_summary_cache` is an `OrderedDict` with a max of 50 entries, evicting the oldest when full. However, the cache key is `hash(text)` — Python's built-in `hash()` which is salted per-process in Python 3.3+. Across restarts, the same text produces different hash values, so cached summaries are never reused across process restarts. This is fine functionally but the comment `# Keep LRU fresh` suggests the intent was cross-session caching.
-
-Fix: Use `hashlib.sha256(text.encode()).hexdigest()[:16]` as the cache key for a stable, deterministic key.
-
----
-
-### Section 7 — Missing Features & Components
-
-**Missing 1: No confirmation pathway for high-risk autonomy steps**
-Severity: Major | Priority: High
-
-There is no mechanism for the autonomy loop to ask the user for confirmation of high-risk steps and wait for their response. The current design either deadlocks (Bug 2) or permanently blocks the step. For a production autonomous agent, high-risk steps discovered during autonomous execution should be held in a `"awaiting_confirmation"` state, a Telegram message sent with inline approve/deny buttons, and execution resumed only after the user responds.
-
-Fix: Implement an async confirmation queue. When the autonomy loop encounters a high-risk step, it sends a Telegram message with inline buttons, pauses the goal (sets status to `"awaiting_confirmation"`), and a `/approve_goal <goal_id>` command resumes it with an authorized callback.
-
----
-
-**Missing 2: No `DocumentStore` backup**
-Severity: Major | Priority: Medium
-
-`core/memory/backup.py` schedules daily backups of `LocalMemoryStore` (`.jarvis_chroma/`). The `DocumentStore` (`.jarvis_docs/`) which holds all ingested PDFs, DOCXs, and text files has no backup at all. ChromaDB corruption in the docs store would require re-ingesting all documents manually.
-
-Fix: Extend `_backup_chromadb` to accept a list of directories, or add a parallel `schedule_daily_doc_backup` call that backs up `.jarvis_docs/` alongside memory.
-
----
-
-**Missing 3: No rate limiting on Telegram command handling**
-Severity: Major | Priority: Medium
-
-An authorized Telegram user can send commands at any rate. `/goal <very complex goal>` sent 20 times rapidly would queue 20 concurrent goal-planning LLM calls in `_summarize_executor`, consuming all daily tokens within minutes and potentially hitting the hard cap. There is no per-command cooldown or queue depth limit.
-
-Fix: Add a per-user rate limiter in `run_telegram_bot()` using a simple token bucket: max N commands per minute per chat ID, with the remainder queued or silently dropped with a "slow down" reply.
-
----
-
-**Missing 4: No per-session browser/ADB isolation on session switch**
-Severity: Major | Priority: Medium
-
-Switching sessions via `agent.switch_session("jarvis_work")` changes the memory context and conversation history but leaves the `Browser`, `ADBClient`, and `MouseKeyboard` instances untouched. A browser logged into a personal account in the personal session is still open when the work session starts. The LLM operating in work session context may act on a browser that has personal credentials.
-
-Fix: Add a `on_session_switch()` hook that closes the browser and resets stateful tool clients, or maintain per-session resource pools.
-
----
-
-**Missing 5: `HybridRanker` is implemented but never wired into the RAG pipeline**
-Severity: Minor | Priority: Low
-
-`web/hybrid_ranker.py` implements full BM25+semantic+RRF fusion ranking and has a passing test suite. However, it is never imported or used anywhere in `main.py` or `rag/doc_store.py`. The `doc.query` tool uses only ChromaDB's native cosine similarity.
-
-Fix: Either integrate `HybridRanker` into `DocumentStore.query()` (for re-ranking top-K ChromaDB results) or remove it to reduce dead code.
-
----
-
-**Missing 6: No `doc_store` integration in RAG content injection guard**
-Severity: Minor | Priority: Medium
-
-`web/scraper.py` now prepends `[Content from web (untrusted)]` and applies injection filtering. `rag/doc_store.py` returns raw chunk text with no such prefix or filtering. If a malicious document was ingested via `doc.ingest`, its content is returned directly to the LLM context with no indication that it is externally sourced.
-
-Fix: Apply `detect_prompt_injection()` to each chunk returned by `DocumentStore.query()` and prepend `[Content from document (unverified)]` to the context block.
-
----
-
-**Missing 7: No graceful handling of ChromaDB collection corruption during `add()`**
-Severity: Minor | Priority: Low
-
-`LocalMemoryStore.add()` catches exceptions from `self._collection.add()` and permanently disables ChromaDB (`self._use_chroma = False`). The fix 2.8 logs a warning and notes that previously stored documents are inaccessible. However, there is no attempt to re-initialize ChromaDB on the next call. A transient ChromaDB error (e.g., a locked WAL file) would permanently degrade the session to in-memory keyword search.
-
-Fix: Attempt `_init_chroma()` again on the next `add()` or `search()` call after a configurable retry delay, rather than permanently disabling ChromaDB.
-
----
-
-### Section 8 — Deployment & Production Readiness
-
-**Deploy 1: Docker Compose has no service healthchecks — NOVA starts before dependencies are ready**
-Severity: Major | Priority: High
-
-`docker-compose.yml` uses `depends_on: [ollama, chromadb]` without `condition: service_healthy`. Docker's `depends_on` without a health condition only waits for the container to start, not for the service inside to be ready. Ollama takes 10-30 seconds to load models after the container starts. NOVA connects immediately, gets `ConnectionRefusedError` from Ollama, and falls back to displaying `[ERROR] Fallback LLM connection failed`.
-
-Fix:
-```yaml
-depends_on:
-  ollama:
-    condition: service_healthy
-  chromadb:
-    condition: service_healthy
-```
-Add `healthcheck` blocks to the `ollama` and `chromadb` service definitions (e.g., `curl -f http://localhost:11434/api/tags` for Ollama).
-
----
-
-**Deploy 2: `EXPOSE 7860` in Dockerfile is incorrect**
-Severity: Minor | Priority: Medium
-
-The application runs as a CLI (`run_cli(app)`) with no HTTP server on port 7860. This appears to be a leftover from a Gradio or web UI prototype. No service listens on 7860, so the exposed port is misleading in documentation and could confuse infrastructure teams who add firewall rules for it.
-
-Fix: Remove `EXPOSE 7860` or replace with the actual OmniParser server port if NOVA is to run alongside it (`EXPOSE 8000`).
-
----
-
-**Deploy 3: Ollama model pull runs on every container restart**
-Severity: Minor | Priority: Medium
-
-The Ollama entrypoint `ollama serve & sleep 5 && ollama pull llama3 && wait` downloads the model every time the container restarts, even if the model already exists in the volume. This adds 1-5 minutes to every container restart cycle and consumes bandwidth unnecessarily.
-
-Fix: Replace with `ollama pull llama3 || true` after checking if the model exists: `ollama list | grep -q llama3 || ollama pull llama3`.
-
----
-
-**Deploy 4: `requirements.txt` mixes pinned and range-specified versions**
-Severity: Minor | Priority: Medium
-
-Packages like `chromadb>=0.5.0`, `sentence-transformers>=3.0.0`, and `mem0ai>=0.1.0` use lower-bound-only pins. ChromaDB has had breaking API changes between 0.5.x and 0.6.x (collection API changes). A clean install six months from now could install an incompatible version.
-
-Fix: Pin all packages to exact versions tested together. Generate a `requirements.lock` with `pip freeze` after a verified working install and use it for production deployments via `pip install -r requirements.lock`.
-
----
-
-**Deploy 5: No `pyproject.toml` or test configuration file**
-Severity: Minor | Priority: Low
-
-There is no `pyproject.toml`, `setup.cfg`, or `pytest.ini`. Running `pytest` from the project root works only because `tests/conftest.py` adds the root to `sys.path`. Without a configuration file, pytest discovery settings, markers, and coverage are undefined. Any contributor running `pytest` from a different working directory will get import errors.
-
-Fix: Add a minimal `pyproject.toml`:
-```toml
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
-```
-
----
-
-**Deploy 6: `logs/` directory is gitignored but the Dockerfile creates it**
-Severity: Minor | Priority: Low
-
-`.gitignore` correctly excludes `logs/`. The Dockerfile has `RUN mkdir -p exports logs assets`. However, `docker-compose.yml` mounts `./logs:/app/logs` which creates the directory on the host at compose-up time. In CI/CD pipelines that clone a fresh repo before each build, this works fine, but the interaction between gitignore and the Docker volume mount can cause confusion when developers expect `logs/` to not exist in their working tree.
-
-Fix: Document in README that `logs/` is created at runtime and is not tracked in version control.
-
----
-
-Here is a severity summary across all findings:
-
-**Critical (4):** Double guardrails execution regression, autonomy loop deadlock on high-risk steps, plugin sandbox MRO bypass, OmniParser cache key collision producing always-stale UI element data.
-
-**Major (14):** Session history read without lock, memory hash pre-registration data loss, IPv6 SSRF bypass, unredacted tool results in guardrails log, incomplete injection guards in scraper and memory router, no confirmation pathway for autonomous high-risk steps, no doc store backup, no Telegram rate limiting, no session isolation on switch, autonomy/interactive executor conflict, Docker Compose missing healthchecks, plugin `__builtins__` crash risk, shared `_summarize_executor` blocking goal planning and summarization, `snapshot_environment()` blocking every LLM request.
-
-**Minor (21):** All remaining items above.
+1 — Bugs & Runtime Errors
+Critical
+Daily hard-cap flag never resets on next calendar day
+HIGH
+›
+Critical
+LLM failure in background summarizer silently erases rolling summary
+HIGH
+›
+Major
+Interactive goal.run tool deadlocks in Telegram / GUI contexts
+HIGH
+›
+Major
+StopIteration path in ask_stream leaves assistant turn unrecorded
+MEDIUM
+›
+Minor
+try/except ValueError in LLMEngine constructor catches nothing
+LOW
+›
+Minor
+Double system message sent to LLM on every request
+LOW
+›
+2 — Security & Vulnerabilities
+Critical
+Plugin sandbox does not block open() — arbitrary file read/write
+HIGH
+›
+Major
+Plugin AST check misses getattr() calls accessing restricted dunder attributes
+HIGH
+›
+Major
+Clipboard subprocess still executes even when INCLUDE_CLIPBOARD_IN_CONTEXT=False
+MEDIUM
+›
+Minor
+CLI PIN stored in environment variable — visible in process listing
+LOW
+›
+3 — Performance Problems
+Major
+Goal-planning LLM calls are not tracked in usage accounting
+MEDIUM
+›
+Minor
+snapshot_environment() globals are not lock-protected
+LOW
+›
+Minor
+Session persistence file written non-atomically — corruption on crash
+LOW
+›
+4 — Critical System Risks
+Major
+PhoneWatcher created with adb=None silently loops if enabled
+MEDIUM
+›
+Major
+Background plan for _add_goal abandoned silently on shutdown
+MEDIUM
+›
+Minor
+_start_autonomy_loop() has a TOCTOU race on thread creation
+LOW
+›
+5 — Minor Issues & Improvements
+Minor
+requirements.txt uses range pins while Dockerfile uses requirements.lock
+LOW
+›
+Minor
+shlex.split in launch_process breaks on Windows-style paths
+LOW
+›
+Minor
+ADBClient.type_text does not escape ADB special characters beyond spaces
+LOW
+›
+Minor
+Module-level TTS queue shared across test runs
+LOW
+›
+Minor
+SQLAlchemy connect_args timeout is SQLite-specific
+LOW
+›
+6 — Missing Features
+Major
+No usage tracking for engine.ask() calls made outside ask_stream()
+MEDIUM
+›
+Minor
+No health subsystem registered for the scheduler itself
+LOW
+›
+Minor
+No graceful handling when context_message itself overflows token budget
+LOW
+›

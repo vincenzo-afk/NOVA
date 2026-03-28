@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import socket
 import subprocess
+import threading
 
 
 def _run(cmd: list[str], timeout: float = 1.0) -> str:
@@ -121,30 +122,35 @@ import time
 _ENVIRONMENT_CACHE: dict = {}
 _ENVIRONMENT_CACHE_TTL = 10.0
 _ENVIRONMENT_CACHE_TIME = 0.0
+_ENVIRONMENT_LOCK = threading.RLock()
 
-def snapshot_environment() -> dict:
+def snapshot_environment(include_clipboard: bool = True) -> dict:
     global _ENVIRONMENT_CACHE, _ENVIRONMENT_CACHE_TIME
     now = time.monotonic()
-    if now - _ENVIRONMENT_CACHE_TIME < _ENVIRONMENT_CACHE_TTL:
-        # Return copied cache but update to current time dynamically
-        cached = dict(_ENVIRONMENT_CACHE)
-        cached["time"] = datetime.now().isoformat(timespec="seconds")
-        return cached
+    with _ENVIRONMENT_LOCK:
+        if now - _ENVIRONMENT_CACHE_TIME < _ENVIRONMENT_CACHE_TTL:
+            # Return copied cache but update to current time dynamically
+            cached = dict(_ENVIRONMENT_CACHE)
+            cached["time"] = datetime.now().isoformat(timespec="seconds")
+            if not include_clipboard:
+                cached.pop("clipboard", None)
+                cached["last_active_file"] = None
+            return cached
 
-    clipboard = _get_clipboard()[:1000]
-    app, title = _foreground_app_and_title()
-    result = {
-        "time": datetime.now().isoformat(timespec="seconds"),
-        "cwd": os.getcwd(),
-        "os": platform.platform(),
-        "hostname": socket.gethostname(),
-        "network": _network_status(),
-        "clipboard": clipboard,
-        "foreground_app": app,
-        "window_title": title,
-        "battery_pct": _battery_pct(),
-        "last_active_file": _last_active_file(clipboard),
-    }
-    _ENVIRONMENT_CACHE = dict(result)
-    _ENVIRONMENT_CACHE_TIME = now
-    return result
+        clipboard = _get_clipboard()[:1000] if include_clipboard else ""
+        app, title = _foreground_app_and_title()
+        result = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "cwd": os.getcwd(),
+            "os": platform.platform(),
+            "hostname": socket.gethostname(),
+            "network": _network_status(),
+            "clipboard": clipboard,
+            "foreground_app": app,
+            "window_title": title,
+            "battery_pct": _battery_pct(),
+            "last_active_file": _last_active_file(clipboard) if include_clipboard else None,
+        }
+        _ENVIRONMENT_CACHE = dict(result)
+        _ENVIRONMENT_CACHE_TIME = now
+        return result
