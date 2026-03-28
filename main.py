@@ -285,10 +285,6 @@ class GoalRunArgs(BaseModel):
     dry_run: bool = False
 
 
-class GoalPlanArgs(BaseModel):
-    goal: str
-    max_steps: int = Field(default=10, ge=1, le=30)
-
 
 class GoalAddArgs(BaseModel):
     goal: str = Field(..., min_length=1)
@@ -748,9 +744,6 @@ class NOVAApp:
             steps = steps[:max_steps]
         return {"goal": goal, "status": "ok", "steps": steps, "raw": raw}
         
-    def _goal_plan_wrapper(self, goal: str, max_steps: int = 10) -> dict:
-        return self._add_goal(goal, max_steps=max_steps)
-
     def _add_goal(self, goal: str, max_steps: int = 20) -> dict:
         goal_id = f"goal_{int(time.time())}"
         record = {
@@ -1285,7 +1278,6 @@ class NOVAApp:
         self.dispatcher.register("task.list", self._list_jobs, EmptyArgs)
         self.dispatcher.register("task.cancel", self._cancel_job, TaskCancelArgs)
         self.dispatcher.register("goal.run", self._run_goal, GoalRunArgs)
-        self.dispatcher.register("goal.plan", self._goal_plan_wrapper, GoalPlanArgs)
         self.dispatcher.register("goal.add", self._add_goal, GoalAddArgs)
         self.dispatcher.register("goal.list", self._list_goals, EmptyArgs)
         self.dispatcher.register("goal.cancel", self._cancel_goal, GoalCancelArgs)
@@ -1391,22 +1383,20 @@ class NOVAApp:
             
         try:
             system = "Summarize the conversation history into a concise paragraph for future context."
-            try:
-                summary = self.engine.ask(prompt=text, system=system, history=[])
-                # Fix 3.2 & 11: Lock around LRU ordered dict cache 
-                with self._summary_cache_lock:
-                    self._summary_cache[hash(text)] = summary
-                    if len(self._summary_cache) > 50:
-                        self._summary_cache.popitem(last=False)
-                self.trimmer.summaries[session_id] = summary
-            except Exception:
-                with self._summary_cache_lock:
-                    self._summary_cache[hash(text)] = text[:700]
-                    if len(self._summary_cache) > 50:
-                        self._summary_cache.popitem(last=False)
+            summary = self.engine.ask(prompt=text, system=system, history=[])
+            # Fix 3.2 & 11: Lock around LRU ordered dict cache 
+            with self._summary_cache_lock:
+                self._summary_cache[hash(text)] = summary
+                if len(self._summary_cache) > 50:
+                    self._summary_cache.popitem(last=False)
+            self.trimmer.summaries[session_id] = summary
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning("Summarizer thread failed unconditionally: %s", e)
+            with self._summary_cache_lock:
+                self._summary_cache[hash(text)] = text[:700]
+                if len(self._summary_cache) > 50:
+                    self._summary_cache.popitem(last=False)
 
     def _apply_text_commands(self, user_text: str) -> str | None:
         """Handle built-in text shortcuts without calling the LLM.
@@ -1444,7 +1434,8 @@ class NOVAApp:
             now_muted = self.toggle_mute()
             return "Muted." if now_muted else "Unmuted."
         if re.match(r"^switch session\s+.+$", text):
-            name = text[len("switch session "):].strip()
+            # Retain original casing by slicing from user_text
+            name = user_text.strip()[len("switch session "):].strip()
             state = self.switch_session(name)
             return f"Switched to {state.name} ({state.session_id})."
         return None
@@ -1537,14 +1528,11 @@ class NOVAApp:
 
         with self._usage_lock:
             # Bug fix (connectivity/2): Reset hard cap when the calendar day changes
-            # Previously _hard_cap_hit was never reset — after one daily cap hit, all
-            # subsequent days were permanently blocked until restart.
             if self._hard_cap_hit_date != today:
                 self._hard_cap_hit = False
                 self._hard_cap_hit_date = None
 
             hard_cap = settings.DAILY_TOKEN_HARD_CAP
-            # Bug fix: Only send the alert/log ONCE when the cap is first reached (not every call)
             if hard_cap > 0 and total >= hard_cap and not self._hard_cap_hit:
                 self._hard_cap_hit = True
                 self._hard_cap_hit_date = today
