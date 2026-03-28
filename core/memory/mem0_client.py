@@ -52,7 +52,11 @@ class Mem0Client:
                 last_exc,
             )
         except Exception:
-            pass
+            import logging
+            logging.getLogger(__name__).warning(
+                "mem0 remote init failed; using local fallback only: %s",
+                last_exc,
+            )
 
     @staticmethod
     def _call_with_variants(fn, **kwargs):
@@ -63,13 +67,18 @@ class Mem0Client:
             {**kwargs, "user_id": kwargs.get("session_id"), "memory": kwargs.get("text")},
             {**kwargs, "user_id": kwargs.get("session_id"), "content": kwargs.get("text")},
         ]
+        last_type_error: TypeError | None = None
         for payload in variants:
             payload = {k: v for k, v in payload.items() if v is not None}
             try:
                 return fn(**payload)
-            except TypeError:
+            except TypeError as exc:
+                last_type_error = exc
                 continue
-        return fn()
+        raise TypeError(
+            f"mem0 SDK call failed for all argument variants. "
+            f"Tried keys: {[sorted([k for k, v in p.items() if v is not None]) for p in variants]}"
+        ) from last_type_error
 
     def add(self, text: str, session_id: str, metadata: dict | None = None) -> dict:
         if self._remote_enabled and self._client is not None:

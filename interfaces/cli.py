@@ -37,20 +37,46 @@ def format_usage_message(title: str, summary: dict) -> str:
 def run_cli(agent) -> None:
     # Simple CLI authentication via local file (avoids leaking secret via env/process list).
     import getpass
-    import os
+    import hashlib
+    import hmac
     from pathlib import Path
 
-    pin = ""
-    pin_file = Path(os.getenv("CLI_PIN_FILE", ".jarvis/cli_pin"))
-    if pin_file.exists():
-        try:
-            pin = pin_file.read_text(encoding="utf-8").strip()
-        except Exception:
-            pin = ""
+    def _verify_pin(entered: str, stored: str) -> bool:
+        value = (stored or "").strip()
+        if not value:
+            return True
+        if value.startswith("pbkdf2_sha256$"):
+            try:
+                _algo, iterations, salt, expected = value.split("$", 3)
+                digest = hashlib.pbkdf2_hmac(
+                    "sha256",
+                    entered.encode("utf-8"),
+                    salt.encode("utf-8"),
+                    int(iterations),
+                ).hex()
+                return hmac.compare_digest(digest, expected)
+            except Exception:
+                return False
+        # legacy plaintext support
+        return hmac.compare_digest(entered, value)
 
-    if pin:
+    pin_hash = ""
+    pin_hash_file = Path(".jarvis/cli_pin_hash")
+    legacy_pin_file = Path(".jarvis/cli_pin")
+    if pin_hash_file.exists():
+        try:
+            pin_hash = pin_hash_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            pin_hash = ""
+    elif legacy_pin_file.exists():
+        try:
+            pin_hash = legacy_pin_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            pin_hash = ""
+
+    if pin_hash:
         entered = getpass.getpass("Enter CLI_PIN to unlock NOVA: ")
-        if entered != pin:
+        if not _verify_pin(entered, pin_hash):
             print("Access Denied.")
             return
 
@@ -151,6 +177,7 @@ def run_cli(agent) -> None:
             if len(parts) > 1 and parts[1].strip().lower() in {"json", "md", "markdown"}:
                 v = parts[1].strip().lower()
                 fmt = "json" if v == "json" else "md"
+            console.print(f"Exporting as {fmt.upper()}...")
             path = agent.export_session(fmt)
             console.print(f"Exported session -> {path}")
             continue

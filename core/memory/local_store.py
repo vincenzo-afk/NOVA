@@ -73,6 +73,10 @@ class LocalMemoryStore:
             return hash_id in self._item_hashes
 
     def add(self, text: str, session_id: str, metadata: dict | None = None) -> dict:
+        import time
+        if not self._use_chroma and time.time() > self._chroma_retry_time:
+            self._use_chroma = self._init_chroma()
+
         hash_id = hashlib.sha256(f"{session_id}:{text}".encode("utf-8")).hexdigest()
         if self._dedup_exists(hash_id):
             return {"status": "duplicate", "id": hash_id}

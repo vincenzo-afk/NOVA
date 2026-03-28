@@ -8,12 +8,12 @@ from pathlib import Path
 
 # Fix 4.1: Redact sensitive fields from session history before export
 _SENSITIVE_PATTERNS = [
-    (re.compile(r'"api_key"\s*:\s*"[^"]*"', re.IGNORECASE), '"api_key": "***REDACTED***"'),
-    (re.compile(r'"token"\s*:\s*"[^"]*"', re.IGNORECASE), '"token": "***REDACTED***"'),
-    (re.compile(r'"password"\s*:\s*"[^"]*"', re.IGNORECASE), '"password": "***REDACTED***"'),
-    (re.compile(r'"secret"\s*:\s*"[^"]*"', re.IGNORECASE), '"secret": "***REDACTED***"'),
-    (re.compile(r'"access_key"\s*:\s*"[^"]*"', re.IGNORECASE), '"access_key": "***REDACTED***"'),
-    (re.compile(r'"auth_token"\s*:\s*"[^"]*"', re.IGNORECASE), '"auth_token": "***REDACTED***"'),
+    (re.compile(r'"api_key"\s*:\s*"[^"\n]*"', re.IGNORECASE), '"api_key": "***REDACTED***"'),
+    (re.compile(r'"token"\s*:\s*"[^"\n]*"', re.IGNORECASE), '"token": "***REDACTED***"'),
+    (re.compile(r'"password"\s*:\s*"[^"\n]*"', re.IGNORECASE), '"password": "***REDACTED***"'),
+    (re.compile(r'"secret"\s*:\s*"[^"\n]*"', re.IGNORECASE), '"secret": "***REDACTED***"'),
+    (re.compile(r'"access_key"\s*:\s*"[^"\n]*"', re.IGNORECASE), '"access_key": "***REDACTED***"'),
+    (re.compile(r'"auth_token"\s*:\s*"[^"\n]*"', re.IGNORECASE), '"auth_token": "***REDACTED***"'),
 ]
 
 
@@ -42,7 +42,7 @@ def export_json(history: list[dict], path: str) -> str:
 def export_markdown(history: list[dict], path: str) -> str:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["# JARVIS Session Export", ""]
+    lines = ["# NOVA Session Export", ""]
     for turn in history:
         role = turn.get("role", "unknown").title()
         content = turn.get("content", "")

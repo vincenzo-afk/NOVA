@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -66,11 +67,13 @@ class GoalRunner:
         dispatcher: Dispatcher,
         confirm_callback: Callable[[str], bool] | None = None,
         step_delay_seconds: float = 0.0,
+        step_timeout_seconds: float = 60.0,
         sleep_fn: Callable[[float], None] = time.sleep,
     ):
         self.dispatcher = dispatcher
         self.confirm_callback = confirm_callback  # fix 1.5
         self.step_delay_seconds = max(0.0, step_delay_seconds)  # fix 1.7
+        self.step_timeout_seconds = max(1.0, float(step_timeout_seconds))
         self._sleep_fn = sleep_fn
 
     def run(
@@ -126,7 +129,23 @@ class GoalRunner:
                 )
 
             guard.record(tool, args)
-            result = self.dispatcher.execute(call, dry_run=dry_run, _skip_guardrails=True)
+            pool = ThreadPoolExecutor(max_workers=1)
+            future = pool.submit(self.dispatcher.execute, call, None, None, dry_run, True)
+            try:
+                result = future.result(timeout=self.step_timeout_seconds)
+            except FuturesTimeout:
+                future.cancel()
+                return GoalResult(
+                    status="failed",
+                    reason=f"step_timeout_seconds_exceeded:{self.step_timeout_seconds}",
+                    results=results,
+                    next_index=idx,
+                )
+            finally:
+                try:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    pool.shutdown(wait=False)
             results.append(result)
             if on_step is not None:
                 try:

@@ -42,6 +42,27 @@ services:
       start_period: 20s
 
   # ────────── NOVA agent ──────────────────────────────────────────────────
+  omniparser:
+    build:
+      context: .
+      target: runtime
+    container_name: nova_omniparser
+    command: ["python3", "-m", "vision.omniparser_app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file:
+      - .env
+    volumes:
+      - ./vendor:/app/vendor
+      - ./logs:/app/logs
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+
   nova:
     build:
       context: .
@@ -52,10 +73,13 @@ services:
         condition: service_healthy
       chromadb:
         condition: service_healthy
+      omniparser:
+        condition: service_healthy
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
+      - OMNIPARSER_SERVER_URL=http://omniparser:8000
     env_file:
       - .env
     volumes:
@@ -67,6 +91,12 @@ services:
     restart: unless-stopped
     stdin_open: true
     tty: true
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8765/health >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
 
 volumes:
   ollama_data:

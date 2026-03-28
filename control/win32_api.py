@@ -81,13 +81,28 @@ def kill_process(name_or_pid: str | int) -> bool:
         return False
 
 
-def search_files(root: str, name_pattern: str = "*", content_query: str | None = None) -> list[str]:
+def search_files(
+    root: str,
+    name_pattern: str = "*",
+    content_query: str | None = None,
+    max_depth: int = 8,
+    max_results: int = 500,
+) -> list[str]:
     base = Path(root)
     if not base.exists():
         return []
 
     matches: list[str] = []
+    max_depth = max(0, int(max_depth))
+    max_results = max(1, int(max_results))
+    root_depth = len(base.resolve().parts)
     for path in base.rglob("*"):
+        try:
+            current_depth = len(path.resolve().parts) - root_depth
+        except Exception:
+            continue
+        if current_depth > max_depth:
+            continue
         if not path.is_file():
             continue
         if not fnmatch(path.name, name_pattern):
@@ -100,6 +115,8 @@ def search_files(root: str, name_pattern: str = "*", content_query: str | None =
             if content_query.lower() not in text.lower():
                 continue
         matches.append(str(path))
+        if len(matches) >= max_results:
+            break
     return matches
 
 

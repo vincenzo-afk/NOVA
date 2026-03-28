@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 from web.scraper import _validate_url
 
 
-def crawl(seed_url: str, max_pages: int = 5) -> list[str]:
+def crawl(seed_url: str, max_pages: int = 5, max_depth: int = 2) -> list[str]:
     # Validate seed URL before starting
     try:
         _validate_url(seed_url)
@@ -21,11 +21,11 @@ def crawl(seed_url: str, max_pages: int = 5) -> list[str]:
         raise ValueError(f"Crawl blocked: {exc}") from exc
 
     seen: set[str] = set()
-    queue = [seed_url]
+    queue: list[tuple[str, int]] = [(seed_url, 0)]
     pages: list[str] = []
 
     while queue and len(pages) < max_pages:
-        url = queue.pop(0)
+        url, depth = queue.pop(0)
         if url in seen:
             continue
         seen.add(url)
@@ -40,7 +40,7 @@ def crawl(seed_url: str, max_pages: int = 5) -> list[str]:
             response = requests.get(
                 url,
                 timeout=10,
-                headers={"User-Agent": "Mozilla/5.0 (JARVIS/1.0)"},
+                headers={"User-Agent": "Mozilla/5.0 (NOVA/1.0)"},
             )
             if not response.ok:
                 continue
@@ -51,11 +51,13 @@ def crawl(seed_url: str, max_pages: int = 5) -> list[str]:
             continue
 
         pages.append(url)
+        if depth >= max_depth:
+            continue
         soup = BeautifulSoup(html, "html.parser")
         domain = urlparse(seed_url).netloc
         for link in soup.find_all("a", href=True):
             nxt = urljoin(url, link["href"])
             if urlparse(nxt).netloc == domain and nxt not in seen:
-                queue.append(nxt)
+                queue.append((nxt, depth + 1))
 
     return pages

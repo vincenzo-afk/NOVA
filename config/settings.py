@@ -59,6 +59,7 @@ class Settings:
     # Usage alerts
     DAILY_TOKEN_ALERT_THRESHOLD: int = 100_000
     DAILY_TOKEN_HARD_CAP: int = 500000  # 0 = disabled; set e.g. 500000 to hard-cap spend
+    DAILY_TOKEN_HARD_CAP_WARNING_PCT: int = 80
 
     # Ambiguity / reasoning (fix 6.1)
     AMBIGUITY_THRESHOLD: float = 0.6
@@ -79,7 +80,7 @@ class Settings:
 
     # Proactive screen watcher
     PROACTIVE_WATCHER_ENABLED: bool = True
-    PROACTIVE_WATCHER_INTERVAL: int = 30
+    PROACTIVE_WATCHER_INTERVAL: float = 30.0
     HEALTH_MONITOR_INTERVAL: float = 60.0
     PROACTIVE_WATCHER_COOLDOWN: float = 120.0
 
@@ -92,6 +93,12 @@ class Settings:
     AUTONOMY_MAX_STEPS: int = 20
     AUTONOMY_NOTIFY_TELEGRAM: bool = True
     AUTONOMY_NOTIFY_TTS: bool = False
+    GOAL_STEP_TIMEOUT_SECONDS: float = 60.0
+
+    # Paths / data
+    DATA_DIR: str = "."
+    EMERGENCY_STOP_FILE: str = ".jarvis/emergency_stop"
+    NOVA_HEALTH_PORT: int = 8765
 
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "Settings":
@@ -158,6 +165,7 @@ class Settings:
             DEFAULT_SESSION=env("DEFAULT_SESSION", "nova_personal"),
             DAILY_TOKEN_ALERT_THRESHOLD=env_int("DAILY_TOKEN_ALERT_THRESHOLD", 100_000),
             DAILY_TOKEN_HARD_CAP=env_int("DAILY_TOKEN_HARD_CAP", 500000),
+            DAILY_TOKEN_HARD_CAP_WARNING_PCT=max(0, min(100, env_int("DAILY_TOKEN_HARD_CAP_WARNING_PCT", 80))),
             AMBIGUITY_THRESHOLD=env_float("AMBIGUITY_THRESHOLD", 0.6),
             INCLUDE_CLIPBOARD_IN_CONTEXT=env_bool("INCLUDE_CLIPBOARD_IN_CONTEXT", "false"),
             DEFAULT_LANG=env("DEFAULT_LANG", "en"),
@@ -179,6 +187,10 @@ class Settings:
             AUTONOMY_MAX_STEPS=env_int("AUTONOMY_MAX_STEPS", 20),
             AUTONOMY_NOTIFY_TELEGRAM=env_bool("AUTONOMY_NOTIFY_TELEGRAM", "true"),
             AUTONOMY_NOTIFY_TTS=env_bool("AUTONOMY_NOTIFY_TTS", "false"),
+            GOAL_STEP_TIMEOUT_SECONDS=env_float("GOAL_STEP_TIMEOUT_SECONDS", 60.0),
+            DATA_DIR=env("DATA_DIR", "."),
+            EMERGENCY_STOP_FILE=env("EMERGENCY_STOP_FILE", ".jarvis/emergency_stop"),
+            NOVA_HEALTH_PORT=env_int("NOVA_HEALTH_PORT", 8765),
         )
 
     _PLACEHOLDER_KEYS = {"key1", "key2", "key3", "key_a", "key_b", "ghp_test_key", "your_key_here", ""}

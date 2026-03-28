@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from interfaces.gui.app import build_status_snapshot, format_event_log, format_status_line, format_usage_line
+from interfaces.gui.app import build_status_snapshot, format_status_line, format_usage_line
+from utils.events import format_event_log
 
 
 class _DummyPool:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import threading
+import hashlib
+import hmac
 from typing import Any
 
 from config.settings import settings
@@ -68,6 +70,7 @@ def launch_gui(agent: Any) -> None:
             QHBoxLayout,
             QLabel,
             QLineEdit,
+            QInputDialog,
             QPushButton,
             QTextEdit,
             QVBoxLayout,
@@ -78,8 +81,48 @@ def launch_gui(agent: Any) -> None:
         return
 
     app = QApplication([])
+
+    def _verify_pin(entered: str, stored: str) -> bool:
+        value = (stored or "").strip()
+        if not value:
+            return True
+        if value.startswith("pbkdf2_sha256$"):
+            try:
+                _algo, iterations, salt, expected = value.split("$", 3)
+                digest = hashlib.pbkdf2_hmac(
+                    "sha256",
+                    entered.encode("utf-8"),
+                    salt.encode("utf-8"),
+                    int(iterations),
+                ).hex()
+                return hmac.compare_digest(digest, expected)
+            except Exception:
+                return False
+        return hmac.compare_digest(entered, value)
+
+    # Reuse CLI PIN policy in GUI (hash file first, then legacy plaintext file).
+    from pathlib import Path
+
+    pin_hash = ""
+    pin_hash_file = Path(".jarvis/cli_pin_hash")
+    legacy_pin_file = Path(".jarvis/cli_pin")
+    if pin_hash_file.exists():
+        pin_hash = pin_hash_file.read_text(encoding="utf-8").strip()
+    elif legacy_pin_file.exists():
+        pin_hash = legacy_pin_file.read_text(encoding="utf-8").strip()
+
+    if pin_hash:
+        entered, ok = QInputDialog.getText(
+            None,
+            "NOVA Authentication",
+            "Enter CLI PIN:",
+            echo=QLineEdit.EchoMode.Password,
+        )
+        if not ok or not _verify_pin(str(entered), pin_hash):
+            return
+
     window = QWidget()
-    window.setWindowTitle("JARVIS")
+    window.setWindowTitle("NOVA")
 
     output = QTextEdit()
     output.setReadOnly(True)
@@ -131,7 +174,7 @@ def launch_gui(agent: Any) -> None:
     def append_line(text: str) -> None:
         output.append(text)
 
-    def stream_prompt(prompt: str, heading: str = "JARVIS") -> None:
+    def stream_prompt(prompt: str, heading: str = "NOVA") -> None:
         append_line(f"{heading}: ")
 
         def worker() -> None:
@@ -253,7 +296,7 @@ def launch_gui(agent: Any) -> None:
                 "Use this analysis and assist with next steps.\n"
                 f"Image analysis JSON: {analysis}"
             )
-            stream_prompt(prompt, heading="JARVIS (image)")
+            stream_prompt(prompt, heading="NOVA (image)")
         except Exception as exc:
             append_line(f"[error] failed to analyze image: {exc}")
 

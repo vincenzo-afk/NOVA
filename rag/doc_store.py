@@ -161,3 +161,23 @@ class DocumentStore:
             {"filename": name, **self._doc_meta.get(name, {})}
             for name in sorted(self._docs.keys())
         ]
+
+    def delete(self, filename: str) -> dict[str, Any]:
+        removed = False
+        chunks = self._docs.pop(filename, [])
+        self._doc_meta.pop(filename, None)
+        if chunks:
+            removed = True
+        if self._use_chroma and self._collection:
+            try:
+                ids = [self._chunk_id(filename, idx, c.text) for idx, c in enumerate(chunks)]
+                if ids:
+                    self._collection.delete(ids=ids)
+            except Exception:
+                self._use_chroma = False
+        return {"status": "ok" if removed else "not_found", "filename": filename}
+
+    def update(self, filepath: str) -> dict[str, Any]:
+        filename = Path(filepath).name
+        self.delete(filename)
+        return self.ingest(filepath)

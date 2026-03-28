@@ -31,3 +31,14 @@ def test_memory_router_search_returns_ranked_results():
     results = router.search("python", session_id)
     assert results
     assert "python" in results[0]["text"].lower()
+
+
+def test_mem0_call_with_variants_raises_descriptive_type_error():
+    def _always_type_error(**_kwargs):
+        raise TypeError("bad signature")
+
+    try:
+        Mem0Client._call_with_variants(_always_type_error, session_id="s1", text="hi")
+        assert False, "Expected TypeError for exhausted variants"
+    except TypeError as exc:
+        assert "all argument variants" in str(exc)

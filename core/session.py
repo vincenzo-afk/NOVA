@@ -16,6 +16,8 @@ class SessionState:
 
 
 class SessionManager:
+    _SCHEMA_VERSION = 1
+
     def __init__(self, default_name: str = "jarvis_personal"):
         self._sessions: dict[str, SessionState] = {}
         self._current = self._get_or_create(default_name)
@@ -55,6 +57,7 @@ class SessionManager:
                 session_name = session.name
                 session_id = session.session_id
             data = {"name": session_name, "session_id": session_id, "history": history_snapshot}
+            data["schema_version"] = self._SCHEMA_VERSION
             payload = json.dumps(data, ensure_ascii=False, indent=2)
             if path.exists():
                 try:
@@ -71,6 +74,11 @@ class SessionManager:
                 tmp.write(payload)
                 tmp.flush()
                 tmp_path = Path(tmp.name)
+            try:
+                if tmp_path.stat().st_dev != sessions_dir.stat().st_dev:
+                    raise OSError("temporary file and destination are on different devices; atomic replace not guaranteed")
+            except Exception:
+                pass
             tmp_path.replace(path)
         except Exception:
             pass
@@ -91,6 +99,10 @@ class SessionManager:
                     continue
                 try:
                     data = json.loads(candidate.read_text(encoding="utf-8"))
+                    version = int(data.get("schema_version", 0) or 0)
+                    if version <= 0:
+                        # Migration from legacy format: inject default schema_version.
+                        data["schema_version"] = self._SCHEMA_VERSION
                     session = SessionState(name=data["name"], session_id=data["session_id"])
                     session.history = data.get("history", [])
                     return session

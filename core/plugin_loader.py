@@ -30,7 +30,12 @@ _BLOCKED_IMPORTS = {
     "shutil",
     "pathlib",
     "importlib",
+    "importlib.util",
+    "importlib.machinery",
+    "importlib.abc",
     "ctypes",
+    "_ctypes",
+    "_io",
     "signal",
     "multiprocessing",
     "threading",
@@ -43,7 +48,8 @@ _BLOCKED_IMPORTS = {
 
 def _restricted_import(name: str, *args, **kwargs):
     """Block dangerous imports in plugins."""
-    if name in _BLOCKED_IMPORTS:
+    lowered = (name or "").strip().lower()
+    if lowered in _BLOCKED_IMPORTS or lowered.startswith("_"):
         raise ImportError(f"Plugin attempted to import blocked module: {name}")
     import builtins
     return builtins.__import__(name, *args, **kwargs)

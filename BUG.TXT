@@ -1,0 +1,535 @@
+Here is the full technical audit of the NOVA project. I've reviewed all 130+ source files across every layer of the codebase.
+
+---
+
+# NOVA — Full Technical Audit Report
+
+---
+
+## 1. Bugs & Runtime Errors
+
+---
+
+**BUG-01 — `dispatcher.execute()` swallows `TypeError` from tool functions**
+Severity: Major | Priority: High
+
+When `fn(**validated.model_dump())` raises a `TypeError` (e.g., the registered function has a mismatched signature), it propagates uncaught and crashes the caller. Only `ValidationError` is caught. Every tool registration should be verified at registration time, and `execute()` needs a `except TypeError` guard that returns a structured error dict.
+
+---
+
+**BUG-02 — `_summarize_history` returns `""` silently on first call**
+Severity: Major | Priority: High
+
+`_summarize_history` returns an empty string until the background worker populates the cache. The `ContextTrimmer.trim()` then calls `summarizer(snippet)` and gets `""`, concatenates it with the existing summary (also `""`), and the first N conversations have no compression at all. Simultaneously, the trimmer's `_last_summarized_count` is updated so it never retries. The trimmer should fall back to `snippet[:700]` when the summarizer returns empty, matching the non-summarizer path.
+
+---
+
+**BUG-03 — `_plan_goal` doesn't catch `TypeError` from `_extract_steps`**
+Severity: Major | Priority: High
+
+Inside `_extract_steps`, `json.loads(text)` can succeed but produce non-iterable data. The `isinstance(data, list)` check handles some cases but if `data` is a `str` containing a JSON array (double-encoded), the loop `for item in data` iterates characters, not dicts, and silently returns no steps. This wastes 3 LLM retries.
+
+---
+
+**BUG-04 — `schedule_daily_backup` called with un-started scheduler in edge case**
+Severity: Minor | Priority: Low
+
+If `self.scheduler.start()` raises and is caught, `schedule_daily_backup(self.scheduler)` is still called on a stopped scheduler. `add_from_text` will fail silently (wrapped in bare `except`), but this masks the real problem. The backup registration should be guarded by `if self.scheduler.scheduler.running`.
+
+---
+
+**BUG-05 — `_call_with_variants` final fallback calls `fn()` with no arguments**
+Severity: Major | Priority: High
+
+In `core/memory/mem0_client.py`, the last item in the `variants` loop calls `fn(**{k: v for k, v in payload.items() if v is not None})`, but if all variants raise `TypeError`, the outer `except Exception` catch is never reached because the loop exhausts itself and then calls `fn()` with no args — this throws `TypeError` back to the caller without a clear error message. The fallback `fn()` call at the bottom should be removed; instead raise a descriptive error.
+
+---
+
+**BUG-06 — `_allow_command` rate-limit window clears all users at once**
+Severity: Minor | Priority: Low
+
+In `telegram_bot.py`, when `len(command_windows) > 1000`, the entire dict is cleared. A legitimate user who just sent 11 requests resets to zero rate-limit history. This could be exploited by creating 1000 fake user-IDs (via spoofed updates) to continuously wipe the rate-limit state. Use `OrderedDict` + `popitem(last=False)` to evict the oldest entry instead.
+
+---
+
+**BUG-07 — `_adb_send_sms` double-checks allowlist unnecessarily**
+Severity: Minor | Priority: Low
+
+`main.py._adb_send_sms` checks `settings.ALLOWED_PHONE_NUMBERS`, and then `adb_client.send_sms` checks it again inside. On mismatch this produces two different error strings and confuses callers. The allowlist check should live in exactly one place (the dispatcher layer, not both).
+
+---
+
+**BUG-08 — `parse_schedule_text` raises `ValueError` that is never caught**
+Severity: Major | Priority: High
+
+`_schedule_prompt` in `main.py` calls `self.scheduler.add_from_text(...)` which calls `parse_schedule_text`. For any unsupported schedule string, it raises `ValueError`. The caller has no `try/except`, so the exception propagates into the LLM tool dispatch loop and returns a raw Python traceback to the user rather than a structured error.
+
+---
+
+**BUG-09 — `GoalRunner` holds `_execution_lock` for entire goal duration**
+Severity: Major | Priority: High
+
+In `main.py`, `self._execution_lock = threading.Semaphore(1)` and both `_run_goal` and `_autonomy_loop` acquire it with `with self._execution_lock`. A long-running autonomy goal (20 steps) blocks all user-initiated tool calls for its entire duration. These should use separate semaphores or a timeout-based acquire.
+
+---
+
+**BUG-10 — `reset_context` exports a session before clearing, but `export_session` uses the current history**
+Severity: Minor | Priority: Low
+
+`reset_context` calls `self.export_session("md")` before `self.session.reset_context()`. But `export_session` reads `session.history` which may be in mid-modification by another thread. The history snapshot should be taken while holding `session._lock` before passing to the exporter.
+
+---
+
+## 2. Connectivity & Integration Issues
+
+---
+
+**CONN-01 — OmniParser not included in `docker-compose.yml`**
+Severity: Critical | Priority: High
+
+`docker-compose.yml` defines `ollama`, `chromadb`, and `nova` services, but OmniParser — which NOVA actively depends on for UI element detection and OCR — has no service definition. The environment variable `OMNIPARSER_SERVER_URL` defaults to `http://localhost:8000`, which will be unreachable inside the Docker network. Either add an OmniParser service or document that it must run externally.
+
+---
+
+**CONN-02 — `WakeWordListener` fails silently when Porcupine keys are missing**
+Severity: Major | Priority: High
+
+`voice/wakeword.py._loop()` returns immediately with `if not settings.PORCUPINE_ACCESS_KEY or not settings.PORCUPINE_KEYWORD_PATH: return`. No log message, no health event, no user notification. The health monitor registers the wakeword thread by checking `is_running()` — but since `_running` is set to `True` before `_loop` silently exits, `is_running()` returns `True` even though no keyword detection is happening. The health monitor believes wakeword is healthy when it is not.
+
+---
+
+**CONN-03 — `mem0_client` remote initialization logs warning to `utils.logger` before logger is configured**
+Severity: Minor | Priority: Low
+
+`Mem0Client._init_remote()` is called in `__init__`, which runs before `setup_logger()` is called in `main()`. The `get_logger(__name__).warning(...)` call goes to the root Python logger with no handlers, so the warning is silently discarded on startup.
+
+---
+
+**CONN-04 — ChromaDB retry backoff is per-call, not per-instance**
+Severity: Minor | Priority: Medium
+
+In `LocalMemoryStore._dedup_exists`, `import time` and `self._chroma_retry_time = time.time() + 60.0` are set correctly, but `_chroma_retry_time` is initialized to `0.0` in `__init__`. On very first call if ChromaDB is not installed, `_dedup_exists` calls `_init_chroma` which returns `False`, sets `self._use_chroma = False`, then immediately in the next `add()` call tries to write to in-memory list but misses that ChromaDB could have recovered. The retry is in `_dedup_exists` but the actual ChromaDB write path in `add()` checks `self._use_chroma` which was already set to `False` — the retry window in `_dedup_exists` is useless without propagating the retry to `add()`.
+
+---
+
+**CONN-05 — Telegram bot `stop_event` polling loop doesn't handle `asyncio` deprecation**
+Severity: Minor | Priority: Low
+
+`run_telegram_bot` in the graceful-shutdown path calls `app.updater.start_polling()` then `app.updater.stop()` and `app.stop()`. In `python-telegram-bot` v20+, `Updater` is deprecated in favor of `Application`-level polling. The `app.updater` attribute may not exist in newer library versions, causing an `AttributeError` on shutdown.
+
+---
+
+## 3. Performance Problems
+
+---
+
+**PERF-01 — `snapshot_environment` runs synchronously in every `ask_stream` call**
+Severity: Major | Priority: High
+
+`_context_messages` calls `snapshot_environment()` on every user message. Even with the 10-second TTL cache, the first call after TTL expiry blocks the main thread while running `subprocess.check_output` (clipboard, foreground app, network check). These subprocesses have 1–2 second timeouts each. On Windows with PowerShell calls this can stall response generation for 2–4 seconds per request.
+
+**Fix:** Move the initial synchronous computation to application startup. On subsequent calls, always return stale cache immediately and refresh in background (the stale-if-inflight path already exists but doesn't cover the first call after TTL expires).
+
+---
+
+**PERF-02 — `EmbeddingBackend.encode` loads model under lock, blocking all threads**
+Severity: Major | Priority: Medium
+
+```python
+with self._lock:
+    if self._model is None:
+        self._load()
+```
+
+`_load()` calls `SentenceTransformer(model_name)` which downloads and initializes the model — this can take 10–60 seconds. All threads calling `encode` during this window are blocked. The model should be pre-loaded at startup in a dedicated thread, not lazily on first `encode` call.
+
+---
+
+**PERF-03 — Background summarization `_summarize_executor` uses `max_workers=1`**
+Severity: Minor | Priority: Low
+
+Memory commit (`_commit_memory_async`) and history summarization both submit jobs to `_summarize_executor` (1 worker). Under high message throughput, the queue backs up and old summaries are never written because new message commits keep jumping the queue. Use separate executors for memory writes and summarization, or use `max_workers=2`.
+
+---
+
+**PERF-04 — `search_files` in `win32_api.py` does full `rglob("*")` with no depth limit**
+Severity: Major | Priority: Medium
+
+`search_files(root="/", ...)` will recursively walk the entire filesystem. There is no depth limit, no file count limit, and no timeout. A malicious or misconfigured tool call with `root="/"` will block the dispatcher for minutes and consume all disk I/O. Add `max_depth` and `max_results` parameters.
+
+---
+
+**PERF-05 — `autonomy_loop` `poll` sleep blocks the stop event**
+Severity: Minor | Priority: Low
+
+```python
+self._autonomy_stop.wait(poll)
+```
+
+This is correct. However, if `poll` is set to a large value (e.g., 3600s from environment), stopping the autonomy loop on shutdown blocks for up to `poll` seconds. The `join(timeout=2)` in `_stop_autonomy_loop` will time out, leaving the thread running as a daemon until process exit.
+
+---
+
+## 4. Security & Vulnerabilities
+
+---
+
+**SEC-01 — OmniParser `/health` and `/probe/` endpoints bypass authentication**
+Severity: Major | Priority: High
+
+`vision/omniparser_app.py` auth middleware excludes `/health` and `/probe/` from token validation. Any unauthenticated client on the network can confirm that NOVA's OmniParser instance is running and determine its version. In a multi-tenant or shared environment, this leaks operational intelligence. At minimum, add an optional `?token=` query parameter check on probe endpoints.
+
+---
+
+**SEC-02 — CLI PIN stored in plaintext file, path configurable via environment variable**
+Severity: Major | Priority: High
+
+```python
+pin_file = Path(os.getenv("CLI_PIN_FILE", ".jarvis/cli_pin"))
+```
+
+An attacker who can set environment variables can redirect PIN file lookup to any readable file. The PIN itself is stored as plaintext. If the `.jarvis/` directory is world-readable (common on Linux), the PIN is exposed. Store a `bcrypt` or `argon2` hash instead of plaintext, and hardcode the file path rather than making it configurable via environment.
+
+---
+
+**SEC-03 — `scrape_text` TOCTOU DNS rebinding window on HTTP**
+Severity: Major | Priority: Medium
+
+For HTTP URLs, `scrape_text` validates the resolved IP then connects to the IP directly (good). But the validation and connection use two separate `requests.get` calls internally. Between DNS validation in `_validate_url` and the actual connection, a DNS rebinding attack can redirect the hostname to a private IP. The existing mitigation (direct-IP HTTP connection + Host header) is correct but only applied for plain HTTP — HTTPS re-validates but still connects by hostname, leaving a small window. Consider using a custom DNS resolver that pins the IP for the duration of the request.
+
+---
+
+**SEC-04 — `plugin_loader` AST check doesn't block `__import__` alias**
+Severity: Major | Priority: High
+
+`_check_ast` blocks `eval`, `exec`, and dunder names, but a plugin can alias `__import__`:
+
+```python
+imp = __builtins__["__import__"]  # this references __builtins__ which IS blocked
+```
+
+However, `_restricted_import` only blocks a static list of module names. A plugin can still import `ctypes` aliases (`_ctypes`), `importlib.util` (not in blocklist), or use `importlib` submodules. `importlib` is in `_BLOCKED_IMPORTS` but `importlib.util` is not. Add `importlib.util`, `importlib.machinery`, `importlib.abc`, `_ctypes`, `_io`, and all `_` prefixed stdlib modules.
+
+---
+
+**SEC-05 — `send_telegram_text` sends bot token in URL**
+Severity: Minor | Priority: Medium
+
+```python
+f"https://api.telegram.org/bot{token}/sendMessage"
+```
+
+The Telegram bot token is embedded in the URL path. HTTP access logs, reverse proxies, and CDN logs will capture this token in plaintext. While Telegram's own servers will receive it over HTTPS, any intermediate proxy logs on the infrastructure side expose the token. Use the Telegram Bot API's header-based auth where possible, or ensure all proxy logs are scrubbed.
+
+---
+
+**SEC-06 — `export_markdown` redaction misses multiline patterns**
+Severity: Minor | Priority: Medium
+
+The redaction regex in `utils/exporter.py` uses `"[^"]*"` which doesn't match values containing newlines. A crafted `api_key` value containing `\n` would bypass the redaction. Use `re.DOTALL` or replace `[^"]*` with `[^"\\n]*` to explicitly prevent multiline bypass.
+
+---
+
+**SEC-07 — `_connect_mcp` DNS resolution timeout uses `ThreadPoolExecutor` without cleanup**
+Severity: Minor | Priority: Low
+
+```python
+with ThreadPoolExecutor(max_workers=1) as pool:
+    fut = pool.submit(_run)
+    try:
+        return fut.result(timeout=timeout_seconds)
+    except FuturesTimeout:
+        return []
+```
+
+On timeout, the executor context manager waits for the running thread to complete (`shutdown(wait=True)` is the default). DNS resolution threads can hang for 30+ seconds (OS resolver timeout). This means the `_connect_mcp` call can block for 30 seconds despite the `timeout_seconds` parameter. Pass `wait=False` or use `cancel_futures=True` (Python 3.9+).
+
+---
+
+## 5. Critical System Risks
+
+---
+
+**RISK-01 — Emergency stop file check uses hardcoded home path that may differ across users**
+Severity: Major | Priority: High
+
+```python
+_EMERGENCY_STOP_FILE = Path.home() / ".jarvis" / "emergency_stop"
+_EMERGENCY_STOP_FILE_FALLBACK = Path.cwd() / ".jarvis" / "emergency_stop"
+```
+
+In Docker containers, `Path.home()` returns `/root`. If NOVA is run as a non-root user or with a different home directory, the emergency stop file is never found on restart, and the safety-critical stop state is silently lost. The path should be read from a config constant or environment variable, not hardcoded.
+
+---
+
+**RISK-02 — `shutdown()` doesn't drain `_goal_plan_executor` futures**
+Severity: Major | Priority: High
+
+`_goal_plan_executor.shutdown(wait=False)` is called, but in-flight `background_plan()` futures may still be writing to `self._goals` after the `_goal_lock` context has been abandoned. This can corrupt the goals JSON file on shutdown. Call `shutdown(wait=True, cancel_futures=True)` or set a `_shutting_down` flag that `background_plan` checks before writing.
+
+---
+
+**RISK-03 — ChromaDB backup retention deletes files before confirming new write succeeded**
+Severity: Major | Priority: High
+
+In `core/memory/backup.py`:
+
+```python
+out_path.write_text(json.dumps(snapshot, ...), encoding="utf-8")
+existing = sorted(out_dir.glob("memory_backup_*.json"))
+for old in existing[:-7]:
+    old.unlink(missing_ok=True)
+```
+
+If `write_text` raises (disk full, permission denied), the exception is caught at the top level and the function returns `"backup_failed: ..."`. But if the exception happens after a partial write, the file is created (partially) and counted in `existing`, which can delete the last valid backup. Write to a temp file first, then `rename()` atomically, before deleting old backups.
+
+---
+
+**RISK-04 — Session history persistence uses rename-then-copy, not atomic across drives**
+Severity: Minor | Priority: Medium
+
+`core/session.py._persist_session` uses `tempfile.NamedTemporaryFile` in `sessions_dir` then `tmp_path.replace(path)`. This is atomic on the same filesystem. However, if `TMPDIR` is on a different device than `.jarvis_sessions/`, `tmp_path.replace(path)` falls back to a non-atomic copy. The `NamedTemporaryFile` already specifies `dir=str(sessions_dir)`, so this is actually correct — but the code should add an explicit assertion that the temp file and destination are on the same device.
+
+---
+
+**RISK-05 — `HealthMonitor` restart attempts counter never resets on manual recovery**
+Severity: Major | Priority: High
+
+`_restart_attempts[name]` is reset only when `check_fn()` returns `True` (healthy). If an operator manually restarts OmniParser between health polls but the next poll catches it down again, the counter is already at `max_restart_attempts` and the monitor transitions to `restart_failed` permanently — never attempting another restart. Add a mechanism to reset the counter after a configurable cool-down period.
+
+---
+
+**RISK-06 — `_autonomy_loop` writes goal status after checking for cancellation but not for shutdown**
+Severity: Major | Priority: Medium
+
+When `app.shutdown()` is called mid-goal, `_autonomy_stop.set()` is set but the running goal step may be executing a blocking tool call. After the tool returns, the loop writes to `self._goals` and calls `_persist_goals()`. But `_summarize_executor.shutdown(wait=False)` may have already been called, so the `_commit_memory_async` inside `ask_stream` used during planning will silently drop the result. Add a shutdown flag check before any post-step persistence.
+
+---
+
+## 6. Minor Issues & Improvements
+
+---
+
+**MINOR-01 — Docstrings still reference "JARVIS" throughout**
+Severity: Minor | Priority: Low
+
+`core/memory/backup.py` docstring says `"LocalMemoryStore had no backup mechanism"` and contains references to both `JARVIS` and job IDs `"nova_memory_backup"`. `interfaces/telegram_bot.py` title says `"JARVIS Status"`. `utils/exporter.py` heading is `"# JARVIS Session Export"`. These are brand inconsistencies. A global search-and-replace from JARVIS to NOVA is needed across all user-facing strings and documentation.
+
+---
+
+**MINOR-02 — `config/settings.py` type mismatch: `PROACTIVE_WATCHER_INTERVAL` declared `int`, loaded as `float`**
+Severity: Minor | Priority: Low
+
+```python
+PROACTIVE_WATCHER_INTERVAL: int = 30   # dataclass annotation
+...
+PROACTIVE_WATCHER_INTERVAL=env_float("PROACTIVE_WATCHER_INTERVAL", 30.0),  # from_env
+```
+
+The type annotation says `int` but `env_float` returns `float`. This causes a Pydantic or mypy type error if strict checking is enabled. Change the annotation to `float`.
+
+---
+
+**MINOR-03 — `format_event_log` is duplicated: imported in `gui/app.py` from `utils.events` but also imported by tests from `gui.app`**
+Severity: Minor | Priority: Low
+
+`test_gui_status.py` imports `format_event_log` from `interfaces.gui.app`, which re-exports it implicitly through Python's module system. This is fragile — if `gui/app.py` ever stops importing from `utils.events`, the test breaks silently. Either explicitly re-export it or import directly from `utils.events` in the test.
+
+---
+
+**MINOR-04 — `tray.py` goal summary and health output go to `print()` not the tray menu**
+Severity: Minor | Priority: Low
+
+`on_health`, `on_goals`, and `on_alerts` in `interfaces/tray.py` call `print(...)`. In a system tray context, there is no visible terminal. Users clicking these menu items see nothing. Replace `print()` calls with a system notification (`os_layer.send_notification`) or open a small status dialog.
+
+---
+
+**MINOR-05 — `web/crawler.py` doesn't limit crawl depth, only page count**
+Severity: Minor | Priority: Medium
+
+`crawl(seed_url, max_pages=5)` limits total pages but adds all discovered links to the queue without depth tracking. A page with 100 outbound links will fill the queue with 100 entries before visiting any of them. On a site with deep link graphs, this produces a useless breadth-first traversal that never goes more than 1 level deep. Add a `max_depth` parameter.
+
+---
+
+**MINOR-06 — `interfaces/cli.py` export format parsing is inconsistent**
+Severity: Minor | Priority: Low
+
+```python
+if len(parts) > 1 and parts[1].strip().lower() in {"json", "md", "markdown"}:
+    v = parts[1].strip().lower()
+    fmt = "json" if v == "json" else "md"
+```
+
+`/export markdown` maps correctly to `"md"`, but `/export JSON` (uppercase) maps to `"md"` because `v == "json"` uses the lowercased value correctly. Actually this is fine. However `/export json extra args` would pass `parts[1] == "json"` correctly. The issue is `/export` with no args silently uses `fmt = "md"` without indicating to the user what format was chosen. Add a confirmation line: `console.print(f"Exporting as {fmt.upper()}...")`.
+
+---
+
+**MINOR-07 — `utils/embeddings.py` `@lru_cache` on `get_embedder` caches by `model_name` string but doesn't handle concurrent first calls**
+Severity: Minor | Priority: Low
+
+`@lru_cache` is not thread-safe for cache population. Two threads calling `get_embedder("all-MiniLM-L6-v2")` simultaneously before the cache is populated will both enter `EmbeddingBackend()` constructor and create two model instances. The `_lock` inside `EmbeddingBackend` prevents double-loading the model, but two `EmbeddingBackend` instances are created. Use `functools.lru_cache` with a module-level lock around `get_embedder`.
+
+---
+
+## 7. Missing Features or Components
+
+---
+
+**MISS-01 — No tests for `core/memory/backup.py`**
+Severity: Major | Priority: High
+
+`backup.py` is a critical data-protection module with no test coverage. There are no tests for the happy path (snapshot creation), the retention logic (old file deletion), or error handling (disk full, ChromaDB unavailable). Given that `RISK-03` describes a data-loss scenario in this module, test coverage is essential.
+
+---
+
+**MISS-02 — No health check registered for mem0 remote connectivity**
+Severity: Major | Priority: Medium
+
+`_start_health_monitoring` in `main.py` registers a `mem0_client` health check that only verifies `_remote_enabled` is True (set at initialization). It does not verify ongoing connectivity to mem0's API. A mem0 outage after startup goes undetected by the health monitor. Add a lightweight `ping` or `get_all` check against a test session.
+
+---
+
+**MISS-03 — GUI has no authentication**
+Severity: Major | Priority: High
+
+`interfaces/cli.py` has PIN-based authentication via `.jarvis/cli_pin`. `interfaces/telegram_bot.py` has chat-ID whitelisting. But `interfaces/gui/app.py` has no authentication whatsoever. Any user on the machine who launches the GUI can access all NOVA functionality including file system operations and ADB control. Add the same PIN check used by the CLI to `launch_gui`.
+
+---
+
+**MISS-04 — No rate limiting on Telegram file-producing commands**
+Severity: Major | Priority: Medium
+
+`/screenshot`, `/export`, and `/qr` in `telegram_bot.py` are rate-limited by the general `_allow_command` (12 per minute). But these commands produce large files and trigger expensive operations (screen capture, ChromaDB dump, QR generation). A user sending 12 `/screenshot` commands per minute generates 12 screen captures, 12 file uploads, and 12 vision analysis calls. Add a separate, lower rate limit for file-producing commands (e.g., 2 per minute).
+
+---
+
+**MISS-05 — `GoalRunner` has no timeout per step**
+Severity: Major | Priority: High
+
+A single tool call within a goal (e.g., `browser.open` to a slow server) can block the `_execution_lock` indefinitely. There is a `max_steps` guard against runaway loops but no per-step wall-clock timeout. Add an optional `step_timeout_seconds` parameter to `GoalRunner.run()` using `concurrent.futures.ThreadPoolExecutor` with `future.result(timeout=step_timeout_seconds)`.
+
+---
+
+**MISS-06 — No monitoring/alerting for daily token hard cap approaching**
+Severity: Minor | Priority: Medium
+
+The hard cap check fires at exactly `DAILY_TOKEN_HARD_CAP`. There is no warning when approaching the limit (e.g., at 80% or 90%). Users get no advance notice before NOVA stops responding. Add a configurable `DAILY_TOKEN_HARD_CAP_WARNING_PCT` (default 80) that triggers a Telegram notification without blocking requests.
+
+---
+
+**MISS-07 — `rag/doc_store.py` has no document deletion or update mechanism**
+Severity: Minor | Priority: Medium
+
+`DocumentStore` supports `ingest`, `query`, and `list_docs` but not `delete` or `update`. Re-ingesting the same file does an `upsert` on ChromaDB (by chunk ID hash), but the in-memory `_docs` dict is fully replaced without removing old chunks from ChromaDB if the document shrank. Add a `delete(filename)` method that removes all chunks from both in-memory and ChromaDB collections.
+
+---
+
+**MISS-08 — `vision/omniparser_server.py` has no watchdog for zombie processes**
+Severity: Minor | Priority: Medium
+
+`OmniParserServer.ensure_running()` checks `is_running()` (HTTP health endpoint). But if the OmniParser process exits and the port is rebound by another process, `is_running()` returns `True` while `self.proc.poll()` returns a non-None exit code. The server restart logic only triggers if `self.proc.poll() is not None`, which it checks before starting a new process. Add explicit zombie detection: if `self.proc` is not None and `self.proc.poll() is not None` and `is_running()` is False, log the exit code and restart.
+
+---
+
+## 8. Deployment & Production Readiness
+
+---
+
+**DEPLOY-01 — `requirements.txt` and `requirements.lock` are identical files**
+Severity: Minor | Priority: Low
+
+Both files contain the same pinned content. In standard Python workflows, `requirements.txt` is the human-editable input and `requirements.lock` (or `pip freeze`) is the pinned output. Having identical files is confusing. Rename `requirements.lock` to the primary source of truth and generate `requirements.txt` from it, or use a tool like `pip-tools` with `requirements.in` → `requirements.txt`.
+
+---
+
+**DEPLOY-02 — `Dockerfile` installs `requirements.lock` but `setup.py` installs `requirements.txt`**
+Severity: Minor | Priority: Medium
+
+`Dockerfile`: `COPY requirements.lock .` then `pip install -r requirements.lock`. `setup.py.install_dependencies()`: `run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])`. If the files ever diverge, the Docker image and native install will have different dependency trees. Unify to a single requirements file referenced consistently.
+
+---
+
+**DEPLOY-03 — `jarvis_jobs.sqlite` path uses `Path(__file__).resolve().parent.parent`**
+Severity: Minor | Priority: Medium
+
+In `tasks/scheduler.py`, the default SQLite path is resolved relative to the scheduler module's file location. In Docker, if the source is mounted at a different path or the working directory changes, this path is valid but points inside the image filesystem, not a mounted volume. Jobs will be lost on container restart. This path should default to a configurable data directory (e.g., `DATA_DIR` env var), which can be volume-mounted.
+
+---
+
+**DEPLOY-04 — `.gitignore` excludes `logs/` and `exports/` but Docker volume mounts them**
+Severity: Minor | Priority: Low
+
+`docker-compose.yml` mounts `./logs:/app/logs` and `./exports:/app/exports`. But `.gitignore` excludes `logs/` and `exports/`. On a fresh clone, `docker compose up` will create these directories automatically, but any CI/CD pipeline that checks whether required directories exist before mounting will fail. Add `logs/.gitkeep` and `exports/.gitkeep` (analogous to `assets/.gitkeep` which already exists).
+
+---
+
+**DEPLOY-05 — No `HEALTHCHECK` for the `nova` service in `docker-compose.yml`**
+Severity: Minor | Priority: Medium
+
+`ollama` and `chromadb` services have `healthcheck` blocks. The `nova` service only has the Dockerfile `HEALTHCHECK` which uses `ps aux | grep 'python3 main.py'` — this returns healthy even when NOVA is in a crash loop being restarted by the OS. Add a proper health endpoint (a simple `/health` HTTP server or a probe socket) and use it in `docker-compose.yml`.
+
+---
+
+**DEPLOY-06 — `setup.py` auto-registers startup on developer machines**
+Severity: Minor | Priority: Low
+
+`setup.py.main()` calls `register_startup_entry()` which writes a systemd service (Linux), LaunchAgent (macOS), or scheduled task (Windows) unconditionally. A developer running `python setup.py` to install dependencies will also register a startup daemon they may not want. This should be opt-in, either via a `--register-startup` flag or a `yes/no` prompt.
+
+---
+
+**DEPLOY-07 — No migration strategy for `.jarvis_sessions/` format changes**
+Severity: Minor | Priority: Medium
+
+Session files are stored as JSON with a fixed schema (`name`, `session_id`, `history`). If the schema changes in a future version (e.g., adding an `emotion_history` field), existing session files will load with missing keys but no validation or migration. Add a `schema_version` field to session files and a migration function in `_load_session` that upgrades old formats.
+
+---
+
+## Summary Table
+
+| ID | Category | Severity | Priority |
+|---|---|---|---|
+| BUG-01 | Bugs | Major | High |
+| BUG-02 | Bugs | Major | High |
+| BUG-03 | Bugs | Major | High |
+| BUG-04 | Bugs | Minor | Low |
+| BUG-05 | Bugs | Major | High |
+| BUG-06 | Bugs | Minor | Low |
+| BUG-07 | Bugs | Minor | Low |
+| BUG-08 | Bugs | Major | High |
+| BUG-09 | Bugs | Major | High |
+| BUG-10 | Bugs | Minor | Low |
+| CONN-01 | Connectivity | Critical | High |
+| CONN-02 | Connectivity | Major | High |
+| CONN-03 | Connectivity | Minor | Low |
+| CONN-04 | Connectivity | Minor | Medium |
+| CONN-05 | Connectivity | Minor | Low |
+| PERF-01 | Performance | Major | High |
+| PERF-02 | Performance | Major | Medium |
+| PERF-03 | Performance | Minor | Low |
+| PERF-04 | Performance | Major | Medium |
+| PERF-05 | Performance | Minor | Low |
+| SEC-01 | Security | Major | High |
+| SEC-02 | Security | Major | High |
+| SEC-03 | Security | Major | Medium |
+| SEC-04 | Security | Major | High |
+| SEC-05 | Security | Minor | Medium |
+| SEC-06 | Security | Minor | Medium |
+| SEC-07 | Security | Minor | Low |
+| RISK-01 | System Risk | Major | High |
+| RISK-02 | System Risk | Major | High |
+| RISK-03 | System Risk | Major | High |
+| RISK-04 | System Risk | Minor | Medium |
+| RISK-05 | System Risk | Major | High |
+| RISK-06 | System Risk | Major | Medium |
+| MINOR-01 through 07 | Minor | Minor | Low |
+| MISS-01 | Missing | Major | High |
+| MISS-02 | Missing | Major | Medium |
+| MISS-03 | Missing | Major | High |
+| MISS-04 | Missing | Major | Medium |
+| MISS-05 | Missing | Major | High |
+| MISS-06 | Missing | Minor | Medium |
+| MISS-07 | Missing | Minor | Medium |
+| MISS-08 | Missing | Minor | Medium |
+| DEPLOY-01 through 07 | Deployment | Minor | Low–Medium |
+
+**Recommended fix order:** CONN-01 (Docker OmniParser) → SEC-02 (CLI PIN hashing) → SEC-04 (plugin sandbox) → MISS-03 (GUI auth) → BUG-08 (scheduler ValueError) → BUG-09 (execution lock contention) → RISK-03 (backup atomic write) → RISK-01 (emergency stop path) → MISS-05 (step timeout) → PERF-01 (environment snapshot blocking) → then all remaining Medium and Low priority items.

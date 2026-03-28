@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -9,8 +10,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 
-# Fix 6.7: Use absolute path for SQLite database
-_DEFAULT_DB = f"sqlite:///{Path(__file__).resolve().parent.parent}/jarvis_jobs.sqlite"
+# Fix 6.7/Deploy-03: use configurable data dir for persistent scheduler DB.
+_DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parent.parent)).expanduser().resolve()
+_DATA_DIR.mkdir(parents=True, exist_ok=True)
+_DEFAULT_DB = f"sqlite:///{_DATA_DIR}/jarvis_jobs.sqlite"
 
 
 class TaskScheduler:

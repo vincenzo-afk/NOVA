@@ -51,12 +51,20 @@ def _get_omniparser(config: dict) -> object:
 
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
+    if AUTH_TOKEN:
+        query_token = request.query_params.get("token", "")
+        if query_token != AUTH_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
     return {"status": "ok"}
 
 
 @app.get("/probe/")
-async def probe():
+async def probe(request: Request):
+    if AUTH_TOKEN:
+        query_token = request.query_params.get("token", "")
+        if query_token != AUTH_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
     return {"message": "OmniParser API ready"}
 
 

@@ -17,11 +17,18 @@ class HealthItem:
 
 
 class HealthMonitor:
-    def __init__(self, on_change: Callable[[str, str, str | None], None] | None = None, max_restart_attempts: int = 3):
+    def __init__(
+        self,
+        on_change: Callable[[str, str, str | None], None] | None = None,
+        max_restart_attempts: int = 3,
+        restart_cooldown_seconds: float = 300.0,
+    ):
         self._state: dict[str, HealthItem] = {}
         self._checks: dict[str, tuple[Callable[[], bool], Callable[[], None] | None]] = {}
         self._restart_attempts: dict[str, int] = {}  # fix 5.1: track restart attempts
+        self._restart_block_until: dict[str, float] = {}
         self._max_restart_attempts = max_restart_attempts
+        self._restart_cooldown_seconds = max(1.0, float(restart_cooldown_seconds))
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
@@ -76,9 +83,16 @@ class HealthMonitor:
                 # fix 5.1: check restart attempt count
                 with self._lock:
                     attempts = self._restart_attempts.get(name, 0)
+                    blocked_until = float(self._restart_block_until.get(name, 0.0))
+                    now = time.monotonic()
+                    if blocked_until and now >= blocked_until:
+                        attempts = 0
+                        self._restart_attempts[name] = 0
+                        self._restart_block_until[name] = 0.0
                     if attempts >= self._max_restart_attempts:
                         self.heartbeat(name, "restart_failed")
                         self._emit_change(name, "restart_failed", "down")
+                        self._restart_block_until[name] = now + self._restart_cooldown_seconds
                         continue
                     self._restart_attempts[name] = attempts + 1
                 try:
