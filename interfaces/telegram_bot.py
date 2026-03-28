@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from io import BytesIO
 from collections import OrderedDict, deque
+import asyncio
 import json
+import queue
+import threading
 import time
 from typing import Any
 
@@ -83,7 +86,21 @@ async def _stream_text(message: Any, context: Any, agent: Any, prompt_text: str)
     buffer = ""
     last_edit = 0.0
 
-    for token in agent.ask_stream(prompt_text):
+    token_queue: queue.Queue[str | None] = queue.Queue()
+
+    def _worker() -> None:
+        try:
+            for token in agent.ask_stream(prompt_text):
+                token_queue.put(token)
+        finally:
+            token_queue.put(None)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    while True:
+        token = await asyncio.to_thread(token_queue.get)
+        if token is None:
+            break
         buffer += token
         now = time.time()
         if now - last_edit > 1.5:

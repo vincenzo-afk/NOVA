@@ -346,6 +346,23 @@ class SetMuteArgs(BaseModel):
 
 class NOVAApp:
     def __init__(self):
+        # Pre-initialize shutdown-critical attributes so partial construction remains safe.
+        self.health = None
+        self.screen_watcher = None
+        self.phone_watcher = None
+        self.scheduler = None
+        self.omniparser = None
+        self.trimmer = ContextTrimmer(max_raw_turns=10)
+        self._browser_lock = threading.RLock()
+        self._emergency_hotkey_listener = None
+        self._summarize_executor = ThreadPoolExecutor(max_workers=1)
+        self._memory_executor = ThreadPoolExecutor(max_workers=1)
+        self._goal_plan_executor = ThreadPoolExecutor(max_workers=1)
+        self.goal_runner = None
+        self.autonomy_runner = None
+        self._tts_queue = queue.Queue()
+        self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
+
         startup_phase = "cloud" if settings.has_cloud_llm else "minimal"
         settings.validate_startup(phase=startup_phase)
 
@@ -358,7 +375,7 @@ class NOVAApp:
         self.trimmer = ContextTrimmer(max_raw_turns=10)
         self.health = HealthMonitor(on_change=self._handle_health_event)
         self.emotion = EmotionEngine()
-        self.usage = UsageTracker()
+        self.usage = UsageTracker(persist_path=".jarvis/usage_tracker.json")
         self._usage_alerted_day = None
         self._hard_cap_hit = False  # fix 7.1: set True when daily hard-cap is reached
         self._hard_cap_warning_day = None
@@ -375,15 +392,21 @@ class NOVAApp:
         self._summary_inflight: set[str] = set()
 
         # Add single thread for TTS execution (fix 5.1)
-        self._tts_queue = queue.Queue()
-        self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         self._tts_thread.start()
 
         # Separate executors so goal planning and memory sync cannot block summarization.
+        self._summarize_executor.shutdown(wait=False)
+        self._memory_executor.shutdown(wait=False)
+        self._goal_plan_executor.shutdown(wait=False)
         self._summarize_executor = ThreadPoolExecutor(max_workers=1)
         self._memory_executor = ThreadPoolExecutor(max_workers=1)
         self._goal_plan_executor = ThreadPoolExecutor(max_workers=2)
+        self._max_background_summary_jobs = 100
+        self._max_background_memory_jobs = 200
+        self._summary_jobs_inflight = 0
+        self._memory_jobs_inflight = 0
         self._shutting_down = threading.Event()
+        self._max_pending_goals = 20
         self._health_http_server: ThreadingHTTPServer | None = None
         self._health_http_thread: threading.Thread | None = None
 
@@ -512,7 +535,7 @@ class NOVAApp:
             self._start_probe_server()
         except Exception as exc:
             import logging
-            logging.getLogger(__name__).warning("Health probe startup failed: %s", exc)
+            logging.getLogger(__name__).error("Health probe startup failed: %s", exc)
         try:
             self.scheduler.start()
         except Exception as exc:
@@ -867,6 +890,13 @@ class NOVAApp:
         return {"goal": goal, "status": "ok", "steps": steps, "raw": raw}
         
     def _add_goal(self, goal: str, max_steps: int = 20) -> dict:
+        with self._goal_lock:
+            pending_count = sum(1 for g in self._goals if g.get("status") in {"planning", "pending"})
+            if pending_count >= self._max_pending_goals:
+                return {
+                    "status": "error",
+                    "reason": f"too_many_pending_goals:max={self._max_pending_goals}",
+                }
         goal_id = f"goal_{int(time.time())}"
         record = {
             "id": goal_id,
@@ -1207,6 +1237,11 @@ class NOVAApp:
                 check_fn=self._autonomy_is_running,
                 restart_fn=self._start_autonomy_loop,
             )
+        self.health.register_subsystem(
+            "probe_server",
+            check_fn=lambda: self._health_http_server is not None and self._health_http_thread is not None and self._health_http_thread.is_alive(),
+            restart_fn=self._start_probe_server,
+        )
         try:
             self.omniparser.ensure_running()
         except Exception:
@@ -1311,9 +1346,9 @@ class NOVAApp:
         poll = max(2.0, float(settings.AUTONOMY_POLL_SECONDS))
         while not self._autonomy_stop.is_set():
             goal = None
-            # Shallow copy the list to safely scan without holding the main global lock
+            # Deep copy to avoid reading mutable dict references outside the lock.
             with self._goal_lock:
-                goals_snapshot = list(self._goals)
+                goals_snapshot = copy.deepcopy(self._goals)
                 
             candidate_id = None
             for item in goals_snapshot:
@@ -1342,12 +1377,13 @@ class NOVAApp:
             with self._autonomy_execution_lock:
                 if approved_for_step:
                     result = self.autonomy_runner.run(
-                        steps,
-                        max_steps=max_steps,
-                        start_index=start_index,
+                        steps[start_index : start_index + 1],
+                        max_steps=1,
+                        start_index=0,
                         on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
                         confirm_callback=lambda _p: True,
                     )
+                    result.next_index = start_index + (1 if result.status == "completed" else 0)
                 else:
                     result = self.autonomy_runner.run(
                         steps,
@@ -1357,15 +1393,18 @@ class NOVAApp:
                         confirm_callback=self._autonomy_confirm_callback,
                     )
 
-            status = "completed" if result.status == "completed" else "paused"
-            if result.status == "stopped" and "Cycle detected" in result.reason:
-                status = "failed"
-            if result.status == "stopped" and "max_steps" in result.reason:
-                status = "paused"
-            if result.status == "failed":
-                status = "failed"
-            if result.status == "blocked":
-                status = "awaiting_confirmation"
+            if approved_for_step and result.status == "completed":
+                status = "pending" if result.next_index < len(steps) else "completed"
+            else:
+                status = "completed" if result.status == "completed" else "paused"
+                if result.status == "stopped" and "Cycle detected" in result.reason:
+                    status = "failed"
+                if result.status == "stopped" and "max_steps" in result.reason:
+                    status = "paused"
+                if result.status == "failed":
+                    status = "failed"
+                if result.status == "blocked":
+                    status = "awaiting_confirmation"
 
             if self._shutting_down.is_set():
                 break
@@ -1406,12 +1445,16 @@ class NOVAApp:
 
     def shutdown(self) -> None:
         self._shutting_down.set()
-        self.health.stop()
+        if getattr(self, "health", None):
+            self.health.stop()
         if settings.PROACTIVE_WATCHER_ENABLED:
-            self.screen_watcher.stop()
-        if settings.PHONE_WATCHER_ENABLED and self.phone_watcher is not None:
-            self.phone_watcher.stop()
-        self.scheduler.stop()
+            if getattr(self, "screen_watcher", None):
+                self.screen_watcher.stop()
+        phone_watcher = getattr(self, "phone_watcher", None)
+        if settings.PHONE_WATCHER_ENABLED and phone_watcher is not None:
+            phone_watcher.stop()
+        if getattr(self, "scheduler", None):
+            self.scheduler.stop()
         self._stop_autonomy_loop()
         self._stop_probe_server()
         if self._emergency_hotkey_listener is not None:
@@ -1419,17 +1462,33 @@ class NOVAApp:
                 self._emergency_hotkey_listener.stop()
             except Exception:
                 pass
-        with self._browser_lock:
-            self._browser_close()
+        if getattr(self, "_browser_lock", None):
+            with self._browser_lock:
+                self._browser_close()
         try:
             self.omniparser.stop()
+        except Exception:
+            pass
+        try:
+            summary_file = Path(".jarvis/trimmer_summaries.json")
+            summary_file.parent.mkdir(parents=True, exist_ok=True)
+            with self.trimmer._lock:
+                summary_file.write_text(
+                    json.dumps(self.trimmer.summaries, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
         except Exception:
             pass
         import sys as _sys
         kwargs = {"cancel_futures": True} if _sys.version_info >= (3, 9) else {}
         self._summarize_executor.shutdown(wait=False, **kwargs)
         self._memory_executor.shutdown(wait=False, **kwargs)
-        self._goal_plan_executor.shutdown(wait=True, **kwargs)
+        self._goal_plan_executor.shutdown(wait=False, **kwargs)
+        try:
+            self.goal_runner.close()
+            self.autonomy_runner.close()
+        except Exception:
+            pass
         # Bug fix: drain TTS queue on shutdown so the worker thread exits cleanly
         try:
             self._tts_queue.put(None)   # sentinel to stop the worker
@@ -1627,8 +1686,11 @@ class NOVAApp:
                         finally:
                             with self._summary_submit_lock:
                                 self._summary_inflight.discard(sid)
+                                self._summary_jobs_inflight = max(0, self._summary_jobs_inflight - 1)
 
-                    self._summarize_executor.submit(_job)
+                    if self._summary_jobs_inflight < self._max_background_summary_jobs:
+                        self._summary_jobs_inflight += 1
+                        self._summarize_executor.submit(_job)
         
         summary, recent = self.trimmer.trim(
             history,
@@ -1857,10 +1919,10 @@ class NOVAApp:
                 assistant_text = tool_result_text
 
             self.session.add_turn("assistant", assistant_text)
+            committed = True
             self._track_usage(system_prompt, history, user_text, assistant_text)
             usage_tracked = True
             self._commit_memory_async(user_text, assistant_text)
-            committed = True
         except Exception as exc:
             yield f"[ERROR] Generation failed: {exc}"
         finally:
@@ -1885,17 +1947,24 @@ class NOVAApp:
         session_id = self.session.current.session_id
 
         def _job() -> None:
-            self.memory.add(
-                text=f"User: {user_text}\nAssistant: {assistant_text}",
-                session_id=session_id,
-                metadata={"source": "conversation"},
-            )
-            self.memory.sync_pending(session_id)
+            try:
+                self.memory.add(
+                    text=f"User: {user_text}\nAssistant: {assistant_text}",
+                    session_id=session_id,
+                    metadata={"source": "conversation"},
+                )
+                self.memory.sync_pending(session_id)
+            finally:
+                self._memory_jobs_inflight = max(0, self._memory_jobs_inflight - 1)
 
         try:
+            if self._memory_jobs_inflight >= self._max_background_memory_jobs:
+                return
+            self._memory_jobs_inflight += 1
             self._memory_executor.submit(_job)
         except Exception:
             # Fallback to sync path if executor is unavailable.
+            self._memory_jobs_inflight = max(0, self._memory_jobs_inflight - 1)
             _job()
 
     def _adb_send_sms(self, phone_number: str, body: str) -> str:
@@ -1964,6 +2033,10 @@ class NOVAApp:
 
 def main() -> int:
     setup_logger()
+    startup_delay = max(0.0, float(getattr(settings, "NOVA_STARTUP_DELAY_SECONDS", 0.0)))
+    if startup_delay > 0.0:
+        print(f"[startup] Delaying boot by {startup_delay:.1f}s (NOVA_STARTUP_DELAY_SECONDS)")
+        time.sleep(startup_delay)
     try:
         app = NOVAApp()
     except SettingsError as exc:

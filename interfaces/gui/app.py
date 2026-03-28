@@ -5,8 +5,10 @@ from __future__ import annotations
 import threading
 import hashlib
 import hmac
+import time
 from typing import Any
 
+from config.constants import CLI_PIN_HASH_FILE, CLI_PIN_LEGACY_FILE, CLI_PIN_LOCK_FILE
 from config.settings import settings
 from core.llm.fallback import NetworkState
 from vision.gemini_vision import analyze_image
@@ -104,21 +106,43 @@ def launch_gui(agent: Any) -> None:
     from pathlib import Path
 
     pin_hash = ""
-    pin_hash_file = Path(".jarvis/cli_pin_hash")
-    legacy_pin_file = Path(".jarvis/cli_pin")
+    pin_hash_file = Path(CLI_PIN_HASH_FILE)
+    legacy_pin_file = Path(CLI_PIN_LEGACY_FILE)
+    lock_file = Path(CLI_PIN_LOCK_FILE)
     if pin_hash_file.exists():
         pin_hash = pin_hash_file.read_text(encoding="utf-8").strip()
     elif legacy_pin_file.exists():
         pin_hash = legacy_pin_file.read_text(encoding="utf-8").strip()
 
     if pin_hash:
-        entered, ok = QInputDialog.getText(
-            None,
-            "NOVA Authentication",
-            "Enter CLI PIN:",
-            echo=QLineEdit.EchoMode.Password,
-        )
-        if not ok or not _verify_pin(str(entered), pin_hash):
+        if lock_file.exists():
+            try:
+                unlock_at = float(lock_file.read_text(encoding="utf-8").strip() or "0")
+                if time.time() < unlock_at:
+                    return
+            except Exception:
+                pass
+        failed = 0
+        while failed < 5:
+            entered, ok = QInputDialog.getText(
+                None,
+                "NOVA Authentication",
+                "Enter CLI PIN:",
+                echo=QLineEdit.EchoMode.Password,
+            )
+            if not ok:
+                return
+            if _verify_pin(str(entered), pin_hash):
+                try:
+                    lock_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                break
+            failed += 1
+            time.sleep(min(30, 2 ** failed))
+        else:
+            lock_file.parent.mkdir(parents=True, exist_ok=True)
+            lock_file.write_text(str(time.time() + 300), encoding="utf-8")
             return
 
     window = QWidget()

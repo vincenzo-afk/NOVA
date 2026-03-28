@@ -56,7 +56,8 @@ def _emergency_stop_paths() -> tuple[Path, Path]:
 
 
 # Backward-compatible module-level aliases for tests/patching.
-_EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths()
+_EMERGENCY_STOP_FILE: Path | None = None
+_EMERGENCY_STOP_FILE_FALLBACK: Path | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +139,9 @@ class Guardrails:
 
         # Fix 1.9: load persisted emergency stop on startup
         self._emergency_stop = threading.Event()
+        global _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK
+        if _EMERGENCY_STOP_FILE is None or _EMERGENCY_STOP_FILE_FALLBACK is None:
+            _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths()
         self._emergency_stop_file = _EMERGENCY_STOP_FILE
         self._emergency_stop_file_fallback = _EMERGENCY_STOP_FILE_FALLBACK
         if self._emergency_stop_file.exists() or self._emergency_stop_file_fallback.exists():

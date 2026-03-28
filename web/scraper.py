@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from urllib.parse import urlparse
 
 import requests
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 
@@ -87,21 +88,31 @@ def _validate_url(url: str) -> tuple[str, str, str]:
 
 
 def scrape_text(url: str) -> str:
-    scheme, hostname, resolved_ip = _validate_url(url)
-    headers = {"User-Agent": "Mozilla/5.0 (NOVA/1.0)"}
-    request_url = url
-    # Mitigate DNS rebinding: for plain HTTP, connect directly to validated IP.
-    if scheme == "http":
-        parsed = urlparse(url)
-        netloc = resolved_ip
-        if parsed.port:
-            netloc = f"{resolved_ip}:{parsed.port}"
-        request_url = parsed._replace(netloc=netloc).geturl()
-        headers["Host"] = hostname
-    else:
-        # Re-validate just before HTTPS request to reduce DNS TOCTOU risk.
-        _validate_url(url)
-    response = requests.get(request_url, timeout=20, headers=headers)
+    current_url = url
+    response = None
+    for _ in range(5):
+        scheme, hostname, resolved_ip = _validate_url(current_url)
+        headers = {"User-Agent": "Mozilla/5.0 (NOVA/1.0)"}
+        request_url = current_url
+        if scheme == "http":
+            parsed = urlparse(current_url)
+            netloc = resolved_ip
+            if parsed.port:
+                netloc = f"{resolved_ip}:{parsed.port}"
+            request_url = parsed._replace(netloc=netloc).geturl()
+            headers["Host"] = hostname
+        else:
+            _validate_url(current_url)
+        response = requests.get(request_url, timeout=20, headers=headers, allow_redirects=False)
+        if response.is_redirect or response.is_permanent_redirect:
+            location = response.headers.get("Location")
+            if not location:
+                break
+            current_url = urljoin(current_url, location)
+            continue
+        break
+    if response is None:
+        raise ValueError("Failed to fetch URL")
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
     for tag in soup(["script", "style", "noscript"]):

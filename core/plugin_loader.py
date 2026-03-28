@@ -75,7 +75,9 @@ def _check_ast(source: str):
 
 
 def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
+    import logging
     loaded = []
+    tool_owners: dict[str, str] = {}
     for path in Path(plugin_dir).glob("*.py"):
         spec = spec_from_file_location(path.stem, path)
         if not spec or not spec.loader:
@@ -106,8 +108,13 @@ def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
         for tool in tools:
             name = tool["name"]
             if name in dispatcher.registry:
-                import logging
-                logging.getLogger(__name__).warning("Plugin attempted to shadow builtin tool '%s'. Skipping.", name)
+                owner = tool_owners.get(name, "builtin/previous registration")
+                logging.getLogger(__name__).warning(
+                    "Plugin tool '%s' in %s conflicts with existing '%s'; skipping this tool.",
+                    name,
+                    path.name,
+                    owner,
+                )
                 continue
             fn_name = tool.get("fn") or tool.get("function") or name
             fn = restricted_globals.get(fn_name)
@@ -115,6 +122,7 @@ def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
                 continue
             schema = _resolve_schema(tool, restricted_globals)
             dispatcher.register(name, fn, schema)
+            tool_owners[name] = path.name
         loaded.append(path.name)
     return loaded
 

@@ -59,6 +59,8 @@ class LocalMemoryStore:
         if not self._use_chroma:
             if time.time() > self._chroma_retry_time:
                 self._use_chroma = self._init_chroma()
+                if not self._use_chroma:
+                    self._chroma_retry_time = time.time() + 60.0
             
         if not self._use_chroma:
             return hash_id in self._item_hashes

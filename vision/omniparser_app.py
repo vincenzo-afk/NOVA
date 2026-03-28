@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 import time
@@ -106,7 +107,7 @@ def main() -> None:
     
     # Set global auth token
     global AUTH_TOKEN
-    AUTH_TOKEN = args.auth_token if args.auth_token else None
+    AUTH_TOKEN = args.auth_token if args.auth_token else os.environ.get("OMNIPARSER_AUTH_TOKEN") or None
 
     som_path, caption_path = _resolve_paths(args.repo_dir, args.som_model_path or None, args.caption_model_path or None)
 

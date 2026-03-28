@@ -30,7 +30,7 @@ _SECRET_ENV_PREFIXES = (
 )
 
 
-def _safe_env(extra_pythonpath: str = "") -> dict[str, str]:
+def _safe_env(extra_pythonpath: str = "", auth_token: str = "") -> dict[str, str]:
     """Build a minimal environment for the OmniParser subprocess.
 
     Only passes PATH, PYTHONPATH, and HOME — never any API keys or tokens.
@@ -44,6 +44,8 @@ def _safe_env(extra_pythonpath: str = "") -> dict[str, str]:
     pythonpath_parts = [p for p in [extra_pythonpath, os.environ.get("PYTHONPATH", "")] if p]
     if pythonpath_parts:
         safe["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+    if auth_token:
+        safe["OMNIPARSER_AUTH_TOKEN"] = auth_token
     return safe
 
 
@@ -99,7 +101,7 @@ class OmniParserServer:
             if self.repo_dir:
                 pythonpath = str(Path(self.repo_dir).expanduser().resolve()) + os.pathsep + pythonpath
 
-            env = _safe_env(extra_pythonpath=pythonpath)
+            env = _safe_env(extra_pythonpath=pythonpath, auth_token=self.auth_token)
             log_dir = Path("logs")
             log_dir.mkdir(exist_ok=True)
             log_path = log_dir / "omniparser_server.log"
@@ -125,7 +127,7 @@ class OmniParserServer:
             if self.is_running():
                 return
             attempt += 1
-            wait = min(delay * (2 ** (attempt - 1)), 16.0)
+            wait = min(delay * (2 ** (attempt - 1)), 4.0)
             print(f"[omniparser] waiting for server startup (attempt {attempt}, sleeping {wait:.0f}s)…")
             time.sleep(wait)
 
@@ -169,8 +171,6 @@ class OmniParserServer:
             host,
             "--port",
             str(port),
-            "--auth-token",
-            self.auth_token,
         ]
         if repo_path:
             command += ["--repo-dir", str(repo_path)]
