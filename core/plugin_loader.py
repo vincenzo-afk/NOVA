@@ -55,6 +55,10 @@ def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
         tools = restricted_globals.get("PLUGIN_TOOLS", [])
         for tool in tools:
             name = tool["name"]
+            if name in dispatcher.registry:
+                import logging
+                logging.getLogger(__name__).warning("Plugin attempted to shadow builtin tool '%s'. Skipping.", name)
+                continue
             fn_name = tool.get("fn") or tool.get("function") or name
             fn = restricted_globals.get(fn_name)
             if not fn:

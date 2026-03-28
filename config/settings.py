@@ -73,12 +73,14 @@ class Settings:
     GEMINI_TTS_MODEL: str = "gemini-2.5-flash-preview-tts"
     GEMINI_TTS_VOICE: str = "Kore"
     GEMINI_TTS_TIMEOUT_SECONDS: int = 45
+    TTS_OFFLINE_WATCHDOG_SECONDS: int = 10
     VOICE_BARGEIN_HOTKEY: str = "ctrl+shift+x"
     VOICE_BARGEIN_ENABLED: bool = True
 
     # Proactive screen watcher
     PROACTIVE_WATCHER_ENABLED: bool = True
-    PROACTIVE_WATCHER_INTERVAL: float = 30.0
+    PROACTIVE_WATCHER_INTERVAL: int = 30
+    HEALTH_MONITOR_INTERVAL: int = 60.0
     PROACTIVE_WATCHER_COOLDOWN: float = 120.0
 
     # Phone watcher
