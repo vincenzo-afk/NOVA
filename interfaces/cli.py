@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from config.constants import AGENT_NAME
 from utils.events import format_event_log
 from utils.goals import format_goal_list
 from utils.health import format_health_table, summarize_health
@@ -145,7 +146,8 @@ def run_cli(agent) -> None:
             console.print(f"Exported session -> {path}")
             continue
 
-        console.print("[bold magenta]JARVIS[/bold magenta] > " if HAS_RICH else "JARVIS > ", end="")
+        prefix = f"[bold magenta]{AGENT_NAME}[/bold magenta] > " if HAS_RICH else f"{AGENT_NAME} > "
+        console.print(prefix, end="")
         chunks = []
         for token in agent.ask_stream(user_text):
             chunks.append(token)

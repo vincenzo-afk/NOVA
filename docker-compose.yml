@@ -16,8 +16,14 @@ services:
     ports:
       - "11434:11434"
     restart: unless-stopped
-    # Pull the default model on first boot
-    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull llama3 && wait"]
+    # Pull the default model only if missing
+    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 5 && (ollama list | grep -q 'llama3' || ollama pull llama3) && wait"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:11434/api/tags >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
 
   # ────────── ChromaDB — vector memory ───────────────────────────────────
   chromadb:
@@ -28,6 +34,12 @@ services:
     ports:
       - "8001:8000"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/api/v1/heartbeat >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
 
   # ────────── NOVA agent ──────────────────────────────────────────────────
   nova:
@@ -36,8 +48,10 @@ services:
       target: runtime
     container_name: nova_agent
     depends_on:
-      - ollama
-      - chromadb
+      ollama:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
       - CHROMA_HOST=chromadb

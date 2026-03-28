@@ -24,7 +24,7 @@ def _format_goal_summary(agent: Any) -> str:
         goals = list(agent.list_goals())
     except Exception:
         goals = []
-    return format_goal_list(goals)
+    return "Goals: " + format_goal_list(goals)
 
 
 def _format_health_summary(agent: Any) -> str:

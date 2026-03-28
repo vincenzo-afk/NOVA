@@ -13,6 +13,12 @@ import shutil
 REPO_ROOT = Path(__file__).resolve().parent
 
 
+def startup_command(repo_root: str | Path, python_executable: str | None = None, entrypoint: str = "main.py") -> str:
+    root = Path(repo_root).resolve()
+    py = python_executable or sys.executable
+    return f'cd "{root}" && "{py}" "{entrypoint}"'
+
+
 def run(cmd: list[str]) -> None:
     print("$", " ".join(cmd))
     subprocess.run(cmd, check=True, cwd=str(REPO_ROOT))

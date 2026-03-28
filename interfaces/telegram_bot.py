@@ -8,6 +8,7 @@ Fixes applied:
 from __future__ import annotations
 
 from io import BytesIO
+from collections import defaultdict, deque
 import json
 import time
 from typing import Any
@@ -23,6 +24,8 @@ from utils.health import format_health_table, summarize_health
 from utils.logger import get_logger
 
 _log = get_logger(__name__)
+_TELEGRAM_RATE_WINDOW_SECONDS = 60
+_TELEGRAM_RATE_LIMIT = 12
 
 
 def is_whitelisted(user_id: str | int, allowed_chat_id: str | None = None) -> bool:
@@ -134,6 +137,18 @@ def run_telegram_bot(agent: Any, token: str | None = None, allowed_chat_id: str 
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("python-telegram-bot is not installed") from exc
 
+    command_windows: dict[int, deque[float]] = defaultdict(deque)
+
+    def _allow_command(user_id: int) -> bool:
+        now = time.monotonic()
+        window = command_windows[user_id]
+        while window and (now - window[0]) > _TELEGRAM_RATE_WINDOW_SECONDS:
+            window.popleft()
+        if len(window) >= _TELEGRAM_RATE_LIMIT:
+            return False
+        window.append(now)
+        return True
+
     async def _authorized(update) -> bool:
         user = update.effective_user
         if not user:
@@ -145,6 +160,11 @@ def run_telegram_bot(agent: Any, token: str | None = None, allowed_chat_id: str 
                 f"Telegram auth rejected: user_id={user.id} username={user.username!r} "
                 f"whitelist={effective_chat_id!r}"
             )
+            return False
+        if not _allow_command(int(user.id)):
+            if update.message:
+                await update.message.reply_text("Too many commands too quickly. Please slow down for a minute.")
+            return False
         return authorized
 
     async def on_status(update, _context: ContextTypes.DEFAULT_TYPE):

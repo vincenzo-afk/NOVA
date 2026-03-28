@@ -31,14 +31,12 @@ class SessionManager:
     def reset_context(self) -> None:
         with self._current._lock:
             self._current.history.clear()
-            # Fix 5.3: Persist while holding lock
-            self._persist_session(self._current)
+        self._persist_session(self._current)
 
     def add_turn(self, role: str, content: str) -> None:
         with self._current._lock:
             self._current.history.append({"role": role, "content": content})
-            # Fix 1.3: Removed duplicate definition, and persist while holding lock
-            self._persist_session(self._current)
+        self._persist_session(self._current)
 
     def _persist_session(self, session: SessionState) -> None:
         """Serialize session history to a JSON file for crash recovery (fix 2.6)."""
@@ -50,7 +48,10 @@ class SessionManager:
             safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in session.name)
             path = sessions_dir / f"{safe_name}.json"
             with session._lock:
-                data = {"name": session.name, "session_id": session.session_id, "history": session.history}
+                history_snapshot = list(session.history)
+                session_name = session.name
+                session_id = session.session_id
+            data = {"name": session_name, "session_id": session_id, "history": history_snapshot}
             path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
