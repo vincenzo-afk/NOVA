@@ -145,6 +145,8 @@ def run_telegram_bot(
     command_windows: dict[int, deque[float]] = defaultdict(deque)
 
     def _allow_command(user_id: int) -> bool:
+        if len(command_windows) > 1000:
+            command_windows.clear()
         now = time.monotonic()
         window = command_windows[user_id]
         while window and (now - window[0]) > _TELEGRAM_RATE_WINDOW_SECONDS:

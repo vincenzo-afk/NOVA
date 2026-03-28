@@ -12,6 +12,7 @@ import socket
 from pathlib import Path
 import re
 import threading
+import sys
 from collections import deque, OrderedDict
 from typing import Any, Generator
 from datetime import date
@@ -341,7 +342,8 @@ class SetMuteArgs(BaseModel):
 
 class NOVAApp:
     def __init__(self):
-        settings.validate_startup(phase="minimal")
+        startup_phase = "cloud" if settings.has_cloud_llm else "minimal"
+        settings.validate_startup(phase=startup_phase)
 
         self.dispatcher = Dispatcher()
         self.scheduler = TaskScheduler()
@@ -463,12 +465,36 @@ class NOVAApp:
         self._autonomy_confirm_callback = _autonomy_confirm
         self.autonomy_runner = GoalRunner(self.dispatcher, confirm_callback=self._autonomy_confirm_callback)
         
-        load_plugins(self.dispatcher)
-        self._start_health_monitoring()
-        self._start_watchers_if_enabled()
-        self._start_autonomy_loop()
-        self._start_emergency_hotkey()
-        self.scheduler.start()
+        try:
+            load_plugins(self.dispatcher)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Plugin loader failed: %s", exc)
+        try:
+            self._start_health_monitoring()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Health monitoring startup failed: %s", exc)
+        try:
+            self._start_watchers_if_enabled()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Watcher startup failed: %s", exc)
+        try:
+            self._start_autonomy_loop()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Autonomy loop startup failed: %s", exc)
+        try:
+            self._start_emergency_hotkey()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Emergency hotkey startup failed: %s", exc)
+        try:
+            self.scheduler.start()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Scheduler startup failed: %s", exc)
         # Missing feature fix: schedule daily ChromaDB backup to prevent data loss on corruption
         try:
             from core.memory.backup import schedule_daily_backup
@@ -817,7 +843,10 @@ class NOVAApp:
             self._persist_goals()
 
         def background_plan():
-            plan = self._plan_goal(goal, max_steps=min(max_steps, 30))
+            try:
+                plan = self._plan_goal(goal, max_steps=min(max_steps, 30))
+            except Exception as exc:
+                plan = {"status": "failed", "reason": f"planning_exception:{exc}"}
             with self._goal_lock:
                 for item in self._goals:
                     if item.get("id") == goal_id:
@@ -830,7 +859,19 @@ class NOVAApp:
                         self._persist_goals()
                         break
 
-        self._goal_plan_executor.submit(background_plan)
+        future = self._goal_plan_executor.submit(background_plan)
+        def _on_done(fut):
+            try:
+                fut.result()
+            except Exception as exc:
+                with self._goal_lock:
+                    for item in self._goals:
+                        if item.get("id") == goal_id and item.get("status") == "planning":
+                            item["status"] = "failed"
+                            item["last_result"] = {"status": "failed", "reason": f"planning_future_exception:{exc}"}
+                            self._persist_goals()
+                            break
+        future.add_done_callback(_on_done)
         return record
 
     def _on_goal_step_completed(self, goal_id: str, step_index: int, step_result: dict[str, Any]) -> None:
@@ -915,6 +956,21 @@ class NOVAApp:
         timeout_seconds: int = 20,
         discover: bool = True,
     ) -> dict:
+        def _resolve_host_with_timeout(hostname: str, timeout_seconds: float = 5.0) -> list[str]:
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+            import socket as _socket
+
+            def _run() -> list[str]:
+                rows = _socket.getaddrinfo(hostname, None)
+                return [r[4][0] for r in rows]
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(_run)
+                try:
+                    return fut.result(timeout=timeout_seconds)
+                except FuturesTimeout:
+                    return []
+
         svc = service.strip().lower()
         if not svc:
             return {"status": "error", "reason": "service_required"}
@@ -935,7 +991,10 @@ class NOVAApp:
             if key and parsed_scheme == "http":
                 resolved_private = False
                 try:
-                    addrs = {row[4][0] for row in socket.getaddrinfo(parsed_host, None)}
+                    addrs = set(_resolve_host_with_timeout(parsed_host, timeout_seconds=5.0))
+                    if not addrs:
+                        resolved_private = False
+                        raise RuntimeError("dns_resolution_timeout_or_failure")
                     resolved_private = True
                     for ip in addrs:
                         parsed_ip = ipaddress.ip_address(ip)
@@ -1031,6 +1090,10 @@ class NOVAApp:
         self.health.register_subsystem("nova", lambda: True)
         self.health.register_subsystem("network", lambda: NetworkState.is_online())
         self.health.register_subsystem("memory_router", lambda: self.memory is not None)
+        self.health.register_subsystem(
+            "mem0_client",
+            lambda: bool(getattr(self.memory.mem0, "_remote_enabled", False)) or not bool(settings.MEM0_API_KEY),
+        )
         self.health.register_subsystem(
             "scheduler",
             lambda: bool(getattr(self.scheduler, "scheduler", None) and self.scheduler.scheduler.running),
@@ -1183,24 +1246,20 @@ class NOVAApp:
             approved_for_step = goal.get("status") == "approved_for_step"
             with self._execution_lock:
                 if approved_for_step:
-                    # Bypass guardrails for just ONE step.
-                    try:
-                        self.autonomy_runner.confirm_callback = lambda p: True
-                        result = self.autonomy_runner.run(
-                            steps,
-                            max_steps=max_steps,
-                            start_index=start_index,
-                            on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
-                        )
-                    finally:
-                        # Restore callback even if run() raises.
-                        self.autonomy_runner.confirm_callback = self._autonomy_confirm_callback
+                    result = self.autonomy_runner.run(
+                        steps,
+                        max_steps=max_steps,
+                        start_index=start_index,
+                        on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
+                        confirm_callback=lambda _p: True,
+                    )
                 else:
                     result = self.autonomy_runner.run(
                         steps,
                         max_steps=max_steps,
                         start_index=start_index,
                         on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
+                        confirm_callback=self._autonomy_confirm_callback,
                     )
 
             status = "completed" if result.status == "completed" else "paused"
@@ -1264,7 +1323,9 @@ class NOVAApp:
         except Exception:
             pass
         self._summarize_executor.shutdown(wait=False)
-        self._goal_plan_executor.shutdown(wait=False, cancel_futures=True)
+        import sys as _sys
+        kwargs = {"cancel_futures": True} if _sys.version_info >= (3, 9) else {}
+        self._goal_plan_executor.shutdown(wait=False, **kwargs)
         # Bug fix: drain TTS queue on shutdown so the worker thread exits cleanly
         try:
             self._tts_queue.put(None)   # sentinel to stop the worker
@@ -1376,12 +1437,13 @@ class NOVAApp:
         self.dispatcher.register("win32_api.get_clipboard", win32_api.get_clipboard, EmptyArgs)
         self.dispatcher.register("win32_api.set_clipboard", win32_api.set_clipboard, ClipboardSetArgs)
         self.dispatcher.register("win32_api.disk_info", win32_api.disk_info, DiskInfoArgs)
-        self.dispatcher.register("win32_api.list_windows", win32_api.list_windows, EmptyArgs)
-        self.dispatcher.register("win32_api.focus_window", win32_api.focus_window, WindowTitleArgs)
-        self.dispatcher.register("win32_api.close_window", win32_api.close_window, WindowTitleArgs)
-        self.dispatcher.register("win32_api.resize_window", win32_api.resize_window, WindowResizeArgs)
-        self.dispatcher.register("win32_api.registry_read", win32_api.registry_read, RegistryReadArgs)
-        self.dispatcher.register("win32_api.registry_write", win32_api.registry_write, RegistryWriteArgs)
+        if sys.platform.startswith("win"):
+            self.dispatcher.register("win32_api.list_windows", win32_api.list_windows, EmptyArgs)
+            self.dispatcher.register("win32_api.focus_window", win32_api.focus_window, WindowTitleArgs)
+            self.dispatcher.register("win32_api.close_window", win32_api.close_window, WindowTitleArgs)
+            self.dispatcher.register("win32_api.resize_window", win32_api.resize_window, WindowResizeArgs)
+            self.dispatcher.register("win32_api.registry_read", win32_api.registry_read, RegistryReadArgs)
+            self.dispatcher.register("win32_api.registry_write", win32_api.registry_write, RegistryWriteArgs)
         self.dispatcher.register("win32_api.send_notification", win32_api.send_notification, NotificationArgs)
         self.dispatcher.register("mouse.click", self._mouse_click, MouseClickArgs)
         self.dispatcher.register("mouse.click_element", self._mouse_click_element, MouseClickElementArgs)
@@ -1467,7 +1529,7 @@ class NOVAApp:
         summary, recent = self.trimmer.trim(
             history,
             session_id=session_id,
-            summarizer=self._summarize_history,
+            summarizer=lambda snippet: self._summarize_history(snippet, session_id),
         )
         memories = self.memory.search(user_text, session_id=session_id, top_k=DEFAULT_MEMORY_TOP_K)
         world_state = snapshot_environment(include_clipboard=settings.INCLUDE_CLIPBOARD_IN_CONTEXT)
@@ -1498,7 +1560,7 @@ class NOVAApp:
             while total_tokens > MAX_CONTEXT_TOKENS and len(recent) > 1:
                 dropped = recent.pop(0)
                 total_tokens -= estimate_tokens_from_messages([dropped])
-                all_messages = [context_message, *recent]
+            all_messages = [context_message, *recent]
             # If even context+1 turn overflow, truncate context payload to fit.
             if total_tokens > MAX_CONTEXT_TOKENS:
                 base = "Context payload:\n"
@@ -1515,12 +1577,12 @@ class NOVAApp:
 
         return system_prompt, all_messages, memories
 
-    def _summarize_history(self, text: str) -> str:
+    def _summarize_history(self, text: str, session_id: str) -> str:
         """Summarize conversation history. Uses cached summary if available."""
         if not text.strip():
             return ""
 
-        stable_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        stable_hash = hashlib.sha256(f"{session_id}:{text}".encode("utf-8")).hexdigest()
         with self._summary_cache_lock:
             if stable_hash in self._summary_cache:
                 self._summary_cache.move_to_end(stable_hash)  # Keep LRU fresh
@@ -1542,7 +1604,7 @@ class NOVAApp:
                 return
             # Fix 3.2 & 11: Lock around LRU ordered dict cache 
             with self._summary_cache_lock:
-                stable_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                stable_hash = hashlib.sha256(f"{session_id}:{text}".encode("utf-8")).hexdigest()
                 self._summary_cache[stable_hash] = summary
                 if len(self._summary_cache) > 50:
                     self._summary_cache.popitem(last=False)
@@ -1551,11 +1613,6 @@ class NOVAApp:
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning("Summarizer thread failed unconditionally: %s", e)
-            with self._summary_cache_lock:
-                stable_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-                self._summary_cache[stable_hash] = ""
-                if len(self._summary_cache) > 50:
-                    self._summary_cache.popitem(last=False)
 
     def _apply_text_commands(self, user_text: str) -> str | None:
         """Handle built-in text shortcuts without calling the LLM.
@@ -1626,12 +1683,13 @@ class NOVAApp:
         dry_run_tools: bool = False,
     ) -> Generator[str, None, None]:
         today = date.today()
+        hard_cap_active = False
         with self._usage_lock:
             if self._hard_cap_hit_date != today:
                 self._hard_cap_hit = False
                 self._hard_cap_hit_date = None
-
-        if self._hard_cap_hit:
+            hard_cap_active = self._hard_cap_hit
+        if hard_cap_active:
             yield f"Daily token hard cap of {settings.DAILY_TOKEN_HARD_CAP} reached. Further calls blocked."
             return
 
@@ -1658,6 +1716,7 @@ class NOVAApp:
         stream = self.engine.ask_stream(prompt=user_text, system=system_prompt, history=history)
         user_added = False
         committed = False
+        usage_tracked = False
         assistant_text = ""
 
         try:
@@ -1684,7 +1743,6 @@ class NOVAApp:
                     raise
 
             assistant_text = "".join(output_chunks).strip()
-            self._track_usage(system_prompt, history, user_text, assistant_text)
             tool_call = self.dispatcher.try_parse_tool_call(assistant_text) if allow_tools else None
             if tool_call:
                 result = self.dispatcher.execute(tool_call, dry_run=dry_run_tools)
@@ -1695,12 +1753,9 @@ class NOVAApp:
                 assistant_text = tool_result_text
 
             self.session.add_turn("assistant", assistant_text)
-            self.memory.add(
-                text=f"User: {user_text}\nAssistant: {assistant_text}",
-                session_id=self.session.current.session_id,
-                metadata={"source": "conversation"},
-            )
-            self.memory.sync_pending(self.session.current.session_id)
+            self._track_usage(system_prompt, history, user_text, assistant_text)
+            usage_tracked = True
+            self._commit_memory_async(user_text, assistant_text)
             committed = True
         except Exception as exc:
             yield f"[ERROR] Generation failed: {exc}"
@@ -1708,19 +1763,34 @@ class NOVAApp:
             # If caller abandons this generator mid-stream, persist partial output.
             if not committed and (user_added or output_chunks):
                 partial = assistant_text or "".join(output_chunks).strip()
+                if not partial:
+                    return
                 if not user_added:
                     self.session.add_turn("user", user_text)
                 try:
-                    self._track_usage(system_prompt, history, user_text, partial)
+                    if not usage_tracked:
+                        self._track_usage(system_prompt, history, user_text, partial)
                 except Exception:
                     pass
                 self.session.add_turn("assistant", partial)
-                self.memory.add(
-                    text=f"User: {user_text}\nAssistant: {partial}",
-                    session_id=self.session.current.session_id,
-                    metadata={"source": "conversation"},
-                )
-                self.memory.sync_pending(self.session.current.session_id)
+                self._commit_memory_async(user_text, partial)
+
+    def _commit_memory_async(self, user_text: str, assistant_text: str) -> None:
+        session_id = self.session.current.session_id
+
+        def _job() -> None:
+            self.memory.add(
+                text=f"User: {user_text}\nAssistant: {assistant_text}",
+                session_id=session_id,
+                metadata={"source": "conversation"},
+            )
+            self.memory.sync_pending(session_id)
+
+        try:
+            self._summarize_executor.submit(_job)
+        except Exception:
+            # Fallback to sync path if executor is unavailable.
+            _job()
 
     def _adb_send_sms(self, phone_number: str, body: str) -> str:
         """Fix 10: Enforce allowlist for SMS delivery."""

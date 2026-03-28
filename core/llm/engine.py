@@ -36,15 +36,18 @@ class LLMEngine:
         self.pool: RoundRobinPool | None = None
         if openai_keys:
             self.pool = RoundRobinPool(openai_keys)
-        self._thread_local = threading.local()
+        self._last_provider = "unknown"
+        self._provider_lock = threading.Lock()
 
     @property
     def last_provider(self) -> str:
-        return getattr(self._thread_local, "last_provider", "unknown")
+        with self._provider_lock:
+            return self._last_provider
 
     @last_provider.setter
     def last_provider(self, val: str) -> None:
-        self._thread_local.last_provider = val
+        with self._provider_lock:
+            self._last_provider = val
 
     def ask(self, prompt: str, system: str, history: list[dict] | None = None) -> str:
         return "".join(self.ask_stream(prompt, system, history))

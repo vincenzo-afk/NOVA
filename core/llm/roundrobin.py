@@ -42,7 +42,7 @@ class RoundRobinPool:
         now = self._now_fn()
         for record in self._keys:
             if (
-                record.status == "rate_limited"
+                record.status in {"rate_limited", "dead"}
                 and record.cooldown_until is not None
                 and now >= record.cooldown_until
             ):
@@ -70,7 +70,9 @@ class RoundRobinPool:
 
     def mark_dead(self, key: str) -> None:
         record = self._find(key)
+        record.failures += 1
         record.status = "dead"
+        record.cooldown_until = self._now_fn() + timedelta(seconds=MAX_BACKOFF_SECONDS)
 
     def mark_rate_limited(self, key: str, retry_after: int = 60) -> None:
         record = self._find(key)

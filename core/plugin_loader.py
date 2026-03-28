@@ -34,6 +34,10 @@ _BLOCKED_IMPORTS = {
     "signal",
     "multiprocessing",
     "threading",
+    "builtins",
+    "_thread",
+    "gc",
+    "weakref",
 }
 
 
@@ -73,10 +77,12 @@ def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
         module = module_from_spec(spec)
         # Fix 4.4: Execute plugin in restricted namespace
         import builtins
-        safe_builtins = {
-            k: v for k, v in vars(builtins).items()
-            if k not in {"__import__", "open"}
+        allowed_builtin_names = {
+            "abs", "all", "any", "bool", "dict", "enumerate", "float", "int", "isinstance",
+            "len", "list", "max", "min", "pow", "print", "range", "reversed", "round",
+            "set", "slice", "sorted", "str", "sum", "tuple", "zip", "map", "filter",
         }
+        safe_builtins = {k: v for k, v in vars(builtins).items() if k in allowed_builtin_names}
         safe_builtins["__import__"] = _restricted_import
         restricted_globals = {
             "__builtins__": safe_builtins,

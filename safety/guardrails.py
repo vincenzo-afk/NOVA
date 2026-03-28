@@ -184,6 +184,24 @@ class Guardrails:
         # Fix 15: Explicit registry allowlist
         if tool_name == "win32_api.registry_write":
             path = str(tool_call.args.get("path", "")).lower()
+            if "\x00" in path:
+                return RiskResult(
+                    score=10,
+                    level="high",
+                    blocked=True,
+                    reason="registry_path_contains_null_byte",
+                    requires_confirmation=False,
+                    plan=self._build_plan(tool_call),
+                )
+            if any(ord(ch) < 0x20 or ord(ch) > 0x7E for ch in path):
+                return RiskResult(
+                    score=10,
+                    level="high",
+                    blocked=True,
+                    reason="registry_path_non_ascii_rejected",
+                    requires_confirmation=False,
+                    plan=self._build_plan(tool_call),
+                )
             if ".." in path.replace("/", "\\").split("\\"):
                 return RiskResult(
                     score=10,
