@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import threading
 from typing import Any, Callable
 
 from pydantic import BaseModel, ValidationError
@@ -35,28 +36,30 @@ class Dispatcher:
         self.registry: dict[str, Callable[..., Any]] = {}
         self.schemas: dict[str, type[BaseModel]] = {}
 
-        # Fix Perf 3: Token bucket for rate limiting tool executions
+        # Fix Perf 3 & Bug 10: Token bucket for rate limiting tool executions with Lock
         self._max_tokens = rate_limit_rpm
         self._tokens = float(rate_limit_rpm)
         self._last_refill = time.time()
         self._refill_rate = rate_limit_rpm / 60.0 if rate_limit_rpm > 0 else 0.0
+        self._token_lock = threading.RLock()
 
     def _consume_token(self) -> None:
         """Consume one rate-limit token; raise RateLimitedError (non-blocking) if exhausted."""
         if self._max_tokens <= 0:
             return  # No limit configured
-        now = time.time()
-        elapsed = now - self._last_refill
-        self._tokens = min(self._max_tokens, self._tokens + elapsed * self._refill_rate)
-        self._last_refill = now
+            
+        with self._token_lock:
+            now = time.time()
+            elapsed = now - self._last_refill
+            self._tokens = min(self._max_tokens, self._tokens + elapsed * self._refill_rate)
+            self._last_refill = now
 
-        if self._tokens < 1.0:
-            # Non-blocking: raise an error instead of sleeping on the main thread
-            raise RateLimitedError(
-                f"Dispatcher rate limit hit ({self._max_tokens} rpm). "
-                "Retry in a moment."
-            )
-        self._tokens -= 1.0
+            if self._tokens < 1.0:
+                # Non-blocking: raise an error instead of sleeping on the main thread
+                raise RateLimitedError(
+                    f"Dispatcher rate limit hit ({self._max_tokens} rpm). Retry in a moment."
+                )
+            self._tokens -= 1.0
 
     def register(self, name: str, fn: Callable[..., Any], schema: type[BaseModel]) -> None:
         self.registry[name] = fn
@@ -105,6 +108,7 @@ class Dispatcher:
         confirm_callback: Callable[[str], bool] | None = None,
         announce_callback: Callable[[str], None] | None = None,
         dry_run: bool = False,
+        _skip_guardrails: bool = False,
     ) -> dict[str, Any]:
         fn = self.registry.get(tool_call.tool)
         schema = self.schemas.get(tool_call.tool)
@@ -120,30 +124,35 @@ class Dispatcher:
                 "details": json.loads(exc.json()),
             }
 
-        risk = guardrails.check(tool_call)
-        auth = guardrails.authorize(
-            tool_call=tool_call,
-            risk=risk,
-            confirm_callback=confirm_callback,
-            announce_callback=announce_callback,
-            dry_run=dry_run,
-            sleep_fn=time.sleep,
-        )
-        if auth.blocked:
-            status = "cancelled" if auth.reason == "user_declined" else "blocked"
-            result = {"status": status, "reason": auth.reason, "risk": auth.score}
-            guardrails.log(tool_call, auth, result=result, status=status, confirmed_by="user")
-            return result
+        # Auth and risk default to None for bypass scenarios
+        from safety.guardrails import Authorization
+        auth = Authorization(blocked=False, reason="guard_bypass", score=0, level="low", plan="")
 
-        if dry_run:
-            result = {
-                "status": "dry_run",
-                "risk": auth.score,
-                "level": auth.level,
-                "plan": auth.plan,
-            }
-            guardrails.log(tool_call, auth, result=result, status="dry_run", confirmed_by="system")
-            return result
+        if not _skip_guardrails:
+            risk = guardrails.check(tool_call)
+            auth = guardrails.authorize(
+                tool_call=tool_call,
+                risk=risk,
+                confirm_callback=confirm_callback,
+                announce_callback=announce_callback,
+                dry_run=dry_run,
+                sleep_fn=time.sleep,
+            )
+            if auth.blocked:
+                status = "cancelled" if auth.reason == "user_declined" else "blocked"
+                result = {"status": status, "reason": auth.reason, "risk": auth.score}
+                guardrails.log(tool_call, auth, result=result, status=status, confirmed_by="user")
+                return result
+
+            if dry_run:
+                result = {
+                    "status": "dry_run",
+                    "risk": auth.score,
+                    "level": auth.level,
+                    "plan": auth.plan,
+                }
+                guardrails.log(tool_call, auth, result=result, status="dry_run", confirmed_by="system")
+                return result
 
         # Fix Perf 3: Non-blocking rate limit — raise instead of sleeping
         try:

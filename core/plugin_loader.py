@@ -5,6 +5,7 @@ from __future__ import annotations
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from typing import Any
+import ast
 
 from pydantic import BaseModel, create_model
 
@@ -32,6 +33,15 @@ def _restricted_import(name: str, *args, **kwargs):
     import builtins
     return builtins.__import__(name, *args, **kwargs)
 
+def _check_ast(source: str):
+    tree = ast.parse(source)
+    restricted = {"__class__", "__mro__", "__subclasses__", "__globals__", "__builtins__", "eval", "exec"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in restricted:
+            raise ValueError(f"Restricted identifier used: {node.id}")
+        if isinstance(node, ast.Attribute) and node.attr in restricted:
+            raise ValueError(f"Restricted attribute used: {node.attr}")
+
 
 def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
     loaded = []
@@ -41,12 +51,14 @@ def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
             continue
         module = module_from_spec(spec)
         # Fix 4.4: Execute plugin in restricted namespace
+        import builtins
         restricted_globals = {
-            "__builtins__": {k: v for k, v in __builtins__.items() if k != "__import__"},
+            "__builtins__": {k: v for k, v in vars(builtins).items() if k != "__import__"},
             "__import__": _restricted_import,
         }
         try:
             source = path.read_text(encoding="utf-8")
+            _check_ast(source)
             code = compile(source, str(path), "exec")
             exec(code, restricted_globals)
         except Exception as exc:

@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import base64
 import time
+import hashlib
+from collections import OrderedDict
 
 import requests
 
 
-_UI_ELEMENT_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_UI_ELEMENT_CACHE: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
 _UI_ELEMENT_CACHE_TTL_S = 0.5  # fix 3.2: 500 ms TTL
 
 
@@ -49,7 +51,7 @@ class OmniParserClient:
 
     def ui_elements(self, image_bytes: bytes) -> list[dict]:
         """Return UI elements with short-TTL caching to avoid per-click screenshot round-trips (fix 3.2)."""
-        cache_key = base64.b64encode(image_bytes[:64]).decode()  # fast key from first 64 bytes
+        cache_key = hashlib.sha256(image_bytes[:4096]).hexdigest()  # use full header+metadata hash
         now = time.monotonic()
         if cache_key in _UI_ELEMENT_CACHE:
             cached_time, cached_elements = _UI_ELEMENT_CACHE[cache_key]
@@ -63,4 +65,6 @@ class OmniParserClient:
         elements = payload.get("elements") or payload.get("ui_elements") or []
         result = [e for e in elements if isinstance(e, dict)]
         _UI_ELEMENT_CACHE[cache_key] = (now, result)
+        if len(_UI_ELEMENT_CACHE) > 10:
+            _UI_ELEMENT_CACHE.popitem(last=False)
         return result

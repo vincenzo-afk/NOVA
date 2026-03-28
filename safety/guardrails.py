@@ -47,6 +47,7 @@ _SENSITIVE_ARG_KEYS = {
 
 # Path for persistent emergency-stop flag (fix 18)
 _EMERGENCY_STOP_FILE = Path.home() / ".jarvis" / "emergency_stop"
+_EMERGENCY_STOP_FILE_FALLBACK = Path.cwd() / ".jarvis" / "emergency_stop"
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +95,20 @@ def _scrub_args(args: dict[str, Any]) -> dict[str, Any]:
             scrubbed[key] = value
     return scrubbed
 
+def _scrub_result(result: Any) -> Any:
+    """Truncate and scrub sensitive data from tool results (Sec 2)."""
+    if isinstance(result, str):
+        if len(result) > 500:
+            result = result[:500] + "... [truncated]"
+        import re
+        result = re.sub(r"(?i)(key|password|secret|token)[\s=:]+['\"]?[\w\-]{16,}['\"]?", r"\1=***REDACTED***", result)
+        return result
+    if isinstance(result, dict):
+        return {k: _scrub_result(v) for k, v in result.items()}
+    if isinstance(result, list):
+        return [_scrub_result(i) for i in result]
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Guardrails class
@@ -114,7 +129,7 @@ class Guardrails:
 
         # Fix 1.9: load persisted emergency stop on startup
         self._emergency_stop = threading.Event()
-        if _EMERGENCY_STOP_FILE.exists():
+        if _EMERGENCY_STOP_FILE.exists() or _EMERGENCY_STOP_FILE_FALLBACK.exists():
             self._emergency_stop.set()
 
         # Fix 2.12: use loguru rotating sink (10 MB / 7 days)
@@ -226,15 +241,26 @@ class Guardrails:
         """Activate emergency stop and persist to disk so it survives restarts (fix 1.9)."""
         self._emergency_stop.set()
         try:
+            _EMERGENCY_STOP_FILE.parent.mkdir(parents=True, exist_ok=True)
             _EMERGENCY_STOP_FILE.write_text("1", encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Failed to write to primary emergency stop file: %s", exc)
+            try:
+                _EMERGENCY_STOP_FILE_FALLBACK.parent.mkdir(parents=True, exist_ok=True)
+                _EMERGENCY_STOP_FILE_FALLBACK.write_text("1", encoding="utf-8")
+            except Exception:
+                pass
 
     def clear_emergency_stop(self) -> None:
         """Clear the emergency stop and remove the persistence file (fix 1.9)."""
         self._emergency_stop.clear()
         try:
             _EMERGENCY_STOP_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            _EMERGENCY_STOP_FILE_FALLBACK.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -310,7 +336,7 @@ class Guardrails:
             requires_confirmation=risk.requires_confirmation,
             confirmed_by=confirmed_by,
             status=status,
-            result=result,
+            result=_scrub_result(result),
             reason=risk.reason,
         )
         self._log_line(json.dumps(asdict(entry), ensure_ascii=False))
