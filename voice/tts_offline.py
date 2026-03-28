@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import os
 
 _QUEUE: queue.Queue | None = None
 _WORKER_THREAD: threading.Thread | None = None
@@ -39,6 +40,16 @@ def _tts_worker() -> None:
 
 def _ensure_worker() -> None:
     global _QUEUE, _WORKER_THREAD
+    # In pytest, rebuild worker per test case to avoid cross-test shared queue state.
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        if _QUEUE is not None and _WORKER_THREAD is not None and _WORKER_THREAD.is_alive():
+            try:
+                _QUEUE.put(None)
+                _WORKER_THREAD.join(timeout=1)
+            except Exception:
+                pass
+            _WORKER_THREAD = None
+            _QUEUE = None
     if _QUEUE is None:
         _QUEUE = queue.Queue()
     if _WORKER_THREAD is None or not _WORKER_THREAD.is_alive():

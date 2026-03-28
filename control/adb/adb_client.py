@@ -61,8 +61,11 @@ class ADBClient:
         )
 
     def type_text(self, text: str) -> str:
-        # Use ADB's own text escaping — replace spaces with %s as ADB requires
-        safe = text.replace(" ", "%s").replace("'", "\\'")
+        # Use ADB's own escaping for shell-sensitive characters.
+        safe = text.replace("\n", " ").replace("\r", " ")
+        for ch in ("\\", "&", "|", ";", "<", ">", "(", ")", "$", "`", "\"", "'"):
+            safe = safe.replace(ch, f"\\{ch}")
+        safe = safe.replace(" ", "%s")
         return self.shell("input", "text", safe)
 
     def launch_app(self, package_name: str) -> str:

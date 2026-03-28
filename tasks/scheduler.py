@@ -16,7 +16,8 @@ _DEFAULT_DB = f"sqlite:///{Path(__file__).resolve().parent.parent}/jarvis_jobs.s
 class TaskScheduler:
     def __init__(self, db_url: str = _DEFAULT_DB):
         from sqlalchemy import create_engine
-        engine = create_engine(db_url, connect_args={"timeout": 30})
+        connect_args = {"timeout": 30} if db_url.startswith("sqlite") else {}
+        engine = create_engine(db_url, connect_args=connect_args)
         self.scheduler = BackgroundScheduler(
             jobstores={"default": SQLAlchemyJobStore(engine=engine)}
         )

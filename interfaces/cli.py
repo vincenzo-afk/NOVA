@@ -35,10 +35,19 @@ def format_usage_message(title: str, summary: dict) -> str:
 
 
 def run_cli(agent) -> None:
-    # Fix 29: Simple Authentication on CLI
+    # Simple CLI authentication via local file (avoids leaking secret via env/process list).
     import getpass
     import os
-    pin = os.getenv("CLI_PIN")
+    from pathlib import Path
+
+    pin = ""
+    pin_file = Path(os.getenv("CLI_PIN_FILE", ".jarvis/cli_pin"))
+    if pin_file.exists():
+        try:
+            pin = pin_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            pin = ""
+
     if pin:
         entered = getpass.getpass("Enter CLI_PIN to unlock NOVA: ")
         if entered != pin:

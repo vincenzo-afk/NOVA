@@ -41,6 +41,16 @@ def _check_ast(source: str):
             raise ValueError(f"Restricted identifier used: {node.id}")
         if isinstance(node, ast.Attribute) and node.attr in restricted:
             raise ValueError(f"Restricted attribute used: {node.attr}")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+            and node.args[1].value in restricted
+        ):
+            raise ValueError(f"Restricted getattr target used: {node.args[1].value}")
 
 
 def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
@@ -52,7 +62,10 @@ def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
         module = module_from_spec(spec)
         # Fix 4.4: Execute plugin in restricted namespace
         import builtins
-        safe_builtins = {k: v for k, v in vars(builtins).items() if k != "__import__"}
+        safe_builtins = {
+            k: v for k, v in vars(builtins).items()
+            if k not in {"__import__", "open"}
+        }
         safe_builtins["__import__"] = _restricted_import
         restricted_globals = {
             "__builtins__": safe_builtins,

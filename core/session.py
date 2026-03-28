@@ -43,6 +43,7 @@ class SessionManager:
         try:
             import json
             from pathlib import Path
+            import tempfile
             sessions_dir = Path(".jarvis_sessions")
             sessions_dir.mkdir(exist_ok=True)
             safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in session.name)
@@ -52,7 +53,18 @@ class SessionManager:
                 session_name = session.name
                 session_id = session.session_id
             data = {"name": session_name, "session_id": session_id, "history": history_snapshot}
-            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            payload = json.dumps(data, ensure_ascii=False, indent=2)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(sessions_dir),
+                delete=False,
+                suffix=".tmp",
+            ) as tmp:
+                tmp.write(payload)
+                tmp.flush()
+                tmp_path = Path(tmp.name)
+            tmp_path.replace(path)
         except Exception:
             pass
 
