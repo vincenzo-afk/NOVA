@@ -45,8 +45,8 @@ _SENSITIVE_ARG_KEYS = {
     "private_key", "auth_token", "bearer_token", "api_secret",
 }
 
-# Path for persistent emergency-stop flag (fix 1.9)
-_EMERGENCY_STOP_FILE = Path(".jarvis_emergency_stop")
+# Path for persistent emergency-stop flag (fix 18)
+_EMERGENCY_STOP_FILE = Path.home() / ".jarvis" / "emergency_stop"
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +165,20 @@ class Guardrails:
         args_text = json.dumps(tool_call.args, ensure_ascii=False).lower()
         tool_name = tool_call.tool.lower()
 
+        # Fix 15: Explicit registry allowlist
+        if tool_name == "win32_api.registry_write":
+            path = str(tool_call.args.get("path", "")).lower()
+            allowlist = {"hkey_current_user\\software\\nova", "hkey_current_user\\environment"}
+            if not any(path.startswith(a) for a in allowlist):
+                return RiskResult(
+                    score=10,
+                    level="high",
+                    blocked=True,
+                    reason="registry_path_not_in_allowlist",
+                    requires_confirmation=False,
+                    plan=self._build_plan(tool_call),
+                )
+
         score = 2
         if any(token in tool_name for token in ("win32_api.", "adb.", "browser.")):
             score += 1
@@ -176,6 +190,23 @@ class Guardrails:
             score += 3
         if any(h in args_text for h in _HIGH_RISK_HINTS):
             score += 3
+
+        # Security fix (4.3): Path-based check for critical system directories.
+        # A write/move/delete targeting System32, Program Files, or /etc is always
+        # high-risk regardless of which keyword matched the tool name.
+        _SYSTEM_PATHS = (
+            "system32", "syswow64", "program files", "windows\\system",
+            "/etc/", "/usr/bin/", "/usr/lib/", "/bin/", "/sbin/",
+        )
+        _FILE_MUTATING_TOOLS = {"win32_api.write", "win32_api.move", "win32_api.delete",
+                                 "win32_api.launch_process"}
+        if tool_name in _FILE_MUTATING_TOOLS:
+            for arg_val in tool_call.args.values():
+                if isinstance(arg_val, str):
+                    av_lower = arg_val.lower().replace("\\", "/")
+                    if any(sp in av_lower for sp in _SYSTEM_PATHS):
+                        score = max(score, 9)
+                        break
 
         if tool_call.tool in DESTRUCTIVE_TOOLS:
             score = max(score, 9)

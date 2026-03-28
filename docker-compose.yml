@@ -1,0 +1,58 @@
+version: "3.9"
+
+# NOVA — docker-compose orchestration
+# Wires up: NOVA agent + Ollama (local LLM) + ChromaDB Memory
+# Usage:
+#   cp .env.example .env && nano .env
+#   docker compose up -d
+
+services:
+  # ────────── Ollama — local LLM server ──────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: nova_ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+    # Pull the default model on first boot
+    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 5 && ollama pull llama3 && wait"]
+
+  # ────────── ChromaDB — vector memory ───────────────────────────────────
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: nova_chromadb
+    volumes:
+      - chroma_data:/chroma/chroma
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+
+  # ────────── NOVA agent ──────────────────────────────────────────────────
+  nova:
+    build:
+      context: .
+      target: runtime
+    container_name: nova_agent
+    depends_on:
+      - ollama
+      - chromadb
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+    env_file:
+      - .env
+    volumes:
+      - ./exports:/app/exports
+      - ./logs:/app/logs
+      - ./assets:/app/assets
+      - ./.jarvis_sessions:/app/.jarvis_sessions
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+volumes:
+  ollama_data:
+  chroma_data:
