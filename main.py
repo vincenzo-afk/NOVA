@@ -12,6 +12,8 @@ from collections import deque, OrderedDict
 from typing import Any, Generator
 from datetime import date
 import copy
+import queue
+from concurrent.futures import ThreadPoolExecutor
 
 from pydantic import BaseModel, Field
 
@@ -364,13 +366,11 @@ class NOVAApp:
         self._last_snippet_hash: int | None = None
 
         # Add single thread for TTS execution (fix 5.1)
-        import queue  # Fix 25
         self._tts_queue = queue.Queue()
         self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         self._tts_thread.start()
 
         # Add executor for background summarization (fix 2)
-        from concurrent.futures import ThreadPoolExecutor
         self._summarize_executor = ThreadPoolExecutor(max_workers=1)
 
         self._event_lock = threading.Lock()
@@ -394,6 +394,10 @@ class NOVAApp:
         else:
             self.adb = None
             self.health.register_subsystem("adb", check_fn=lambda: False)
+            
+        if not settings.ALLOWED_PHONE_NUMBERS and settings.AUTONOMY_ENABLED:
+            import logging
+            logging.getLogger(__name__).warning("ALLOWED_PHONE_NUMBERS is empty — adb.send_sms will always be blocked")
         self.qr = QRPairing(adb_port=settings.ADB_PORT)
         self.omniparser = OmniParserServer(
             url=settings.OMNIPARSER_SERVER_URL,
@@ -407,6 +411,9 @@ class NOVAApp:
         if self._goals_file.exists():
             try:
                 self._goals = json.loads(self._goals_file.read_text(encoding="utf-8"))
+                for goal in self._goals:
+                    if goal.get("status") in {"planning", "running"}:
+                        goal["status"] = "pending"
             except Exception:
                 pass
         self._goal_lock = threading.Lock()
@@ -736,6 +743,10 @@ class NOVAApp:
         if len(steps) > max_steps:
             steps = steps[:max_steps]
         return {"goal": goal, "status": "ok", "steps": steps, "raw": raw}
+        
+    def _goal_plan_wrapper(self, goal: str, max_steps: int = 10) -> dict:
+        self._summarize_executor.submit(self._plan_goal, goal, max_steps=min(max_steps, 30))
+        return {"goal": goal, "status": "planning"}
 
     def _add_goal(self, goal: str, max_steps: int = 20) -> dict:
         goal_id = f"goal_{int(time.time())}"
@@ -772,8 +783,9 @@ class NOVAApp:
     def _persist_goals(self) -> None:
         try:
             self._goals_file.write_text(json.dumps(self._goals, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Failed to persist goals: %s", e)
 
     def _list_goals(self) -> list[dict]:
         with self._goal_lock:
@@ -1271,7 +1283,7 @@ class NOVAApp:
         self.dispatcher.register("task.list", self._list_jobs, EmptyArgs)
         self.dispatcher.register("task.cancel", self._cancel_job, TaskCancelArgs)
         self.dispatcher.register("goal.run", self._run_goal, GoalRunArgs)
-        self.dispatcher.register("goal.plan", self._plan_goal, GoalPlanArgs)
+        self.dispatcher.register("goal.plan", self._goal_plan_wrapper, GoalPlanArgs)
         self.dispatcher.register("goal.add", self._add_goal, GoalAddArgs)
         self.dispatcher.register("goal.list", self._list_goals, EmptyArgs)
         self.dispatcher.register("goal.cancel", self._cancel_goal, GoalCancelArgs)
@@ -1362,13 +1374,6 @@ class NOVAApp:
             if text_hash in self._summary_cache:
                 self._summary_cache.move_to_end(text_hash)  # Keep LRU fresh
                 return self._summary_cache[text_hash]
-                
-        # Fix 4: Sleep briefly and check cache again in case the background thread produced it
-        time.sleep(0.5)
-        with self._summary_cache_lock:
-            if text_hash in self._summary_cache:
-                self._summary_cache.move_to_end(text_hash)
-                return self._summary_cache[text_hash]
         
         # If no cache, return truncated text (will be summarized in background)
         return text[:700]
@@ -1393,8 +1398,6 @@ class NOVAApp:
                     self._summary_cache[hash(text)] = text[:700]
                     if len(self._summary_cache) > 50:
                         self._summary_cache.popitem(last=False)
-        finally:
-            pass
 
     def _apply_text_commands(self, user_text: str) -> str | None:
         """Handle built-in text shortcuts without calling the LLM.
