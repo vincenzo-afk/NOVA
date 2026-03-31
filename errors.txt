@@ -1,0 +1,60 @@
+Here's the complete flat list from the audit file. All 40 issues, nothing skipped: [ppl-ai-file-upload.s3.amazonaws](https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/105483807/083e4154-bb6a-4d24-8573-f18d0ce1c058/nova_technical_audit-1.html?AWSAccessKeyId=ASIA2F3EMEYEZIKXIDTK&Signature=9tsocDSIzXnoRXyADJMGVpmcUvE%3D&x-amz-security-token=IQoJb3JpZ2luX2VjEHQaCXVzLWVhc3QtMSJHMEUCIGzChPePUem5q7Oj%2B6dsrIRpHuBwe%2BS%2Fhy8ptMaMptcVAiEAn1z7Neo1Lypg%2FmW%2FNwqjwthuIakf4QOEqlPSsKTVRRAq8wQIPBABGgw2OTk3NTMzMDk3MDUiDA5JmW6RV7WwTQeCjSrQBABMSUUfwirOBEaYnOBQd1z83YcECUZgKoq0KXSyDvx%2F9V0pZ67FnIYabM2N9H3lizV7aroniQcKcVMhwiuKCrZYWeWWGoJnHh4nuQV7VH8iWHwePVdSjYVhVNvZZhgQjlNNlk6%2FB7ACSauQdfh24kMm%2BfptgCSxRhwEzuon%2F21o77VhHrlNdB39YFi7hK8jeiKbUkb91J5Qyp9DxYEIJOvKNx2taHexMButh8atASNtNC8R17dfwtaqDIYrn9KaCdwZzGy7ePwWaWH%2FqklZLNS5FmOgjbdcs7pb0bnrJqeyjYLYIJ8pUOg3YB00Npp5PodN%2BbxK7MxGY0HvaVe%2Bnleswutd5WnDnAeEvUpNVYX2YDjweZc6hwCkJ67f4bzdkRk8LuNvF86QLy31ZUCaT4WJcHzG1NnpI9WOIm8LzuFYu%2F8a0Q2rIcFnQ4dXXX9wXO%2B7yRgF1Ncer7dgrViR4UgAWfYLSXzvjnLIdq1krfJuCyGrja8YPcnFb%2BUy2bX39QdDGX4ypxJZJWZgwQ%2BEzMFal0USKiX8K4SdRX7xrG5aIyh67KI9aZ9ZZ8yoZ5Vh3q1bky773xLitEfTtqeBTKQK4Y1%2FrT1gx7Z6DskLumz6NyAOBJ%2BTDlaqgxh%2B6BMLWT4y%2BLeUvKxkmDcgn1tU6DEW3t9ys9gOEb9x5zf4xJm9vAQW%2F2lS2ngJ9eY71079EwZ%2BSlZmCv%2B6TsPBhf3LC4c4TqCj22xoPkltTtmHxpwDW8THw4yr64Qp%2BGUg2Ma3I2mihjy8Z6nuzkEv154YCBUwn9euzgY6mAEpNUh%2F24VZckMjvUDm9OPuHQ%2FPZpxNoYjbDn3jFLJ4z85XV0mQFVtFQL%2FcIUIxrmB0q1MOwNmWoiRQ%2B%2FBEjW9Oe8a%2B0FDvu6e0pUDrPi5zFZKnbuTR0PBdQGZtzGNtKLaoCbf2EpcwrIPMZcoULvlQftT3ke11semEMMszAB2mI6rmrvODzDiYk7MuIeUi%2FnqiRiTsglFczg%3D%3D&Expires=1774957946)
+
+***
+
+## 🔴 Critical (6)
+
+1. **ADB SMS allowlist bypass** — empty `ALLOWED_PHONE_NUMBERS` skips the guard entirely, allows SMS to any number
+2. **Plugin sandbox is bypassable** — `exec` with restricted globals is not a real sandbox; `__subclasses__`, `ctypes` escape it
+3. **SSRF bypass via IPv6-mapped IPv4** — `::ffff:192.168.1.1` passes through the private-IP guard due to swallowed `TypeError`
+4. **Thread-unsafe hard-cap date reset in `_track_usage`** — concurrent calls race past the TOCTOU reset, double-fire Telegram alert or miss blocking
+5. **GoalRunner executor deadlock risk** — two semaphores across manual and autonomy paths can deadlock on cross-path tool calls
+6. **LLM output triggers arbitrary tool execution in autonomy mode** — medium-risk steps (score 4–6) auto-confirm after 5s countdown with no user in loop; injectable via web scraping/OCR
+
+***
+
+## 🟠 Major (19)
+
+7. **`ask_stream` finally block double-persists turns** — exception between `add_turn` and `committed=True` causes duplicate history entries
+8. **`summary_last_trigger_count` never resets on session clear** — stale trigger count suppresses re-summarization for up to 3 turns after `reset_context`
+9. **GoalRunner executor shutdown deadlock** — `shutdown(wait=False)` abandons mid-execution threads that may hold internal locks
+10. **Emergency stop path traversal** — `EMERGENCY_STOP_FILE` not validated; LLM-controlled `.env` write can redirect it anywhere
+11. **MCP HTTP connector SSRF logic fragile** — DNS timeout silently sets `resolved_private=False`; double-negative logic is misconfiguration-prone
+12. **Session persistence fails silently on cross-device temp file** — cross-device `OSError` swallowed, session not saved, caller unaware
+13. **`sync_all_pending` blocks every `ask_stream` call** — synchronous mem0 network op on the hot path before LLM call
+14. **Background summarizer submits duplicate jobs** — no cooldown after summary completes; re-triggers after 3 new turns immediately
+15. **Ollama health check uses hardcoded `/api/tags` path** — fails for vLLM/LM Studio backends, triggers unnecessary restart attempts
+16. **CLI PIN lock file path traversal** — `Path.home() / CLIP_IN_LOCK_FILE.lstrip(".")` breaks for absolute paths; home dir silently ignored
+17. **Autonomy loop overwrites cancelled goals back to `running`** — cancel checked post-execution, not pre-execution inside lock
+18. **No rate limiting on LLM calls from autonomy loop** — `step_delay_seconds` defaults to `0.0`, autonomy can exhaust API keys rapidly
+19. **ChromaDB corruption has no recovery path** — backup exists but `restore_chromadb()` not implemented; health monitor can't distinguish corruption from slowness
+20. **Sensitive API keys logged in dispatcher validation error path** — `scrub_args` called only on success path; `ValidationError` returns raw args including secrets
+21. **`requirements.txt` and `requirements.lock` identical** — no real transitive dependency pinning
+22. **Docker OmniParser service missing weights/repo** — container starts without running `setup.py`, `vendor/OmniParser` absent
+23. **No input validation on goal steps before LLM planning** — no `max_length` on `GoalAddArgs`, no injection detection before planner prompt injection
+24. **OmniParser auth token not included in cache key** — stale cached elements returned after server restart with new token
+25. **Web scraper "untrusted" tag has no enforcement** — LLM still acts on scraped content; system prompt has no instruction to ignore it as commands
+
+***
+
+## 🟡 Minor (15)
+
+26. **`tts_offline.py` worker recreation in pytest leaks COM objects** — new pyttsx3 engine per test, not properly cleaned up on Windows
+27. **CLI PIN file world-readable** — no `os.chmod(path, 0o600)` after write
+28. **Web crawler ignores `robots.txt`** — no `RobotFileParser` check before crawling
+29. **`HybridRanker` BM25 fallback uses insertion order** — Jaccard semantic fallback skipped; undocumented degraded quality
+30. **JARVIS→NOVA rename incomplete** — `.env.example`, `DEFAULT_SESSION`, path constants still use `jarvis` prefix
+31. **No rate limiting on Telegram `goal` command** — `goal` and `resume_goal` not routed through `allow_heavy_command`; 12 LLM planning calls/min possible
+32. **Health probe binds to `0.0.0.0`** — no `NOVA_HEALTH_BIND_HOST` setting; exposes probe to all networks in Docker/LAN
+33. **First `ask_stream` after startup has no summary compression** — async summarizer not yet complete; first N requests may overflow context
+34. **Vision watcher silently drops injection-detected alerts** — `detect_issue` returns empty string instead of sanitized warning event
+35. **`UsageTracker.persist` serializes full history on every timer flush** — slow disk write blocks timer thread permanently on large datasets
+36. **No session expiry or idle timeout** — `session.history` unbounded; no `MAX_SESSION_HISTORY_TURNS` enforcement
+37. **`setup.py` startup registration never runs in Docker** — `NOVA_REGISTER_STARTUP` not set in compose; bare-metal users confused
+38. **Redundant `browser_lock` re-acquisition in `browser_close`** — RLock reentrant so no deadlock, but intent-masking; refactor to `_close_no_lock`
+39. **`browser.fill` doesn't preview content before countdown** — user can't see what will be typed on medium-risk auto-confirm
+40. **No session expiry / idle timeout** *(see #36 above — flagged separately as missing feature)*
+
+***
+
+That's all 40. Fix the 6 criticals first, then the 19 majors in severity order. Want me to generate a prioritized fix checklist with exact file locations for each?
