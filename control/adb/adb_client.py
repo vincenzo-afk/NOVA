@@ -84,7 +84,10 @@ class ADBClient:
         Now uses ADB's own argument parser through a proper arg list.
         """
         from config.settings import settings
-        if settings.ALLOWED_PHONE_NUMBERS and phone_number not in settings.ALLOWED_PHONE_NUMBERS:
+        # Security: fail closed when allowlist is empty.
+        if not settings.ALLOWED_PHONE_NUMBERS:
+            raise ValueError("ALLOWED_PHONE_NUMBERS is empty; SMS sending is blocked.")
+        if phone_number not in settings.ALLOWED_PHONE_NUMBERS:
             raise ValueError(f"Phone number {phone_number} is not in ALLOWED_PHONE_NUMBERS.")
         
         return self.shell(

@@ -89,11 +89,18 @@ def parse_schedule_text(schedule_text: str) -> dict:
     def _normalize_time(hour_str: str, min_str: str, ampm: str | None) -> tuple[int, int]:
         h = int(hour_str)
         m = int(min_str)
+        if m < 0 or m > 59:
+            raise ValueError("minute must be between 00 and 59")
         if ampm:
+            if h < 1 or h > 12:
+                raise ValueError("hour must be 1-12 for am/pm format")
             if ampm == "pm" and h < 12:
                 h += 12
             if ampm == "am" and h == 12:
                 h = 0
+        else:
+            if h < 0 or h > 23:
+                raise ValueError("hour must be 0-23 for 24h format")
         return h, m
 
     daily_match = re.search(r"(daily|every day)\s+at\s+(\d{1,2}):(\d{2})(?:\s*(am|pm))?", text)

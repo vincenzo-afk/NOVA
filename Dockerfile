@@ -36,6 +36,7 @@ RUN python -m playwright install chromium --with-deps || true
 FROM deps AS runtime
 
 COPY . .
+EXPOSE 8765
 
 # Create required directories
 RUN mkdir -p exports logs assets

@@ -55,6 +55,7 @@ class Settings:
 
     # Sessions
     DEFAULT_SESSION: str = "nova_personal"
+    MAX_SESSION_HISTORY_TURNS: int = 500
 
     # Usage alerts
     DAILY_TOKEN_ALERT_THRESHOLD: int = 100_000
@@ -94,6 +95,9 @@ class Settings:
     AUTONOMY_NOTIFY_TELEGRAM: bool = True
     AUTONOMY_NOTIFY_TTS: bool = False
     GOAL_STEP_TIMEOUT_SECONDS: float = 60.0
+    AUTONOMY_STEP_DELAY_SECONDS: float = 0.5
+    NOVA_HEALTH_BIND_HOST: str = "127.0.0.1"
+    PLUGINS_ENABLED: bool = False
 
     # Paths / data
     DATA_DIR: str = "~/.jarvis/data"
@@ -164,6 +168,7 @@ class Settings:
             OMNIPARSER_REPO_DIR=env("OMNIPARSER_REPO_DIR", ""),
             RISK_CONFIRM_THRESHOLD=env_int("RISK_CONFIRM_THRESHOLD", 7),
             DEFAULT_SESSION=env("DEFAULT_SESSION", "nova_personal"),
+            MAX_SESSION_HISTORY_TURNS=max(50, env_int("MAX_SESSION_HISTORY_TURNS", 500)),
             DAILY_TOKEN_ALERT_THRESHOLD=env_int("DAILY_TOKEN_ALERT_THRESHOLD", 100_000),
             DAILY_TOKEN_HARD_CAP=env_int("DAILY_TOKEN_HARD_CAP", 500000),
             DAILY_TOKEN_HARD_CAP_WARNING_PCT=max(0, min(100, env_int("DAILY_TOKEN_HARD_CAP_WARNING_PCT", 80))),
@@ -189,6 +194,9 @@ class Settings:
             AUTONOMY_NOTIFY_TELEGRAM=env_bool("AUTONOMY_NOTIFY_TELEGRAM", "true"),
             AUTONOMY_NOTIFY_TTS=env_bool("AUTONOMY_NOTIFY_TTS", "false"),
             GOAL_STEP_TIMEOUT_SECONDS=env_float("GOAL_STEP_TIMEOUT_SECONDS", 60.0),
+            AUTONOMY_STEP_DELAY_SECONDS=max(0.0, env_float("AUTONOMY_STEP_DELAY_SECONDS", 0.5)),
+            NOVA_HEALTH_BIND_HOST=env("NOVA_HEALTH_BIND_HOST", "127.0.0.1"),
+            PLUGINS_ENABLED=env_bool("PLUGINS_ENABLED", "false"),
             DATA_DIR=env("DATA_DIR", "~/.jarvis/data"),
             EMERGENCY_STOP_FILE=env("EMERGENCY_STOP_FILE", ".jarvis/emergency_stop"),
             NOVA_HEALTH_PORT=env_int("NOVA_HEALTH_PORT", 8765),

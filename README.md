@@ -37,7 +37,7 @@
 jarvis/
 ├── main.py                            # Entry point, bootstraps everything
 ├── assets/
-│   └── Hey-Jarvis_en_windows_v3_0_0.ppn  # Download from console.picovoice.ai
+│   └── Hey-Nova_en_windows_v3_0_0.ppn  # Download from console.picovoice.ai
 ├── config/
 │   ├── settings.py                    # .env loader + startup validation (fail fast on missing keys)
 │   └── constants.py
@@ -146,7 +146,7 @@ MEM0_API_KEY=
 
 # Wakeword
 PORCUPINE_ACCESS_KEY=
-PORCUPINE_KEYWORD_PATH=./assets/Hey-Jarvis_en_windows_v3_0_0.ppn  # download from console.picovoice.ai
+PORCUPINE_KEYWORD_PATH=./assets/Hey-Nova_en_windows_v3_0_0.ppn  # download from console.picovoice.ai
 PORCUPINE_SENSITIVITY=0.6
 
 # Telegram
@@ -164,7 +164,7 @@ OMNIPARSER_SERVER_URL=http://localhost:8000
 RISK_CONFIRM_THRESHOLD=7               # 0–10, above this needs explicit confirm
 
 # Sessions
-DEFAULT_SESSION=jarvis_personal
+DEFAULT_SESSION=nova_personal
 
 # Usage
 DAILY_TOKEN_ALERT_THRESHOLD=100000
@@ -291,7 +291,7 @@ Each phase produces something **fully working and testable** before you move on.
 7. **`core/session.py`**:
    - Every conversation has a `session_id` (UUID)
    - `reset_context()` — clear turn history, keep memories
-   - Named sessions: `jarvis_work`, `jarvis_personal` — separate mem0 user IDs
+   - Named sessions: `nova_work`, `nova_personal` — separate mem0 user IDs
    - Switch: *"switch to work mode"* → loads correct session memories
 
 **Testable milestone:** Tell NOVA your name → close and reopen → remembered. 100-turn conversation → no crash, no silent truncation. Search for something from turn 50 → exact recall via BM25 hybrid. Two sessions → memories properly isolated.
@@ -859,7 +859,7 @@ Each phase produces something **fully working and testable** before you move on.
    print("   1. Go to console.picovoice.ai")
    print("   2. Create a custom 'Hey NOVA' keyword for your OS")
    print("   3. Download the .ppn file")
-   print("   4. Place it at: assets/Hey-Jarvis_en_windows_v3_0_0.ppn")
+   print("   4. Place it at: assets/Hey-Nova_en_windows_v3_0_0.ppn")
    print("   5. Confirm the path matches PORCUPINE_KEYWORD_PATH in your .env")
 
    # 8. Register startup entry for current OS

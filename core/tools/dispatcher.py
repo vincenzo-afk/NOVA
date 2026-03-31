@@ -30,6 +30,19 @@ class ToolCall(BaseModel):
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
+_SENSITIVE_KEYS = {"api_key", "token", "password", "secret", "access_key", "private_key", "auth_token", "bearer_token", "api_secret"}
+
+
+def _scrub_args_for_error(args: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in args.items():
+        if key.lower() in _SENSITIVE_KEYS:
+            out[key] = "***REDACTED***"
+        elif isinstance(value, dict):
+            out[key] = _scrub_args_for_error(value)
+        else:
+            out[key] = value
+    return out
 
 
 class Dispatcher:
@@ -157,7 +170,13 @@ class Dispatcher:
             return {
                 "error": "validation_error",
                 "tool": tool_call.tool,
-                "details": json.loads(exc.json()),
+                "details": {
+                    "errors": [
+                        {"loc": e.get("loc"), "msg": e.get("msg"), "type": e.get("type")}
+                        for e in json.loads(exc.json())
+                    ],
+                    "args": _scrub_args_for_error(dict(tool_call.args)),
+                },
             }
 
         # Default auth for bypass scenarios

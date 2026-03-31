@@ -434,7 +434,7 @@ def register_startup_entry() -> None:
     try:
         from control.os_layer import register_startup, startup_command  # fix 6.10
         command = startup_command(str(REPO_ROOT), python_executable=sys.executable, entrypoint="main.py")
-        location = register_startup(command, app_name="jarvis")
+        location = register_startup(command, app_name="nova")
         print(f"✓ Startup registered: {location}")
     except ImportError:
         print("⚠️ Startup registration skipped (dependencies not yet installed).")
@@ -443,6 +443,9 @@ def register_startup_entry() -> None:
 
 
 def main() -> None:
+    deployment_mode = os.getenv("DEPLOYMENT_MODE", "bare-metal").strip().lower()
+    if deployment_mode not in {"bare-metal", "docker"}:
+        deployment_mode = "bare-metal"
     env_path = ensure_env_file()
     env_values = load_env_values(env_path)
     ensure_assets_dir()
@@ -456,7 +459,9 @@ def main() -> None:
     download_omniparser_weights(omniparser_repo)
     maybe_install_ollama_model(env_values)
     verify_wakeword_asset(env_values)
-    if os.getenv("NOVA_REGISTER_STARTUP", "").strip().lower() in {"1", "true", "yes", "y"}:
+    if deployment_mode == "docker":
+        print("Skipping startup registration (DEPLOYMENT_MODE=docker).")
+    elif os.getenv("NOVA_REGISTER_STARTUP", "").strip().lower() in {"1", "true", "yes", "y"}:
         register_startup_entry()
     else:
         print("Skipping startup registration (set NOVA_REGISTER_STARTUP=true to enable).")

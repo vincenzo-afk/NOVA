@@ -115,7 +115,7 @@ class ScreenWatcher:
         ).lower()
 
         if detect_prompt_injection(combined):
-            return ""
+            return "I detected potentially malicious on-screen text and ignored it. Do you want me to review safely?"
 
         if any(keyword in combined for keyword in _ERROR_KEYWORDS):
             return "I detected a possible error dialog on your screen. Want me to take a look?"

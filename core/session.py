@@ -18,8 +18,9 @@ class SessionState:
 class SessionManager:
     _SCHEMA_VERSION = 1
 
-    def __init__(self, default_name: str = "jarvis_personal"):
+    def __init__(self, default_name: str = "jarvis_personal", max_history_turns: int = 500):
         self._sessions: dict[str, SessionState] = {}
+        self._max_history_turns = max(50, int(max_history_turns))
         self._current = self._get_or_create(default_name)
 
     @property
@@ -38,6 +39,8 @@ class SessionManager:
     def add_turn(self, role: str, content: str) -> None:
         with self._current._lock:
             self._current.history.append({"role": role, "content": content})
+            if len(self._current.history) > self._max_history_turns:
+                self._current.history = self._current.history[-self._max_history_turns :]
         self._persist_session(self._current)
 
     def _persist_session(self, session: SessionState) -> None:
@@ -83,6 +86,13 @@ class SessionManager:
             except OSError:
                 tmp_dev = dst_dev = None
             if tmp_dev is not None and dst_dev is not None and tmp_dev != dst_dev:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Session persist cross-device mismatch for %s (%s -> %s).",
+                    session.name,
+                    tmp_dev,
+                    dst_dev,
+                )
                 raise OSError("temporary file and destination are on different devices; atomic replace not guaranteed")
             tmp_path.replace(path)
         except Exception as exc:

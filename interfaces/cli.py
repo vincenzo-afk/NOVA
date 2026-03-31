@@ -65,7 +65,7 @@ def run_cli(agent) -> None:
     pin_hash = ""
     pin_hash_file = Path(CLI_PIN_HASH_FILE)
     legacy_pin_file = Path(CLI_PIN_LEGACY_FILE)
-    lock_file = Path.home() / CLI_PIN_LOCK_FILE.lstrip("./")
+    lock_file = _resolve_lock_file(CLI_PIN_LOCK_FILE)
     if pin_hash_file.exists():
         try:
             pin_hash = pin_hash_file.read_text(encoding="utf-8").strip()
@@ -102,6 +102,10 @@ def run_cli(agent) -> None:
                 lock_file.parent.mkdir(parents=True, exist_ok=True)
                 lock_until = time.time() + min(300, 2 ** failed)
                 lock_file.write_text(str(lock_until), encoding="utf-8")
+                try:
+                    lock_file.chmod(0o600)
+                except Exception:
+                    pass
             except Exception:
                 pass
             delay = min(30, 2 ** failed)
@@ -109,6 +113,10 @@ def run_cli(agent) -> None:
         else:
             lock_file.parent.mkdir(parents=True, exist_ok=True)
             lock_file.write_text(str(time.time() + 300), encoding="utf-8")
+            try:
+                lock_file.chmod(0o600)
+            except Exception:
+                pass
             print("Access Denied. Too many failed attempts.")
             return
 
@@ -226,3 +234,8 @@ def run_cli(agent) -> None:
 
         provider_msg = f"\n[dim][{agent.last_provider_label()}][/dim]" if HAS_RICH else f"\n[{agent.last_provider_label()}]"
         console.print(provider_msg)
+    def _resolve_lock_file(path_value: str) -> Path:
+        p = Path(path_value).expanduser()
+        if p.is_absolute():
+            return p
+        return Path.home() / path_value.lstrip("./")
