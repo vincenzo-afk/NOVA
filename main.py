@@ -387,6 +387,11 @@ class NOVAApp:
         # Add tracking for daily resets (fix 1.5)
         self._hard_cap_hit_date: date | None = None
         self._usage_lock = threading.Lock()  # Fix 3: Lock around usage caps
+
+        total_today = self.usage.total_tokens_today(session_id=settings.DEFAULT_SESSION)
+        if total_today >= settings.DAILY_TOKEN_HARD_CAP:
+            self._hard_cap_hit = True
+            self._hard_cap_hit_date = date.today()
         
         # Add summary cache tracking (fix 6.1, 11)
         self._summary_cache = OrderedDict()  # Fix 11
@@ -1586,6 +1591,9 @@ class NOVAApp:
             self._notify_autonomy_event(message)
 
     def shutdown(self) -> None:
+        if getattr(self, "_shutdown_called", False):
+            return
+        self._shutdown_called = True
         self._shutting_down.set()
         if getattr(self, "health", None):
             self.health.stop()
@@ -1604,6 +1612,11 @@ class NOVAApp:
             if timer and timer.is_alive():
                 timer.cancel()
             with self._goal_lock:
+                for item in self._goals:
+                    if item.get("status") == "planning":
+                        item["status"] = "failed"
+                        if "last_result" not in item:
+                            item["last_result"] = {"status": "failed", "reason": "goal_planning_interrupted_by_shutdown"}
                 self._persist_goals()
         except Exception:
             pass
@@ -1983,7 +1996,8 @@ class NOVAApp:
                 return self._summary_cache[stable_hash]
 
         # No cached summary yet; background worker will populate it.
-        return ""
+        # Drop to a fast truncation so we don't completely lose context.
+        return text[:700]
     
     def _summarize_history_background(self, text: str, session_id: str, session_epoch: int) -> None:
         """Summarize history in background thread and update cache."""
