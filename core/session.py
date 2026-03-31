@@ -100,6 +100,10 @@ class SessionManager:
                     raise OSError("cross-device fallback copy failed")
             else:
                 tmp_path.replace(path)
+            try:
+                backup_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning(

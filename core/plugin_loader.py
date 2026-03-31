@@ -119,6 +119,7 @@ def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:
                     path.name,
                     owner,
                 )
+                print(f"[plugin] Conflict: tool '{name}' in {path.name} skipped (already provided by {owner}).")
                 continue
             fn_name = tool.get("fn") or tool.get("function") or name
             fn = restricted_globals.get(fn_name)

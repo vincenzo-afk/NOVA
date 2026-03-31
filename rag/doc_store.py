@@ -180,9 +180,8 @@ class DocumentStore:
             removed = True
         if self._use_chroma and self._collection:
             try:
-                ids = [self._chunk_id(filename, idx, c.text) for idx, c in enumerate(chunks)]
-                if ids:
-                    self._collection.delete(ids=ids)
+                # Delete by filename metadata to avoid stale/changing chunk-id mismatches.
+                self._collection.delete(where={"filename": filename})
             except Exception:
                 self._use_chroma = False
         return {"status": "ok" if removed else "not_found", "filename": filename}
