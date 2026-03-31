@@ -44,13 +44,64 @@ _ACTION_VERBS = {
 }
 
 
-def build_system_prompt(base: str, dispatcher=None, emotion: str | None = None) -> str:
-    prompt = f"{base}\n\n{_COT_PREFIX}\n{_UNTRUSTED_CONTENT_POLICY}"
+_SOUL_PATH = "SOUL.md"
+
+
+def _load_soul() -> str:
+    """Load SOUL.md persona, stripping any unfilled [ONBOARDING: …] placeholders."""
+    import re
+    from pathlib import Path
+
+    path = Path(_SOUL_PATH)
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8").strip()
+    # Remove HTML comment blocks (the <!-- … --> wrapper at the top)
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL).strip()
+    # Strip any unfilled onboarding placeholders gracefully
+    text = re.sub(r"\[ONBOARDING:[^\]]*\]", "", text).strip()
+    return text
+
+
+def build_system_prompt(
+    base: str,
+    dispatcher=None,
+    emotion: str | None = None,
+    capability_summary: str | None = None,
+) -> str:
+    """Assemble the full system prompt.
+
+    Layer order (highest-level context first):
+      1. SOUL.md persona (who NOVA is)
+      2. Capability summary (what this specific machine can do)
+      3. Base instructions + CoT + untrusted-content policy
+      4. Emotional tone (if set)
+      5. Available tool schemas
+    """
+    parts: list[str] = []
+
+    # 1. Persona
+    soul = _load_soul()
+    if soul:
+        parts.append(soul)
+
+    # 2. Capability map
+    if capability_summary:
+        parts.append(capability_summary)
+
+    # 3. Base + safety
+    parts.append(f"{base}\n\n{_COT_PREFIX}\n{_UNTRUSTED_CONTENT_POLICY}")
+
+    # 4. Emotion
     if emotion:
-        prompt += f"\n\nCurrent emotional tone: {emotion}."
+        parts.append(f"Current emotional tone: {emotion}.")
+
+    # 5. Tool schemas
     if dispatcher:
-        prompt += "\n\n" + dispatcher.get_tool_schema_prompt()
-    return prompt
+        parts.append(dispatcher.get_tool_schema_prompt())
+
+    return "\n\n".join(parts)
+
 
 
 def ambiguity_score(user_text: str) -> float:

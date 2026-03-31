@@ -1,0 +1,168 @@
+"""Self-writing plugin generator — Feature 8.
+
+Security model (read carefully before modifying):
+  1. The LLM generates plugin source code.
+  2. The code MUST pass _check_ast() from core/plugin_loader.py.
+  3. The code is shown to the user, who MUST explicitly approve it.
+  4. Only after approval is the .py file written to plugins/.
+  5. The plugin is then loaded through the normal load_plugins() path,
+     which applies _check_ast() again plus _restricted_import() at exec time.
+
+This double-gate (AST check + human approval + runtime sandbox) ensures
+LLM-generated code cannot bypass the sandbox automatically.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+log = logging.getLogger(__name__)
+
+_PLUGIN_DIR = Path("plugins")
+_PENDING_DIR = Path(".jarvis/pending_plugins")
+
+_SYSTEM_PROMPT = """\
+You are a plugin code generator for NOVA, an autonomous AI assistant.
+
+Generate a single Python plugin file that defines:
+  PLUGIN_TOOLS = [
+      {
+          "name": "tool_name",
+          "description": "what it does",
+          "args": {"arg1": "description", "arg2": "description"},
+          "fn": "function_name",
+      },
+  ]
+
+  def function_name(arg1: str, arg2: str = "") -> dict:
+      ...return...
+
+Rules (ALL are mandatory — violations will be rejected):
+- Do NOT import os, subprocess, socket, sys, requests, urllib, pathlib,
+  io, tempfile, shutil, importlib, ctypes, threading, multiprocessing,
+  signal, gc, weakref, builtins, or any module starting with _.
+- Do NOT use eval, exec, compile, getattr, setattr, delattr, vars,
+  locals, globals, dir, hasattr, __import__, __class__, __mro__,
+  __subclasses__, __globals__, or __builtins__.
+- Keep the code minimal and focused on the requested task.
+- Return only the Python source code (no markdown fences, no explanation).
+"""
+
+
+class PluginGenerationError(RuntimeError):
+    pass
+
+
+class PluginGenerator:
+    """Generates, validates, and (with user approval) hot-loads NOVA plugins."""
+
+    def __init__(
+        self,
+        llm_callable: Callable[[str, str], str],
+        dispatcher,
+        confirm_callback: Callable[[str, str], bool] | None = None,
+    ):
+        """
+        Args:
+            llm_callable: fn(system_prompt, user_prompt) → generated_code_str
+            dispatcher: NOVAApp's Dispatcher instance
+            confirm_callback: fn(tool_code, description) → bool.
+                If None, always requires CLI confirmation.
+        """
+        self._llm = llm_callable
+        self._dispatcher = dispatcher
+        self._confirm = confirm_callback or _cli_confirm
+
+    def generate_and_propose(self, description: str) -> dict[str, Any]:
+        """Full pipeline: generate → validate → show to user → approve → save → load.
+
+        Returns a result dict describing the outcome.
+        """
+        log.info("[plugin_generator] Generating plugin for: %s", description)
+
+        # 1. Generate code
+        try:
+            code = self._llm(_SYSTEM_PROMPT, description).strip()
+        except Exception as exc:
+            raise PluginGenerationError(f"LLM call failed: {exc}") from exc
+
+        # Strip accidental markdown fences
+        code = re.sub(r"^```(?:python)?\n?", "", code, flags=re.MULTILINE)
+        code = re.sub(r"\n?```$", "", code, flags=re.MULTILINE)
+        code = code.strip()
+
+        if not code:
+            raise PluginGenerationError("LLM returned empty code.")
+
+        # 2. AST validation (first gate)
+        try:
+            from core.plugin_loader import _check_ast
+            _check_ast(code)
+        except Exception as exc:
+            log.warning("[plugin_generator] AST check failed: %s", exc)
+            raise PluginGenerationError(f"Generated code failed AST safety check: {exc}") from exc
+
+        log.info("[plugin_generator] AST check passed.")
+
+        # Save to pending dir for inspection
+        _PENDING_DIR.mkdir(parents=True, exist_ok=True)
+        code_hash = hashlib.sha256(code.encode()).hexdigest()[:12]
+        pending_path = _PENDING_DIR / f"pending_{code_hash}.py"
+        pending_path.write_text(code, encoding="utf-8")
+
+        # 3. Human approval (mandatory — this gate CANNOT be bypassed)
+        approved = self._confirm(code, description)
+        if not approved:
+            log.info("[plugin_generator] Plugin rejected by user.")
+            pending_path.unlink(missing_ok=True)
+            return {"status": "rejected", "reason": "user_declined"}
+
+        # 4. Write to plugins/ directory
+        slug = re.sub(r"[^a-z0-9_]", "_", description.lower())[:32].strip("_")
+        plugin_name = f"gen_{slug}_{code_hash[:6]}"
+        plugin_path = _PLUGIN_DIR / f"{plugin_name}.py"
+        _PLUGIN_DIR.mkdir(exist_ok=True)
+        plugin_path.write_text(code, encoding="utf-8")
+        pending_path.unlink(missing_ok=True)
+        log.info("[plugin_generator] Plugin written to %s", plugin_path)
+
+        # 5. Hot-load through the normal sandboxed loader (second gate)
+        try:
+            from core.plugin_loader import load_plugins
+            newly_loaded = load_plugins(self._dispatcher, plugin_dir=str(_PLUGIN_DIR))
+            log.info("[plugin_generator] Hot-loaded: %s", newly_loaded)
+        except Exception as exc:
+            log.error("[plugin_generator] Hot-load failed: %s", exc)
+            return {
+                "status": "error",
+                "reason": f"hot_load_failed: {exc}",
+                "plugin_path": str(plugin_path),
+            }
+
+        return {
+            "status": "loaded",
+            "plugin_path": str(plugin_path),
+            "plugin_name": plugin_name,
+            "loaded_files": newly_loaded,
+        }
+
+
+def _cli_confirm(code: str, description: str) -> bool:
+    """Default human-approval callback using the terminal."""
+    separator = "─" * 60
+    print(f"\n{separator}")
+    print(f"  NOVA Plugin Generator — Review Required")
+    print(f"  Task: {description}")
+    print(separator)
+    print(code)
+    print(separator)
+    try:
+        ans = input("  Approve and load this plugin? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "n"
+    return ans.startswith("y")
