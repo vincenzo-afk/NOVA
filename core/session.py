@@ -93,8 +93,13 @@ class SessionManager:
                     tmp_dev,
                     dst_dev,
                 )
-                raise OSError("temporary file and destination are on different devices; atomic replace not guaranteed")
-            tmp_path.replace(path)
+                try:
+                    shutil.copy2(tmp_path, path)
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    raise OSError("cross-device fallback copy failed")
+            else:
+                tmp_path.replace(path)
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning(

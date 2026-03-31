@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import time
 from typing import Any
 
 
@@ -72,8 +73,13 @@ class Mem0Client:
             payload = {k: v for k, v in payload.items() if v is not None}
             try:
                 return fn(**payload)
+            except ConnectionError:
+                raise
+            except TimeoutError:
+                raise
             except (TypeError, AttributeError) as exc:
                 last_signature_error = exc
+                time.sleep(0.05)
                 continue
         raise TypeError(
             f"mem0 SDK call failed for all argument variants. "

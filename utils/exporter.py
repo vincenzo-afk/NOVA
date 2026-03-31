@@ -8,12 +8,12 @@ from pathlib import Path
 
 # Fix 4.1: Redact sensitive fields from session history before export
 _SENSITIVE_PATTERNS = [
-    (re.compile(r'"api_key"\s*:\s*"[^"\n]*"', re.IGNORECASE), '"api_key": "***REDACTED***"'),
-    (re.compile(r'"token"\s*:\s*"[^"\n]*"', re.IGNORECASE), '"token": "***REDACTED***"'),
-    (re.compile(r'"password"\s*:\s*"[^"\n]*"', re.IGNORECASE), '"password": "***REDACTED***"'),
-    (re.compile(r'"secret"\s*:\s*"[^"\n]*"', re.IGNORECASE), '"secret": "***REDACTED***"'),
-    (re.compile(r'"access_key"\s*:\s*"[^"\n]*"', re.IGNORECASE), '"access_key": "***REDACTED***"'),
-    (re.compile(r'"auth_token"\s*:\s*"[^"\n]*"', re.IGNORECASE), '"auth_token": "***REDACTED***"'),
+    (re.compile(r'"api_key"\s*:\s*"[^"]*"', re.IGNORECASE | re.MULTILINE), '"api_key": "***REDACTED***"'),
+    (re.compile(r'"token"\s*:\s*"[^"]*"', re.IGNORECASE | re.MULTILINE), '"token": "***REDACTED***"'),
+    (re.compile(r'"password"\s*:\s*"[^"]*"', re.IGNORECASE | re.MULTILINE), '"password": "***REDACTED***"'),
+    (re.compile(r'"secret"\s*:\s*"[^"]*"', re.IGNORECASE | re.MULTILINE), '"secret": "***REDACTED***"'),
+    (re.compile(r'"access_key"\s*:\s*"[^"]*"', re.IGNORECASE | re.MULTILINE), '"access_key": "***REDACTED***"'),
+    (re.compile(r'"auth_token"\s*:\s*"[^"]*"', re.IGNORECASE | re.MULTILINE), '"auth_token": "***REDACTED***"'),
 ]
 
 

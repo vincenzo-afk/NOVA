@@ -26,6 +26,7 @@ class UsageTracker:
         self._lock = threading.RLock()
         self._persist_timer: threading.Timer | None = None
         self._persist_interval_seconds = 2.0
+        self._dirty = False
         self._load()
 
     def _load(self) -> None:
@@ -50,6 +51,8 @@ class UsageTracker:
         try:
             if self._persist_path is None:
                 return
+            if not self._dirty:
+                return
             self._persist_path.parent.mkdir(parents=True, exist_ok=True)
             payload: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
             for day_key, sessions in self._daily.items():
@@ -62,6 +65,7 @@ class UsageTracker:
                             "output_tokens": entry.output_tokens,
                         }
             self._persist_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            self._dirty = False
         except Exception:
             pass
 
@@ -98,6 +102,7 @@ class UsageTracker:
             entry = self._daily[today][session_id][provider]
             entry.input_tokens += input_tokens
             entry.output_tokens += output_tokens
+            self._dirty = True
             self._schedule_persist()
 
     def flush(self) -> None:

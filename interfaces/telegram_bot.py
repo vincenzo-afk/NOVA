@@ -279,6 +279,8 @@ def run_telegram_bot(
         if not text:
             await update.message.reply_text("Usage: /goal <goal description>")
             return
+        if len(text) > 500:
+            text = text[:500].rstrip() + "..."
         result = agent.add_goal(text)
         if result.get("status") != "pending":
             await update.message.reply_text(f"Goal planning failed: {result}")

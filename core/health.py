@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 import threading
 import time
@@ -97,8 +97,20 @@ class HealthMonitor:
                     self._restart_attempts[name] = attempts + 1
                 try:
                     restart_fn()
-                    self.heartbeat(name, "restarting")
-                    self._emit_change(name, "restarting", "down")
+                    # Verify quickly after restart before declaring restarting.
+                    time.sleep(5.0)
+                    try:
+                        recovered = bool(check_fn())
+                    except Exception:
+                        recovered = False
+                    if recovered:
+                        self.heartbeat(name, "ok")
+                        self._emit_change(name, "ok", "down")
+                        with self._lock:
+                            self._restart_attempts[name] = 0
+                    else:
+                        self.heartbeat(name, "restarting")
+                        self._emit_change(name, "restarting", "down")
                 except Exception:
                     self.heartbeat(name, "restart_failed")
                     self._emit_change(name, "restart_failed", "down")
@@ -123,4 +135,4 @@ class HealthMonitor:
 
     def status_table(self) -> list[dict]:
         with self._lock:
-            return [item.__dict__ for item in self._state.values()]
+            return [asdict(item) for item in self._state.values()]

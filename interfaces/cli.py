@@ -37,6 +37,13 @@ def format_usage_message(title: str, summary: dict) -> str:
     return "\n".join(lines)
 
 
+def _resolve_lock_file(path_value: str) -> Path:
+    p = Path(path_value).expanduser()
+    if p.is_absolute():
+        return p
+    return Path.home() / path_value.lstrip("./")
+
+
 def run_cli(agent) -> None:
     # Simple CLI authentication via local file (avoids leaking secret via env/process list).
     import getpass
@@ -234,8 +241,3 @@ def run_cli(agent) -> None:
 
         provider_msg = f"\n[dim][{agent.last_provider_label()}][/dim]" if HAS_RICH else f"\n[{agent.last_provider_label()}]"
         console.print(provider_msg)
-    def _resolve_lock_file(path_value: str) -> Path:
-        p = Path(path_value).expanduser()
-        if p.is_absolute():
-            return p
-        return Path.home() / path_value.lstrip("./")

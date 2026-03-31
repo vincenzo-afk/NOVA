@@ -52,10 +52,10 @@ class Dispatcher:
         self.descriptions: dict[str, str] = {}
 
         # Fix Perf 3 & Bug 10: Token bucket for rate limiting tool executions with Lock
-        self._max_tokens = rate_limit_rpm
-        self._tokens = float(rate_limit_rpm)
+        self._max_tokens = max(0, int(rate_limit_rpm))
+        self._tokens = float(self._max_tokens)
         self._last_refill = time.time()
-        self._refill_rate = rate_limit_rpm / 60.0 if rate_limit_rpm > 0 else 0.0
+        self._refill_rate = self._max_tokens / 60.0 if self._max_tokens > 0 else 0.0
         self._token_lock = threading.RLock()
 
     def _consume_token(self) -> None:

@@ -13,6 +13,8 @@ from bs4 import BeautifulSoup
 
 from web.scraper import _validate_url
 
+_USER_AGENT = "Mozilla/5.0 (NOVA/1.0)"
+
 
 def crawl(seed_url: str, max_pages: int = 5, max_depth: int = 2) -> list[str]:
     # Validate seed URL before starting
@@ -40,7 +42,7 @@ def crawl(seed_url: str, max_pages: int = 5, max_depth: int = 2) -> list[str]:
                 pass
             robots[host_key] = parser
         try:
-            return parser.can_fetch("NOVA/1.0", target_url)
+            return parser.can_fetch(_USER_AGENT, target_url)
         except Exception:
             return True
 
@@ -62,7 +64,7 @@ def crawl(seed_url: str, max_pages: int = 5, max_depth: int = 2) -> list[str]:
             response = requests.get(
                 url,
                 timeout=10,
-                headers={"User-Agent": "Mozilla/5.0 (NOVA/1.0)"},
+                headers={"User-Agent": _USER_AGENT},
             )
             if not response.ok:
                 continue

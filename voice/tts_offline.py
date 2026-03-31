@@ -45,7 +45,7 @@ def _ensure_worker() -> None:
         if _QUEUE is not None and _WORKER_THREAD is not None and _WORKER_THREAD.is_alive():
             try:
                 _QUEUE.put(None)
-                _WORKER_THREAD.join(timeout=1)
+                _WORKER_THREAD.join()
             except Exception:
                 pass
             _WORKER_THREAD = None
