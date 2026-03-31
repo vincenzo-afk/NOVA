@@ -398,6 +398,7 @@ class NOVAApp:
         self._memory_submit_lock = threading.Lock()
         self._goal_plan_submit_lock = threading.Lock()
         self._summary_inflight: set[str] = set()
+        self._session_context_epoch: dict[str, int] = {}
 
         # Add single thread for TTS execution (fix 5.1)
         self._tts_thread.start()
@@ -576,7 +577,11 @@ class NOVAApp:
         return self.emotion.state
 
     def switch_session(self, name: str):
+        previous_session_id = self.session.current.session_id
         state = self.session.switch(name)
+        # Clear per-session summary state on switch to avoid stale bleed-through.
+        self._clear_session_context_state(previous_session_id, clear_summary=False)
+        self._clear_session_context_state(state.session_id, clear_summary=True)
         # Session isolation: reset stateful tool clients on session switch.
         with self._browser_lock:
             self._browser_close()
@@ -587,6 +592,18 @@ class NOVAApp:
             except Exception:
                 pass
         return state
+
+    def _clear_session_context_state(self, session_id: str, *, clear_summary: bool) -> None:
+        with self._summary_submit_lock:
+            self._summary_last_trigger_count.pop(session_id, None)
+            self._summary_retry_after.pop(session_id, None)
+            self._last_snippet_hashes.pop(session_id, None)
+            self._summary_inflight.discard(session_id)
+            self._session_context_epoch[session_id] = self._session_context_epoch.get(session_id, 0) + 1
+        with self.trimmer._lock:
+            if clear_summary:
+                self.trimmer.summaries.pop(session_id, None)
+            self.trimmer._last_summarized_count.pop(session_id, None)
 
     def reset_context(self) -> None:
         """Clear current session history and the associated trimmer summary (fix 1.6).
@@ -603,14 +620,8 @@ class NOVAApp:
         except Exception:
             pass
         self.session.reset_context()
-        # fix 1.6: clear the stale summary so it doesn't bleed into the new context
-        with self.trimmer._lock:
-            self.trimmer.summaries.pop(session_id, None)
-            self.trimmer._last_summarized_count.pop(session_id, None)
-        with self._summary_submit_lock:
-            self._summary_last_trigger_count.pop(session_id, None)
-            self._summary_retry_after.pop(session_id, None)
-            self._last_snippet_hashes.pop(session_id, None)
+        # fix 1.6: clear stale summary and invalidate in-flight summarizer writes.
+        self._clear_session_context_state(session_id, clear_summary=True)
 
     def list_goals(self) -> list[dict]:
         return self._list_goals()
@@ -662,7 +673,11 @@ class NOVAApp:
         session = self.session.current
         timestamp = int(time.time())
         safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", session.name).strip("_") or "session"
-        payload = history if history is not None else session.history
+        if history is None:
+            with session._lock:
+                payload = list(session.history)
+        else:
+            payload = list(history)
         if fmt.lower() == "json":
             path = f"exports/{safe_name}_{timestamp}.json"
             return export_json(payload, path)
@@ -1030,7 +1045,12 @@ class NOVAApp:
             Path(Path(os.getenv("TMPDIR", "/tmp")).resolve()),
         ]
         if not any(str(target).startswith(str(root)) for root in allowed_roots):
-            return {"status": "error", "reason": "path_outside_allowed_roots"}
+            return {
+                "status": "error",
+                "reason": "path_outside_allowed_roots",
+                "path": str(target),
+                "allowed_roots": [str(root) for root in allowed_roots],
+            }
         return self.docs.ingest(str(target))
 
     def _persist_goals(self) -> None:
@@ -1077,7 +1097,7 @@ class NOVAApp:
         with self._goal_lock:
             for item in self._goals:
                 if item.get("id") == goal_id:
-                    if item.get("status") == "pending":
+                    if item.get("status") in {"planning", "pending", "running", "approved_for_step", "awaiting_confirmation"}:
                         item["status"] = "cancelled"
                         self._persist_goals()
                         return {"goal_id": goal_id, "status": "cancelled"}
@@ -1339,7 +1359,7 @@ class NOVAApp:
             restart_fn=self._start_probe_server,
         )
         try:
-            self.omniparser.ensure_running()
+            threading.Thread(target=self.omniparser.ensure_running, daemon=True).start()
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("OmniParser startup check failed: %s", exc)
@@ -1419,7 +1439,17 @@ class NOVAApp:
                 _ = (app, format, args)
                 return
 
-        server = ThreadingHTTPServer((str(settings.NOVA_HEALTH_BIND_HOST), int(settings.NOVA_HEALTH_PORT)), _ProbeHandler)
+        try:
+            server = ThreadingHTTPServer((str(settings.NOVA_HEALTH_BIND_HOST), int(settings.NOVA_HEALTH_PORT)), _ProbeHandler)
+        except OSError as exc:
+            import logging
+            logging.getLogger(__name__).error(
+                "Health probe bind failed on %s:%s: %s",
+                settings.NOVA_HEALTH_BIND_HOST,
+                settings.NOVA_HEALTH_PORT,
+                exc,
+            )
+            return
         server.daemon_threads = True
         self._health_http_server = server
         self._health_http_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1490,6 +1520,7 @@ class NOVAApp:
                             start_index=0,
                             on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
                             confirm_callback=lambda _p: True,
+                            should_continue=lambda gid=str(goal.get("id")): not self._is_goal_cancelled(gid),
                         )
                         result.next_index = min(len(steps), start_index + (1 if result.status == "completed" else 0))
                 else:
@@ -1499,12 +1530,15 @@ class NOVAApp:
                         start_index=start_index,
                         on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
                         confirm_callback=self._autonomy_confirm_callback,
+                        should_continue=lambda gid=str(goal.get("id")): not self._is_goal_cancelled(gid),
                     )
 
             if approved_for_step and result.status == "completed":
                 status = "pending" if result.next_index < len(steps) else "completed"
             else:
                 status = "completed" if result.status == "completed" else "paused"
+                if result.status == "cancelled":
+                    status = "cancelled"
                 if result.status == "stopped" and "Cycle detected" in result.reason:
                     status = "failed"
                 if result.status == "stopped" and "max_steps" in result.reason:
@@ -1591,6 +1625,11 @@ class NOVAApp:
             self.usage.flush()
         except Exception:
             pass
+        if self.memory.online:
+            try:
+                self.memory.sync_all_pending()
+            except Exception:
+                pass
         try:
             summary_file = Path(".jarvis/trimmer_summaries.json")
             summary_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1623,10 +1662,21 @@ class NOVAApp:
         self._memory_executor.shutdown(wait=False, **kwargs)
         self._sync_executor.shutdown(wait=False, **kwargs)
         self._goal_plan_executor.shutdown(wait=False, **kwargs)
-        # Bug fix: drain TTS queue on shutdown so the worker thread exits cleanly
+        # Drain queued TTS items so shutdown doesn't wait behind stale backlog.
         try:
+            while True:
+                try:
+                    self._tts_queue.get_nowait()
+                    self._tts_queue.task_done()
+                except queue.Empty:
+                    break
             self._tts_queue.put(None)   # sentinel to stop the worker
             self._tts_thread.join(timeout=5)
+        except Exception:
+            pass
+        try:
+            from voice.tts_offline import shutdown as shutdown_offline_tts
+            shutdown_offline_tts(drain=True)
         except Exception:
             pass
 
@@ -1710,6 +1760,13 @@ class NOVAApp:
         if not settings.AUTONOMY_NOTIFY_TTS:
             return False
         self._tts_queue.put(text)
+        return True
+
+    def _is_goal_cancelled(self, goal_id: str) -> bool:
+        with self._goal_lock:
+            for item in self._goals:
+                if item.get("id") == goal_id:
+                    return item.get("status") == "cancelled"
         return True
 
     def _notify_autonomy_event(self, text: str) -> None:
@@ -1849,10 +1906,11 @@ class NOVAApp:
                     self._last_snippet_hashes[session_id] = snippet_hash
                     self._summary_last_trigger_count[session_id] = older_count
                     self._summary_inflight.add(session_id)
+                    epoch = self._session_context_epoch.get(session_id, 0)
 
-                    def _job(sn=snippet, sid=session_id):
+                    def _job(sn=snippet, sid=session_id, sid_epoch=epoch):
                         try:
-                            self._summarize_history_background(sn, sid)
+                            self._summarize_history_background(sn, sid, sid_epoch)
                         finally:
                             with self._summary_submit_lock:
                                 self._summary_inflight.discard(sid)
@@ -1927,7 +1985,7 @@ class NOVAApp:
         # No cached summary yet; background worker will populate it.
         return ""
     
-    def _summarize_history_background(self, text: str, session_id: str) -> None:
+    def _summarize_history_background(self, text: str, session_id: str, session_epoch: int) -> None:
         """Summarize history in background thread and update cache."""
         if not text.strip():
             return
@@ -1944,6 +2002,10 @@ class NOVAApp:
                 self._summary_cache[stable_hash] = summary
                 if len(self._summary_cache) > 50:
                     self._summary_cache.popitem(last=False)
+            with self._summary_submit_lock:
+                current_epoch = self._session_context_epoch.get(session_id, 0)
+            if current_epoch != session_epoch:
+                return
             with self.trimmer._lock:
                 self.trimmer.summaries[session_id] = summary
             with self._summary_submit_lock:
