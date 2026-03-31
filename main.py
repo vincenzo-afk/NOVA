@@ -60,9 +60,16 @@ from utils.usage_tracker import UsageTracker
 from vision.watcher import ScreenWatcher
 from vision.omniparser_server import OmniParserServer
 from web.crawler import crawl
-from web.scraper import scrape_text
+from web.scraper import scrape_text, scrape_js, scrape_visual
 from web.search import search
 import control.win32_api as win32_api
+# Feature imports ──────────────────────────────────────────────────────────────
+from config.pc_scanner import load as _load_pc_profile
+from config.capability_map import build_capability_summary
+from control.window_manager import WindowManager
+from control.macos_permissions import check_permissions as _check_macos_permissions
+from interfaces.onboarding import run_onboarding
+from core.plugin_generator import PluginGenerator
 
 
 class WebSearchArgs(BaseModel):
@@ -268,6 +275,36 @@ class QRTerminalArgs(BaseModel):
     prefer_remote: bool = False
 
 
+class WindowListArgs(BaseModel):
+    pass
+
+
+class WindowFocusArgs(BaseModel):
+    title: str
+
+
+class WindowResizeWMArgs(BaseModel):
+    title: str
+    width: int
+    height: int
+
+
+class WindowCloseArgs(BaseModel):
+    title: str
+
+
+class PluginGenerateArgs(BaseModel):
+    description: str = Field(..., min_length=5, max_length=1000)
+
+
+class ScrapeJsArgs(BaseModel):
+    url: str
+
+
+class ScrapeVisualArgs(BaseModel):
+    url: str
+
+
 class EmptyArgs(BaseModel):
     pass
 
@@ -399,6 +436,32 @@ class NOVAApp:
             # Ensure any stale flag from yesterday is cleared at startup.
             self._hard_cap_hit = False
             self._hard_cap_hit_date = None
+
+        # ── Feature 10: first-run onboarding ──────────────────────────────────
+        try:
+            run_onboarding(force=False)
+        except Exception as _exc:
+            import logging
+            logging.getLogger(__name__).debug("Onboarding skipped: %s", _exc)
+
+        # ── Feature 16: macOS permission check ────────────────────────────────
+        try:
+            _check_macos_permissions(warn_only=True)
+        except Exception:
+            pass
+
+        # ── Feature 4+7: load PC profile and build capability summary ─────────
+        try:
+            _profile = _load_pc_profile()
+            self._capability_summary: str = build_capability_summary(_profile)
+        except Exception:
+            self._capability_summary = ""
+
+        # ── Feature 14: window manager ────────────────────────────────────────
+        try:
+            self._window_manager = WindowManager()
+        except Exception:
+            self._window_manager = None
         
         # Add summary cache tracking (fix 6.1, 11)
         self._summary_cache = OrderedDict()  # Fix 11
@@ -1902,6 +1965,55 @@ class NOVAApp:
         self.dispatcher.register("session.export", self._session_export_tool, ExportSessionArgs)
         self.dispatcher.register("assistant.set_mute", self._set_mute_tool, SetMuteArgs)
         self.dispatcher.register("assistant.mute_status", self._mute_status_tool, EmptyArgs)
+        # ── Feature 14: cross-platform window manager tools ───────────────────
+        if self._window_manager is not None:
+            self.dispatcher.register(
+                "window.list", lambda: self._window_manager.list_windows(), WindowListArgs,
+                description="List all visible windows on the desktop.",
+            )
+            self.dispatcher.register(
+                "window.focus", lambda title: self._window_manager.focus(title), WindowFocusArgs,
+                description="Bring a window to the foreground by title.",
+            )
+            self.dispatcher.register(
+                "window.resize",
+                lambda title, width, height: self._window_manager.resize(title, width, height),
+                WindowResizeWMArgs,
+                description="Resize a window to the specified pixel dimensions.",
+            )
+            self.dispatcher.register(
+                "window.close", lambda title: self._window_manager.close(title), WindowCloseArgs,
+                description="Close a window by title.",
+            )
+        # ── Feature 6: web scraper levels 3-4 ────────────────────────────────
+        self.dispatcher.register(
+            "web.scrape_js", scrape_js, ScrapeJsArgs,
+            description="Scrape a JS-rendered page using a headless browser (Playwright).",
+        )
+        self.dispatcher.register(
+            "web.scrape_visual",
+            lambda url: scrape_visual(url, omniparser_url=settings.OMNIPARSER_SERVER_URL),
+            ScrapeVisualArgs,
+            description="Screenshot a page and run OmniParser UI-element detection on it.",
+        )
+        # ── Feature 8: self-writing plugin generator ──────────────────────────
+        def _llm_for_plugin(system: str, user: str) -> str:
+            return "".join(
+                self.engine.ask_stream(prompt=user, system=system, history=[])
+            )
+        self._plugin_generator = PluginGenerator(
+            llm_callable=_llm_for_plugin,
+            dispatcher=self.dispatcher,
+        )
+        self.dispatcher.register(
+            "plugin.generate",
+            lambda description: self._plugin_generator.generate_and_propose(description),
+            PluginGenerateArgs,
+            description=(
+                "Generate a new NOVA plugin from a natural-language description. "
+                "The generated code is shown for human approval before being loaded."
+            ),
+        )
 
     def _context_messages(self, user_text: str) -> tuple[str, list[dict], list[dict]]:
         current_session = self.session.current
@@ -1973,6 +2085,7 @@ class NOVAApp:
             self.base_system_prompt,
             dispatcher=self.dispatcher,
             emotion=self.emotion.state,
+            capability_summary=self._capability_summary or None,
         )
 
         # Fix 2.9: Check total token count and trim if needed

@@ -16,6 +16,7 @@ BUILTIN_SERVICES = {
     "linear",
     "google_drive",
     "jira",
+    "home_assistant",  # Feature 9
 }
 
 
@@ -210,6 +211,8 @@ class MasterMCP:
             return self._gdrive_connector(api_key)
         if service == "jira":
             return self._jira_connector(api_key)
+        if service == "home_assistant":
+            return self._home_assistant_connector(api_key)
         raise ValueError(f"unsupported builtin service: {service}")
 
     @staticmethod
@@ -463,3 +466,114 @@ class MasterMCP:
 
         tools = [{"name": "search_issues", "description": "Search Jira issues by JQL."}]
         return tools, {"search_issues": search_issues}
+
+    def _home_assistant_connector(
+        self,
+        api_key: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Callable[..., Any]]]:
+        """Feature 9: Home Assistant REST API connector.
+
+        api_key format:  <base_url>|<long_lived_token>
+        e.g.  http://homeassistant.local:8123|eyJ...
+
+        The pipe separator lets connect_builtin receive everything in one string
+        without requiring a separate endpoint parameter.
+        """
+        if "|" in api_key:
+            base_url, token = api_key.split("|", 1)
+        else:
+            # Assume localhost HA with the entire string as the token
+            base_url = "http://homeassistant.local:8123"
+            token = api_key
+
+        base_url = base_url.rstrip("/")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        def get_state(entity_id: str) -> dict:
+            """Return the current state of a Home Assistant entity."""
+            response = self._request_with_retry(
+                method="get",
+                url=f"{base_url}/api/states/{entity_id}",
+                headers=headers,
+                timeout=10,
+            )
+            return self._safe_json(response)
+
+        def list_entities(domain: str = "") -> list:
+            """List all entities, optionally filtered by domain (e.g. 'light', 'switch')."""
+            response = self._request_with_retry(
+                method="get",
+                url=f"{base_url}/api/states",
+                headers=headers,
+                timeout=15,
+            )
+            try:
+                data = response.json()
+            except Exception:
+                return []
+            entities = [
+                {
+                    "entity_id": e.get("entity_id"),
+                    "state": e.get("state"),
+                    "friendly_name": e.get("attributes", {}).get("friendly_name"),
+                }
+                for e in (data if isinstance(data, list) else [])
+            ]
+            if domain:
+                entities = [e for e in entities if str(e.get("entity_id", "")).startswith(domain + ".")]
+            return entities
+
+        def call_service(
+            domain: str, service: str, entity_id: str = "", **extra
+        ) -> dict:
+            """Call a HA service (e.g. domain='light', service='turn_on', entity_id='light.living_room')."""
+            payload: dict[str, Any] = {**extra}
+            if entity_id:
+                payload["entity_id"] = entity_id
+            response = self._request_with_retry(
+                method="post",
+                url=f"{base_url}/api/services/{domain}/{service}",
+                headers=headers,
+                json=payload,
+                timeout=10,
+            )
+            try:
+                result = response.json()
+                return {"ok": True, "result": result}
+            except Exception:
+                return {"ok": response.ok, "status_code": response.status_code}
+
+        def get_history(entity_id: str, hours: int = 1) -> list:
+            """Return the state history for an entity over the last N hours."""
+            from datetime import datetime, timedelta, timezone
+            start = (datetime.now(timezone.utc) - timedelta(hours=max(1, hours))).isoformat()
+            response = self._request_with_retry(
+                method="get",
+                url=f"{base_url}/api/history/period/{start}",
+                headers=headers,
+                params={"filter_entity_id": entity_id},
+                timeout=15,
+            )
+            try:
+                data = response.json()
+                if isinstance(data, list) and data:
+                    return data[0]
+            except Exception:
+                pass
+            return []
+
+        tools = [
+            {"name": "get_state", "description": "Get current state of a Home Assistant entity."},
+            {"name": "list_entities", "description": "List Home Assistant entities, filtered by domain."},
+            {"name": "call_service", "description": "Call a Home Assistant service (e.g. turn lights on/off)."},
+            {"name": "get_history", "description": "Get state history for an entity over the last N hours."},
+        ]
+        return tools, {
+            "get_state": get_state,
+            "list_entities": list_entities,
+            "call_service": call_service,
+            "get_history": get_history,
+        }

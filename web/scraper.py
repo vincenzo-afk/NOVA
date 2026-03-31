@@ -140,3 +140,109 @@ def scrape_text(url: str) -> str:
     text = re.sub(r'\{[^{}]*"tool"\s*:\s*"[^"]+"[^{}]*\}', "", text, flags=re.IGNORECASE)
     
     return "[Content from web (untrusted)]\n" + text.strip()
+
+
+# ── Level 3: JS-rendered text extraction via Playwright ──────────────────────
+
+def scrape_js(url: str) -> str:
+    """Feature 6 Level 3: scrape fully JS-rendered page using Playwright browser.
+
+    Falls back to scrape_text() if Playwright is not installed.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return scrape_text(url)  # graceful fallback to L1/L2
+
+    # SSRF guard still applies
+    _validate_url(url)
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_default_timeout(20_000)
+            page.goto(url, wait_until="networkidle")
+            html = page.inner_text("body")
+        finally:
+            browser.close()
+
+    import re
+    from core.think.reasoning import detect_prompt_injection
+
+    html = re.sub(r"\[/?tool_call\]", "", html, flags=re.IGNORECASE)
+    if detect_prompt_injection(html):
+        return "[Content from web (untrusted) - BLOCKED: prompt injection detected]"
+    return "[Content from web (untrusted, JS-rendered)]\n" + html.strip()
+
+
+# ── Level 4: Visual page analysis via screenshot + OmniParser ────────────────
+
+def scrape_visual(
+    url: str,
+    omniparser_url: str = "http://localhost:8000",
+    return_screenshot_bytes: bool = False,
+) -> dict:
+    """Feature 6 Level 4: screenshot a page and run OmniParser UI element detection.
+
+    Returns:
+        {
+            "text": str,              # JS-rendered text (L3)
+            "ui_elements": [...],     # OmniParser-detected elements
+            "screenshot_path": str,   # saved PNG path (if saved)
+        }
+
+    Falls back gracefully when browser or OmniParser is unavailable.
+    """
+    result: dict = {"text": "", "ui_elements": [], "screenshot_path": None}
+
+    # Step 1 — JS-rendered text (L3)
+    try:
+        result["text"] = scrape_js(url)
+    except Exception as exc:
+        result["text"] = f"[scrape_js failed: {exc}]"
+
+    # Step 2 — Screenshot
+    screenshot_bytes: bytes | None = None
+    try:
+        from playwright.sync_api import sync_playwright
+
+        _validate_url(url)
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_default_timeout(20_000)
+                page.goto(url, wait_until="networkidle")
+                screenshot_bytes = page.screenshot(full_page=False)
+            finally:
+                browser.close()
+
+        # Optionally save
+        from pathlib import Path
+        import hashlib, time
+
+        assets_dir = Path("assets")
+        assets_dir.mkdir(exist_ok=True)
+        slug = hashlib.md5(url.encode()).hexdigest()[:8]
+        fname = assets_dir / f"scrape_{slug}_{int(time.time())}.png"
+        fname.write_bytes(screenshot_bytes)
+        result["screenshot_path"] = str(fname)
+
+    except ImportError:
+        pass  # Playwright not installed — skip screenshot
+    except Exception as exc:
+        result["screenshot_errors"] = str(exc)
+
+    # Step 3 — OmniParser element detection (L4)
+    if screenshot_bytes:
+        try:
+            from vision.omniparser import OmniParserClient
+
+            client = OmniParserClient(omniparser_url)
+            result["ui_elements"] = client.ui_elements(screenshot_bytes)
+        except Exception as exc:
+            result["omniparser_error"] = str(exc)
+
+    return result
+
