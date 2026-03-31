@@ -388,10 +388,17 @@ class NOVAApp:
         self._hard_cap_hit_date: date | None = None
         self._usage_lock = threading.Lock()  # Fix 3: Lock around usage caps
 
+        # Bug 1 fix: if the persisted usage was from a previous day, don't carry
+        # _hard_cap_hit forward — the user would be silently blocked all of day 2.
         total_today = self.usage.total_tokens_today(session_id=settings.DEFAULT_SESSION)
+        _today = date.today()
         if total_today >= settings.DAILY_TOKEN_HARD_CAP:
             self._hard_cap_hit = True
-            self._hard_cap_hit_date = date.today()
+            self._hard_cap_hit_date = _today
+        else:
+            # Ensure any stale flag from yesterday is cleared at startup.
+            self._hard_cap_hit = False
+            self._hard_cap_hit_date = None
         
         # Add summary cache tracking (fix 6.1, 11)
         self._summary_cache = OrderedDict()  # Fix 11
@@ -591,6 +598,8 @@ class NOVAApp:
         with self._browser_lock:
             self._browser_close()
         self._mouse_keyboard = None
+        # Bug 7 fix: reset omniparser client so it is not shared across sessions.
+        self._omniparser_client = None
         if getattr(self, "adb", None):
             try:
                 self.adb.device = None
@@ -1010,6 +1019,11 @@ class NOVAApp:
 
         future = self._goal_plan_executor.submit(background_plan)
         def _on_done(fut):
+            # Bug 6 fix: background_plan already decrements _goal_plan_jobs_inflight
+            # in its own finally path. _on_done is only invoked when the *future itself*
+            # raises (e.g. the executor aborted the callable), which means background_plan
+            # never ran and therefore never decremented. Only decrement here if the future
+            # raised — otherwise we'd double-decrement and the counter would go negative.
             try:
                 fut.result()
             except Exception as exc:
@@ -1020,6 +1034,8 @@ class NOVAApp:
                             item["last_result"] = {"status": "failed", "reason": f"planning_future_exception:{exc}"}
                             self._persist_goals()
                             break
+                # Only decrement here because background_plan did NOT run (future-level
+                # exception), so the counter was never incremented inside background_plan.
                 with self._goal_plan_submit_lock:
                     self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
         future.add_done_callback(_on_done)

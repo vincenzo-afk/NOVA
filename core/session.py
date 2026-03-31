@@ -101,7 +101,11 @@ class SessionManager:
             else:
                 tmp_path.replace(path)
             try:
-                backup_path.unlink(missing_ok=True)
+                # Bug 4 fix: only remove the backup AFTER confirming the new file was
+                # written successfully. If the write failed (disk full, permissions, etc.)
+                # the .bak is our only copy — never delete it unconditionally.
+                if path.exists() and path.stat().st_size > 0:
+                    backup_path.unlink(missing_ok=True)
             except Exception:
                 pass
         except Exception as exc:
