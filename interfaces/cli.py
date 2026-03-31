@@ -105,16 +105,6 @@ def run_cli(agent) -> None:
                     pass
                 break
             failed += 1
-            try:
-                lock_file.parent.mkdir(parents=True, exist_ok=True)
-                lock_until = time.time() + min(300, 2 ** failed)
-                lock_file.write_text(str(lock_until), encoding="utf-8")
-                try:
-                    lock_file.chmod(0o600)
-                except Exception:
-                    pass
-            except Exception:
-                pass
             delay = min(30, 2 ** failed)
             time.sleep(delay)
         else:
@@ -225,7 +215,10 @@ def run_cli(agent) -> None:
                 v = parts[1].strip().lower()
                 fmt = "json" if v == "json" else "md"
             console.print(f"Exporting as {fmt.upper()}...")
-            path = agent.export_session(fmt)
+            session = agent.session.current
+            with session._lock:
+                history_snapshot = list(session.history)
+            path = agent.export_session(fmt, history=history_snapshot)
             console.print(f"Exported session -> {path}")
             continue
 

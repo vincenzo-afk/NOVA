@@ -319,12 +319,14 @@ class Guardrails:
         primary, fallback = self._resolve_emergency_stop_files()
         try:
             primary.unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Failed to delete primary emergency stop file %s: %s", primary, exc)
         try:
             fallback.unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Failed to delete fallback emergency stop file %s: %s", fallback, exc)
 
     def is_emergency_stopped(self) -> bool:
         return self._emergency_stop.is_set()

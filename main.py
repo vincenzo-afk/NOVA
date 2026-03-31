@@ -468,6 +468,7 @@ class NOVAApp:
         self._goal_persist_interval_seconds = 0.5
         self._autonomy_stop = threading.Event()
         self._autonomy_thread: threading.Thread | None = None
+        self._barge_in_event = threading.Event()
         self._autonomy_start_lock = threading.Lock()
         self._boot_time = time.monotonic()
         self._emergency_hotkey_listener: Any | None = None
@@ -1339,8 +1340,9 @@ class NOVAApp:
         )
         try:
             self.omniparser.ensure_running()
-        except Exception:
-            pass
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("OmniParser startup check failed: %s", exc)
         self.health.start(interval_seconds=settings.HEALTH_MONITOR_INTERVAL)
 
     def _start_watchers_if_enabled(self) -> None:
@@ -1383,9 +1385,7 @@ class NOVAApp:
                     formatted.append(p.strip())
             hotkey_str = "+".join(formatted)
 
-            self._emergency_hotkey_listener = keyboard.GlobalHotKeys(
-                {hotkey_str: guardrails.emergency_stop}
-            )
+            self._emergency_hotkey_listener = keyboard.GlobalHotKeys({hotkey_str: self._barge_in_event.set})
             self._emergency_hotkey_listener.start()
         except Exception:
             self._emergency_hotkey_listener = None
@@ -2024,6 +2024,11 @@ class NOVAApp:
         allow_tools: bool = True,
         dry_run_tools: bool = False,
     ) -> Generator[str, None, None]:
+        command_response = self._apply_text_commands(user_text)
+        if command_response:
+            yield command_response
+            return
+
         today = date.today()
         hard_cap_active = False
         with self._usage_lock:
@@ -2033,11 +2038,6 @@ class NOVAApp:
             hard_cap_active = self._hard_cap_hit
         if hard_cap_active:
             yield f"Daily token hard cap of {settings.DAILY_TOKEN_HARD_CAP} reached. Further calls blocked."
-            return
-
-        command_response = self._apply_text_commands(user_text)
-        if command_response:
-            yield command_response
             return
 
         self.emotion.update_from_signal(user_text)

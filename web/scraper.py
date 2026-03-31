@@ -120,6 +120,8 @@ def scrape_text(url: str) -> str:
         break
     if response is None:
         raise ValueError("Failed to fetch URL")
+    if response.is_redirect or response.is_permanent_redirect:
+        raise ValueError("Too many redirects (limit=5)")
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
