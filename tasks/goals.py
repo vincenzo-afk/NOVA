@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from concurrent.futures import CancelledError, ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -66,12 +66,14 @@ class GoalRunner:
         self,
         dispatcher: Dispatcher,
         confirm_callback: Callable[[str], bool] | None = None,
+        force_confirm_medium: bool = False,
         step_delay_seconds: float = 0.0,
         step_timeout_seconds: float = 60.0,
         sleep_fn: Callable[[float], None] = time.sleep,
     ):
         self.dispatcher = dispatcher
         self.confirm_callback = confirm_callback  # fix 1.5
+        self.force_confirm_medium = force_confirm_medium
         self.step_delay_seconds = max(0.0, step_delay_seconds)  # fix 1.7
         self.step_timeout_seconds = max(1.0, float(step_timeout_seconds))
         self._sleep_fn = sleep_fn
@@ -81,9 +83,9 @@ class GoalRunner:
     def close(self) -> None:
         self._closed = True
         try:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor.shutdown(wait=True, cancel_futures=True)
         except TypeError:
-            self._executor.shutdown(wait=False)
+            self._executor.shutdown(wait=True)
 
     def run(
         self,
@@ -123,6 +125,10 @@ class GoalRunner:
             from safety.guardrails import guardrails
             call = ToolCall(tool=tool, args=args)
             risk = guardrails.check(call)
+            if self.force_confirm_medium and risk.level == "medium":
+                risk.level = "high"
+                risk.requires_confirmation = True
+                risk.auto_confirm_seconds = None
             authorized = guardrails.authorize(
                 call,
                 risk,
@@ -156,6 +162,13 @@ class GoalRunner:
                 )
             try:
                 result = future.result(timeout=self.step_timeout_seconds)
+            except CancelledError:
+                return GoalResult(
+                    status="failed",
+                    reason="step_cancelled",
+                    results=results,
+                    next_index=idx,
+                )
             except FuturesTimeout:
                 future.cancel()
                 return GoalResult(

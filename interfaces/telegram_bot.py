@@ -271,6 +271,10 @@ def run_telegram_bot(
     async def on_goal(update, context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
             return
+        user = update.effective_user
+        if user and not _allow_heavy_command(int(user.id)):
+            await update.message.reply_text("This command is rate-limited to 2 requests per minute.")
+            return
         text = " ".join(context.args).strip()
         if not text:
             await update.message.reply_text("Usage: /goal <goal description>")
@@ -287,6 +291,10 @@ def run_telegram_bot(
 
     async def on_resume_goal(update, context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
+            return
+        user = update.effective_user
+        if user and not _allow_heavy_command(int(user.id)):
+            await update.message.reply_text("This command is rate-limited to 2 requests per minute.")
             return
         if not context.args:
             await update.message.reply_text("Usage: /resume_goal <goal_id>")

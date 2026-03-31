@@ -51,6 +51,10 @@ def _emergency_stop_paths() -> tuple[Path, Path]:
     primary = Path(configured).expanduser()
     if not primary.is_absolute():
         primary = (Path.cwd() / primary).resolve()
+    home = Path.home().resolve()
+    cwd = Path.cwd().resolve()
+    if not str(primary).startswith(str(home)) and not str(primary).startswith(str(cwd)):
+        primary = (cwd / ".jarvis" / "emergency_stop").resolve()
     fallback = (Path.cwd() / ".jarvis" / "emergency_stop").resolve()
     return primary, fallback
 

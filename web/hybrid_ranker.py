@@ -14,7 +14,8 @@ class HybridRanker:
             return []
 
         if BM25Okapi is None:
-            return docs[:top_k]
+            ranked = sorted(docs, key=lambda d: self._jaccard(query, d), reverse=True)
+            return ranked[:top_k]
 
         tokenized = [d.lower().split() for d in docs]
         bm25 = BM25Okapi(tokenized)

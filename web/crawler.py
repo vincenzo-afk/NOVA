@@ -6,6 +6,7 @@ Fix 4.2: applies the same private IP guard from scraper.py before visiting any U
 from __future__ import annotations
 
 from urllib.parse import urljoin, urlparse
+from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
@@ -23,6 +24,25 @@ def crawl(seed_url: str, max_pages: int = 5, max_depth: int = 2) -> list[str]:
     seen: set[str] = set()
     queue: list[tuple[str, int]] = [(seed_url, 0)]
     pages: list[str] = []
+    robots: dict[str, RobotFileParser] = {}
+
+    def _allowed_by_robots(target_url: str) -> bool:
+        parsed = urlparse(target_url)
+        host_key = f"{parsed.scheme}://{parsed.netloc}"
+        parser = robots.get(host_key)
+        if parser is None:
+            parser = RobotFileParser()
+            parser.set_url(urljoin(host_key, "/robots.txt"))
+            try:
+                parser.read()
+            except Exception:
+                # Fail-open if robots cannot be fetched.
+                pass
+            robots[host_key] = parser
+        try:
+            return parser.can_fetch("NOVA/1.0", target_url)
+        except Exception:
+            return True
 
     while queue and len(pages) < max_pages:
         url, depth = queue.pop(0)
@@ -34,6 +54,8 @@ def crawl(seed_url: str, max_pages: int = 5, max_depth: int = 2) -> list[str]:
         try:
             _validate_url(url)
         except ValueError:
+            continue
+        if not _allowed_by_robots(url):
             continue
 
         try:

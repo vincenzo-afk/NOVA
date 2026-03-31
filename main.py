@@ -36,7 +36,7 @@ from core.memory.mem0_client import Mem0Client
 from core.memory.memory_router import MemoryRouter
 from core.plugin_loader import load_plugins
 from core.session import SessionManager
-from core.think.reasoning import build_system_prompt, clarifying_question, needs_clarification
+from core.think.reasoning import build_system_prompt, clarifying_question, detect_prompt_injection, needs_clarification
 from core.tools.dispatcher import Dispatcher
 from control.adb.adb_client import ADBClient
 from control.adb.qr_pairing import QRPairing
@@ -296,7 +296,7 @@ class GoalRunArgs(BaseModel):
 
 
 class GoalAddArgs(BaseModel):
-    goal: str = Field(..., min_length=1)
+    goal: str = Field(..., min_length=1, max_length=2000)
     max_steps: int = Field(default=20, ge=1, le=50)
 
 
@@ -370,7 +370,10 @@ class NOVAApp:
         self.scheduler = TaskScheduler()
         self.master_api = MasterAPI()
         self.master_mcp = MasterMCP()
-        self.session = SessionManager(default_name=settings.DEFAULT_SESSION)
+        self.session = SessionManager(
+            default_name=settings.DEFAULT_SESSION,
+            max_history_turns=settings.MAX_SESSION_HISTORY_TURNS,
+        )
         self._muted = False
         self.trimmer = ContextTrimmer(max_raw_turns=10)
         self.health = HealthMonitor(on_change=self._handle_health_event)
@@ -487,10 +490,11 @@ class NOVAApp:
         
         # Separate manual-goal execution from autonomy-goal execution to avoid cross-blocking.
         self._goal_execution_lock = threading.Semaphore(1)
-        self._autonomy_execution_lock = threading.Semaphore(1)
+        self._autonomy_execution_lock = self._goal_execution_lock
         self.goal_runner = GoalRunner(
             self.dispatcher,
             confirm_callback=self._interactive_confirm,
+            force_confirm_medium=False,
             step_timeout_seconds=settings.GOAL_STEP_TIMEOUT_SECONDS,
         )
 
@@ -503,14 +507,20 @@ class NOVAApp:
         self.autonomy_runner = GoalRunner(
             self.dispatcher,
             confirm_callback=self._autonomy_confirm_callback,
+            force_confirm_medium=True,
+            step_delay_seconds=max(0.1, float(settings.AUTONOMY_STEP_DELAY_SECONDS)),
             step_timeout_seconds=settings.GOAL_STEP_TIMEOUT_SECONDS,
         )
-        
-        try:
-            load_plugins(self.dispatcher)
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("Plugin loader failed: %s", exc)
+        self._last_sync_all_pending = 0.0
+        self._sync_all_inflight = False
+        self._sync_all_lock = threading.Lock()
+
+        if settings.PLUGINS_ENABLED:
+            try:
+                load_plugins(self.dispatcher)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("Plugin loader failed: %s", exc)
         try:
             self._start_health_monitoring()
         except Exception as exc:
@@ -592,6 +602,10 @@ class NOVAApp:
         with self.trimmer._lock:
             self.trimmer.summaries.pop(session_id, None)
             self.trimmer._last_summarized_count.pop(session_id, None)
+        with self._summary_submit_lock:
+            self._summary_last_trigger_count.pop(session_id, None)
+            self._summary_retry_after.pop(session_id, None)
+            self._last_snippet_hashes.pop(session_id, None)
 
     def list_goals(self) -> list[dict]:
         return self._list_goals()
@@ -890,6 +904,8 @@ class NOVAApp:
         return {"goal": goal, "status": "ok", "steps": steps, "raw": raw}
         
     def _add_goal(self, goal: str, max_steps: int = 20) -> dict:
+        if detect_prompt_injection(goal):
+            return {"status": "error", "reason": "goal_rejected_prompt_injection"}
         with self._goal_lock:
             pending_count = sum(1 for g in self._goals if g.get("status") in {"planning", "pending"})
             if pending_count >= self._max_pending_goals:
@@ -1101,8 +1117,10 @@ class NOVAApp:
                 try:
                     addrs = set(_resolve_host_with_timeout(parsed_host, timeout_seconds=5.0))
                     if not addrs:
-                        resolved_private = False
-                        raise RuntimeError("dns_resolution_timeout_or_failure")
+                        return {
+                            "status": "error",
+                            "reason": "dns_resolution_timeout_or_failure",
+                        }
                     resolved_private = True
                     for ip in addrs:
                         parsed_ip = ipaddress.ip_address(ip)
@@ -1113,7 +1131,10 @@ class NOVAApp:
                             resolved_private = False
                             break
                 except Exception:
-                    resolved_private = False
+                    return {
+                        "status": "error",
+                        "reason": "dns_resolution_timeout_or_failure",
+                    }
                 if not (is_local or resolved_private):
                     return {
                         "status": "error",
@@ -1228,11 +1249,15 @@ class NOVAApp:
                 return True
             try:
                 import requests as _req
-                resp = _req.get(
-                    f"{settings.OLLAMA_BASE_URL}/api/tags",
-                    timeout=5,
-                )
-                return resp.ok
+                base = settings.OLLAMA_BASE_URL.rstrip("/")
+                for path in ("/api/tags", "/health", "/v1/models"):
+                    try:
+                        resp = _req.get(f"{base}{path}", timeout=5)
+                        if resp.ok:
+                            return True
+                    except Exception:
+                        continue
+                return False
             except Exception:
                 return False
 
@@ -1353,7 +1378,7 @@ class NOVAApp:
                 _ = (app, format, args)
                 return
 
-        server = ThreadingHTTPServer(("0.0.0.0", int(settings.NOVA_HEALTH_PORT)), _ProbeHandler)
+        server = ThreadingHTTPServer((str(settings.NOVA_HEALTH_BIND_HOST), int(settings.NOVA_HEALTH_PORT)), _ProbeHandler)
         server.daemon_threads = True
         self._health_http_server = server
         self._health_http_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1405,6 +1430,10 @@ class NOVAApp:
             
             approved_for_step = goal.get("status") == "approved_for_step"
             with self._autonomy_execution_lock:
+                with self._goal_lock:
+                    current = next((g for g in self._goals if g.get("id") == goal.get("id")), None)
+                    if current and current.get("status") == "cancelled":
+                        continue
                 if approved_for_step:
                     if start_index >= len(steps):
                         result = GoalResult(status="completed", reason="no_remaining_steps", results=[], next_index=len(steps))
@@ -1873,7 +1902,8 @@ class NOVAApp:
             with self.trimmer._lock:
                 self.trimmer.summaries[session_id] = summary
             with self._summary_submit_lock:
-                self._summary_retry_after.pop(session_id, None)
+                # Cool down re-summarization churn after a successful summary.
+                self._summary_retry_after[session_id] = time.time() + 30.0
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning("Summarizer thread failed unconditionally: %s", e)
@@ -1968,7 +1998,7 @@ class NOVAApp:
         self.emotion.update_from_signal(user_text)
         self.memory.set_online(NetworkState.is_online())
         if self.memory.online:
-            self.memory.sync_all_pending()
+            self._schedule_sync_all_pending()
 
         if needs_clarification(user_text):
             question = clarifying_question(user_text)
@@ -2090,13 +2120,12 @@ class NOVAApp:
         input_tokens += sum(estimate_tokens(str(m.get("content", ""))) for m in history)
         output_tokens = estimate_tokens(assistant_text)
 
-        session_id = self.session.current.session_id
-        provider = self.engine.last_provider
         today = day_anchor or date.today()
-        self.usage.add(provider, input_tokens, output_tokens, session_id=session_id, when=today)
-        total = self.usage.total_tokens_today(session_id=session_id)
-
         with self._usage_lock:
+            session_id = self.session.current.session_id
+            provider = self.engine.last_provider
+            self.usage.add(provider, input_tokens, output_tokens, session_id=session_id, when=today)
+            total = self.usage.total_tokens_today(session_id=session_id)
             if self._hard_cap_hit_date != today:
                 self._hard_cap_hit = False
                 self._hard_cap_hit_date = None
@@ -2131,6 +2160,31 @@ class NOVAApp:
                 if total >= settings.DAILY_TOKEN_ALERT_THRESHOLD:
                     print(f"\n[usage] Warning: daily token usage {total} exceeded threshold {settings.DAILY_TOKEN_ALERT_THRESHOLD}.")
                     self._usage_alerted_day = today
+
+    def _schedule_sync_all_pending(self) -> None:
+        now = time.monotonic()
+        with self._sync_all_lock:
+            if self._sync_all_inflight:
+                return
+            if now - self._last_sync_all_pending < 15.0:
+                return
+            self._sync_all_inflight = True
+            self._last_sync_all_pending = now
+
+        def _job() -> None:
+            try:
+                self.memory.sync_all_pending()
+            except Exception:
+                pass
+            finally:
+                with self._sync_all_lock:
+                    self._sync_all_inflight = False
+
+        try:
+            self._memory_executor.submit(_job)
+        except Exception:
+            with self._sync_all_lock:
+                self._sync_all_inflight = False
 
     def _interactive_confirm(self, prompt: str) -> bool:
         try:

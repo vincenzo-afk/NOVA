@@ -91,3 +91,40 @@ def schedule_daily_backup(
     except Exception:
         # Non-fatal — best-effort
         pass
+
+
+def restore_chromadb(snapshot_path: str, chroma_dir: str = ".jarvis_chroma") -> str:
+    """Restore a ChromaDB snapshot produced by `_backup_chromadb`.
+
+    Returns a status string: "ok:<collection_count>" or "restore_failed:<reason>".
+    """
+    try:
+        import chromadb
+        data = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
+        collections = data.get("collections", {})
+        if not isinstance(collections, dict):
+            return "restore_failed:invalid_snapshot_format"
+
+        import os
+        host = os.getenv("CHROMA_HOST")
+        port = os.getenv("CHROMA_PORT")
+        if host and port:
+            client = chromadb.HttpClient(host=host, port=port)
+        else:
+            client = chromadb.PersistentClient(path=chroma_dir)
+
+        restored = 0
+        for name, payload in collections.items():
+            if not isinstance(payload, dict):
+                continue
+            ids = payload.get("ids") or []
+            docs = payload.get("documents") or []
+            metas = payload.get("metadatas") or []
+            if not ids or not docs:
+                continue
+            collection = client.get_or_create_collection(name)
+            collection.upsert(ids=ids, documents=docs, metadatas=metas)
+            restored += 1
+        return f"ok:{restored}"
+    except Exception as exc:
+        return f"restore_failed:{exc}"

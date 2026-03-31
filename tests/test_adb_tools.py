@@ -98,25 +98,13 @@ def test_adb_client_send_sms_builds_structured_args(monkeypatch):
     monkeypatch.setattr("config.settings.settings.ALLOWED_PHONE_NUMBERS", [])
     monkeypatch.setattr(adb, "shell", lambda *args: calls.append(args) or "ok")
 
-    out = adb.send_sms("+15551230000", "hello world")
-
-    assert out == "ok"
-    assert calls == [
-        (
-            "am",
-            "start",
-            "-a",
-            "android.intent.action.SENDTO",
-            "-d",
-            "sms:+15551230000",
-            "--es",
-            "sms_body",
-            "hello world",
-            "--ez",
-            "exit_on_sent",
-            "true",
-        )
-    ]
+    try:
+        adb.send_sms("+15551230000", "hello world")
+    except ValueError as exc:
+        assert "ALLOWED_PHONE_NUMBERS is empty" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError when ALLOWED_PHONE_NUMBERS is empty")
+    assert calls == []
 
 
 def test_adb_client_notifications_dump_calls_dumpsys(monkeypatch):
