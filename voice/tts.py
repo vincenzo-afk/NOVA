@@ -178,7 +178,10 @@ def speak(
                 try:
                     _play(path, stop_event=stop_event)
                 except TypeError:
-                    _play(path)
+                    try:
+                        _play(path, stop_event)
+                    except TypeError:
+                        _play(path)
                 return
             finally:
                 with contextlib.suppress(Exception):
@@ -191,6 +194,7 @@ def speak(
     try:
         gtts_result = _speak_with_gtts(clean, lang=lang, stop_event=stop_event)
     except TypeError:
+        # Compatibility path for legacy test doubles/helpers without stop_event.
         gtts_result = _speak_with_gtts(clean, lang=lang)
     if gtts_result:
         return

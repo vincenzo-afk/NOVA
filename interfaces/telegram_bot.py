@@ -30,6 +30,7 @@ _log = get_logger(__name__)
 _TELEGRAM_RATE_WINDOW_SECONDS = 60
 _TELEGRAM_RATE_LIMIT = 12
 _TELEGRAM_HEAVY_RATE_LIMIT = 2
+_RATE_LIMIT_MSG = "Too many commands too quickly. Please slow down for a minute."
 
 
 def is_whitelisted(user_id: str | int, allowed_chat_id: str | None = None) -> bool:
@@ -217,7 +218,7 @@ def run_telegram_bot(
             return False
         if not _allow_command(int(user.id)):
             if update.message:
-                await update.message.reply_text("Too many commands too quickly. Please slow down for a minute.")
+                await update.message.reply_text(_RATE_LIMIT_MSG)
             return False
         return authorized
 

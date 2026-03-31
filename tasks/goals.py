@@ -96,6 +96,7 @@ class GoalRunner:
         start_index: int = 0,
         on_step: Callable[[int, dict[str, Any]], None] | None = None,
         confirm_callback: Callable[[str], bool] | None = None,
+        should_continue: Callable[[], bool] | None = None,
     ) -> GoalResult:
         guard = GoalRun(max_steps=max_steps)
         results: list[dict] = []
@@ -107,6 +108,22 @@ class GoalRunner:
             return GoalResult(status="completed", reason="no_remaining_steps", results=[], next_index=start_index)
 
         for idx, step in enumerate(indexed_steps[start_index:], start=start_index):
+            if should_continue is not None:
+                try:
+                    if not should_continue():
+                        return GoalResult(
+                            status="cancelled",
+                            reason="cancelled_by_user",
+                            results=results,
+                            next_index=idx,
+                        )
+                except Exception:
+                    return GoalResult(
+                        status="failed",
+                        reason="cancellation_check_failed",
+                        results=results,
+                        next_index=idx,
+                    )
             tool = step.get("tool") or step.get("name")
             args = step.get("args") or {}
             if not tool:

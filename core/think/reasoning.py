@@ -64,12 +64,15 @@ def ambiguity_score(user_text: str) -> float:
     action_hits = sum(1 for t in tokens if t in _ACTION_VERBS)
 
     score = 0.0
-    if token_count <= 3:
+    # Only treat short messages as highly ambiguous when they combine an action
+    # with an ambiguous reference (e.g. "delete this", "send that").
+    if token_count <= 3 and action_hits > 0 and ambiguous_hits > 0:
         score += 0.35
-    if ambiguous_hits > 0:
+    if ambiguous_hits > 0 and action_hits > 0:
         score += min(0.4, ambiguous_hits * 0.15)
-    if action_hits > 0 and ambiguous_hits > 0:
         score += 0.25
+    elif ambiguous_hits > 0:
+        score += min(0.2, ambiguous_hits * 0.08)
     if "?" in text:
         score -= 0.1
 
