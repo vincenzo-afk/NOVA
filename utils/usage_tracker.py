@@ -24,6 +24,8 @@ class UsageTracker:
         self._max_days = 8
         self._persist_path = Path(persist_path) if persist_path else None
         self._lock = threading.RLock()
+        self._persist_timer: threading.Timer | None = None
+        self._persist_interval_seconds = 2.0
         self._load()
 
     def _load(self) -> None:
@@ -63,6 +65,22 @@ class UsageTracker:
         except Exception:
             pass
 
+    def _schedule_persist(self) -> None:
+        if self._persist_path is None:
+            return
+        if self._persist_timer and self._persist_timer.is_alive():
+            return
+
+        def _flush() -> None:
+            with self._lock:
+                self._persist_timer = None
+                self._persist()
+
+        timer = threading.Timer(self._persist_interval_seconds, _flush)
+        timer.daemon = True
+        self._persist_timer = timer
+        timer.start()
+
     def add(
         self,
         provider: str,
@@ -80,6 +98,14 @@ class UsageTracker:
             entry = self._daily[today][session_id][provider]
             entry.input_tokens += input_tokens
             entry.output_tokens += output_tokens
+            self._schedule_persist()
+
+    def flush(self) -> None:
+        with self._lock:
+            timer = self._persist_timer
+            self._persist_timer = None
+            if timer and timer.is_alive():
+                timer.cancel()
             self._persist()
 
     def today_summary(self, session_id: str | None = None) -> dict[str, dict[str, int]]:

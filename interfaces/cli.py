@@ -98,6 +98,12 @@ def run_cli(agent) -> None:
                     pass
                 break
             failed += 1
+            try:
+                lock_file.parent.mkdir(parents=True, exist_ok=True)
+                lock_until = time.time() + min(300, 2 ** failed)
+                lock_file.write_text(str(lock_until), encoding="utf-8")
+            except Exception:
+                pass
             delay = min(30, 2 ** failed)
             time.sleep(delay)
         else:

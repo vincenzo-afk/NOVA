@@ -36,6 +36,7 @@ class Dispatcher:
     def __init__(self, rate_limit_rpm: int = 120):
         self.registry: dict[str, Callable[..., Any]] = {}
         self.schemas: dict[str, type[BaseModel]] = {}
+        self.descriptions: dict[str, str] = {}
 
         # Fix Perf 3 & Bug 10: Token bucket for rate limiting tool executions with Lock
         self._max_tokens = rate_limit_rpm
@@ -62,10 +63,18 @@ class Dispatcher:
                 )
             self._tokens -= 1.0
 
-    def register(self, name: str, fn: Callable[..., Any], schema: type[BaseModel]) -> None:
+    def register(
+        self,
+        name: str,
+        fn: Callable[..., Any],
+        schema: type[BaseModel],
+        description: str | None = None,
+    ) -> None:
         self._validate_registration_signature(name=name, fn=fn, schema=schema)
         self.registry[name] = fn
         self.schemas[name] = schema
+        if description:
+            self.descriptions[name] = description
 
     @staticmethod
     def _validate_registration_signature(
@@ -90,7 +99,11 @@ class Dispatcher:
 
     def get_tool_schema_prompt(self) -> str:
         tools = [
-            {"tool": name, "args": model.model_json_schema()}
+            {
+                "tool": name,
+                "args": model.model_json_schema(),
+                **({"description": self.descriptions.get(name)} if self.descriptions.get(name) else {}),
+            }
             for name, model in self.schemas.items()
         ]
         return (

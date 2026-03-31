@@ -36,7 +36,19 @@ def _safe_env(extra_pythonpath: str = "", auth_token: str = "") -> dict[str, str
     Only passes PATH, PYTHONPATH, and HOME — never any API keys or tokens.
     """
     safe: dict[str, str] = {}
-    for key in ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "USERPROFILE", "LANG", "LC_ALL", "LC_CTYPE"):
+    for key in (
+        "PATH",
+        "HOME",
+        "XDG_CACHE_HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SYSTEMROOT",
+        "USERPROFILE",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+    ):
         val = os.environ.get(key)
         if val:
             safe[key] = val

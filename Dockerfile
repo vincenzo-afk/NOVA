@@ -49,6 +49,6 @@ ENV PYTHONUNBUFFERED=1 \
     AUTONOMY_ENABLED=false
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD ps aux | grep 'python3 main.py' | grep -v grep || exit 1
+    CMD curl -fsS "http://localhost:${NOVA_HEALTH_PORT:-8765}/health" || exit 1
 
 CMD ["python3", "main.py"]

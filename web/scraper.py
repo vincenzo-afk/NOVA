@@ -51,8 +51,13 @@ def _is_private_ip(ip: str) -> bool:
 
 def _resolve_host(hostname: str, timeout_seconds: float = 5.0) -> list[str]:
     def _run() -> list[str]:
-        addr_info = socket.getaddrinfo(hostname, None)
-        return [info[4][0] for info in addr_info]
+        previous_timeout = socket.getdefaulttimeout()
+        try:
+            socket.setdefaulttimeout(timeout_seconds)
+            addr_info = socket.getaddrinfo(hostname, None)
+            return [info[4][0] for info in addr_info]
+        finally:
+            socket.setdefaulttimeout(previous_timeout)
 
     pool = ThreadPoolExecutor(max_workers=1)
     fut = pool.submit(_run)

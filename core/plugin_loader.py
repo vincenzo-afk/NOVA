@@ -56,7 +56,7 @@ def _restricted_import(name: str, *args, **kwargs):
 
 def _check_ast(source: str):
     tree = ast.parse(source)
-    restricted = {"__class__", "__mro__", "__subclasses__", "__globals__", "__builtins__", "eval", "exec"}
+    restricted = {"__class__", "__mro__", "__subclasses__", "__globals__", "__builtins__", "eval", "exec", "compile", "getattr", "setattr", "delattr"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in restricted:
             raise ValueError(f"Restricted identifier used: {node.id}")

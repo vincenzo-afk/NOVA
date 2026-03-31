@@ -22,8 +22,14 @@ def _backup_chromadb(chroma_dir: str = ".jarvis_chroma", export_dir: str = "expo
     """
     try:
         import chromadb
-
-        client = chromadb.PersistentClient(path=chroma_dir)
+        import os
+        
+        host = os.getenv("CHROMA_HOST")
+        port = os.getenv("CHROMA_PORT")
+        if host and port:
+            client = chromadb.HttpClient(host=host, port=port)
+        else:
+            client = chromadb.PersistentClient(path=chroma_dir)
         collections = client.list_collections()
         snapshot: dict = {"timestamp": time.time(), "collections": {}}
 

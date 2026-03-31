@@ -1,4 +1,4 @@
-# JARVIS — Autonomous AI Agent · Build Roadmap v4
+# NOVA — Autonomous AI Agent · Build Roadmap v4
 
 > One Python project. Every feature. Every gap filled. All fixes integrated. Built phase by phase, always testable.
 
@@ -151,7 +151,7 @@ PORCUPINE_SENSITIVITY=0.6
 
 # Telegram
 TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=                      # whitelist — only this ID can message JARVIS
+TELEGRAM_CHAT_ID=                      # whitelist — only this ID can message NOVA
 
 # ADB
 TAILSCALE_PHONE_IP=
@@ -239,12 +239,12 @@ Each phase produces something **fully working and testable** before you move on.
    - Tokens print live as generator yields
    - Shows which provider answered (e.g., `[cloud • key_2]` or `[local • ollama]`)
 
-**Testable milestone:** Tokens stream live. Ambiguous command → JARVIS asks before acting. Kill internet → Ollama takes over. Rate-limit a key → recovers after TTL without restart. Missing `.env` key → clear startup error, not a mysterious crash 10 minutes in.
+**Testable milestone:** Tokens stream live. Ambiguous command → NOVA asks before acting. Kill internet → Ollama takes over. Rate-limit a key → recovers after TTL without restart. Missing `.env` key → clear startup error, not a mysterious crash 10 minutes in.
 
 ---
 
 ### ✅ PHASE 2 — Memory Layer
-**Goal:** JARVIS remembers everything and never overflows its context window.
+**Goal:** NOVA remembers everything and never overflows its context window.
 
 **Features built:**
 - `[9]` Memory (mem0 + ChromaDB)
@@ -294,12 +294,12 @@ Each phase produces something **fully working and testable** before you move on.
    - Named sessions: `jarvis_work`, `jarvis_personal` — separate mem0 user IDs
    - Switch: *"switch to work mode"* → loads correct session memories
 
-**Testable milestone:** Tell JARVIS your name → close and reopen → remembered. 100-turn conversation → no crash, no silent truncation. Search for something from turn 50 → exact recall via BM25 hybrid. Two sessions → memories properly isolated.
+**Testable milestone:** Tell NOVA your name → close and reopen → remembered. 100-turn conversation → no crash, no silent truncation. Search for something from turn 50 → exact recall via BM25 hybrid. Two sessions → memories properly isolated.
 
 ---
 
 ### ✅ PHASE 3 — Voice Layer
-**Goal:** Talk to JARVIS hands-free. Works fully offline. Supports Tamil.
+**Goal:** Talk to NOVA hands-free. Works fully offline. Supports Tamil.
 
 **Features built:**
 - `[11]` STT (online + offline + multilingual)
@@ -317,8 +317,8 @@ Each phase produces something **fully working and testable** before you move on.
    - Without this, STT has no idea when you finished speaking
 
 2. **`voice/wakeword.py`** — Porcupine background thread:
-   - Wake word: *"Hey JARVIS"* loaded from `PORCUPINE_KEYWORD_PATH` in `.env`
-   - **"Hey JARVIS" is NOT a built-in keyword** — requires a `.ppn` file downloaded from console.picovoice.ai
+   - Wake word: *"Hey NOVA"* loaded from `PORCUPINE_KEYWORD_PATH` in `.env`
+   - **"Hey NOVA" is NOT a built-in keyword** — requires a `.ppn` file downloaded from console.picovoice.ai
    - `setup.py` will remind you to download it; the file goes in `assets/`
    - On detection → fires callback to VAD → begin voice capture
    - Sensitivity controlled by `PORCUPINE_SENSITIVITY` (default: 0.6)
@@ -364,15 +364,15 @@ Each phase produces something **fully working and testable** before you move on.
 
 8. **`interfaces/voice_interface.py`** — full loop:
    - Wakeword → VAD captures until silence → STT (auto online/offline) → LLM stream → TTS (auto online/offline/Tamil)
-   - Barge-in: hotkey mid-speech stops JARVIS and re-listens
-   - Self-mute: wakeword disabled while JARVIS is speaking
+   - Barge-in: hotkey mid-speech stops NOVA and re-listens
+   - Self-mute: wakeword disabled while NOVA is speaking
 
-**Testable milestone:** Say *"Hey JARVIS"* → speak freely → it waits for silence before responding. Speak Tamil → responds in Tamil. Offline → full voice loop on local models. Never cuts you off mid-sentence, never records forever.
+**Testable milestone:** Say *"Hey NOVA"* → speak freely → it waits for silence before responding. Speak Tamil → responds in Tamil. Offline → full voice loop on local models. Never cuts you off mid-sentence, never records forever.
 
 ---
 
 ### ✅ PHASE 4 — Eyes (Screen Vision + Prediction)
-**Goal:** JARVIS sees your screen and acts proactively. OmniParser managed automatically.
+**Goal:** NOVA sees your screen and acts proactively. OmniParser managed automatically.
 
 **Features built:**
 - `[14]` Screen access
@@ -383,7 +383,7 @@ Each phase produces something **fully working and testable** before you move on.
 **What you build:**
 
 1. **`vision/omniparser_server.py`** — OmniParser lifecycle manager:
-   - On JARVIS boot → check if OmniParser server is running
+   - On NOVA boot → check if OmniParser server is running
    - If not → launch as subprocess automatically
    - Configured via `OMNIPARSER_SERVER_URL=http://localhost:8000`
    - `core/health.py` pings it every 60s → auto-restarts if down
@@ -407,14 +407,14 @@ Each phase produces something **fully working and testable** before you move on.
 
 6. **Multi-modal user input** (GUI + Telegram):
    - User can send/upload an image → Gemini Vision analyzes it → enters conversation context
-   - *"Here's a screenshot of the bug"* → JARVIS reasons about it
+   - *"Here's a screenshot of the bug"* → NOVA reasons about it
 
-**Testable milestone:** Boot JARVIS → OmniParser starts automatically. Kill its process → health monitor restarts it. Open an error dialog → JARVIS proactively speaks up. Send a screenshot in Telegram → JARVIS analyzes it.
+**Testable milestone:** Boot NOVA → OmniParser starts automatically. Kill its process → health monitor restarts it. Open an error dialog → NOVA proactively speaks up. Send a screenshot in Telegram → NOVA analyzes it.
 
 ---
 
 ### ✅ PHASE 5 — Hands + Documents (PC Control + RAG)
-**Goal:** JARVIS operates your PC and reads your documents intelligently.
+**Goal:** NOVA operates your PC and reads your documents intelligently.
 
 **Features built:**
 - `[17]` Mouse & keyboard
@@ -554,12 +554,12 @@ Each phase produces something **fully working and testable** before you move on.
    - `list_docs()` — show all ingested documents
    - *"Read this PDF and summarize section 3"* → fully handled end-to-end
 
-**Testable milestone:** *"Open Chrome and find the asyncio docs"* → fully autonomous. *"Read my project_brief.pdf and tell me the key requirements"* → JARVIS ingests, queries, and answers. Dangerous command (e.g., delete a folder) → safety stub prompts for confirmation.
+**Testable milestone:** *"Open Chrome and find the asyncio docs"* → fully autonomous. *"Read my project_brief.pdf and tell me the key requirements"* → NOVA ingests, queries, and answers. Dangerous command (e.g., delete a folder) → safety stub prompts for confirmation.
 
 ---
 
 ### ✅ PHASE 6 — Interfaces, Tray & Startup
-**Goal:** JARVIS on every surface, always running, with full visibility.
+**Goal:** NOVA on every surface, always running, with full visibility.
 
 **Features built:**
 - `[13]` GUI, CLI, Telegram, Voice interfaces
@@ -623,12 +623,12 @@ Each phase produces something **fully working and testable** before you move on.
 
 6. **Startup**: Win32 registry + watchdog process
 
-**Testable milestone:** Boot PC → JARVIS in tray. Telegram only responds to your chat ID. The "typing" cursor effect appears in Telegram as JARVIS generates. Export conversation → readable Markdown file. Tray tooltip shows live usage.
+**Testable milestone:** Boot PC → NOVA in tray. Telegram only responds to your chat ID. The "typing" cursor effect appears in Telegram as NOVA generates. Export conversation → readable Markdown file. Tray tooltip shows live usage.
 
 ---
 
 ### ✅ PHASE 7 — Scheduler, Goals & Autonomy
-**Goal:** JARVIS works while you're away.
+**Goal:** NOVA works while you're away.
 
 **Features built:**
 - `[20]` Scheduled tasks
@@ -653,12 +653,12 @@ Each phase produces something **fully working and testable** before you move on.
    - Reports completion via TTS (local) or Telegram (away)
    - Configurable max autonomy depth (how many steps before checking in)
 
-**Testable milestone:** *"Every morning at 8 summarize my emails"* → runs next morning unattended. Long-running goal hits step limit → JARVIS pauses and asks, doesn't loop forever.
+**Testable milestone:** *"Every morning at 8 summarize my emails"* → runs next morning unattended. Long-running goal hits step limit → NOVA pauses and asks, doesn't loop forever.
 
 ---
 
 ### ✅ PHASE 8 — Android Control + QR Pairing
-**Goal:** JARVIS controls your Android from anywhere. Pair with a single QR scan.
+**Goal:** NOVA controls your Android from anywhere. Pair with a single QR scan.
 
 **Features built:**
 - `[5]` ADB with Tailscale
@@ -672,7 +672,7 @@ Each phase produces something **fully working and testable** before you move on.
    - Reconnect if tunnel drops
 
 2. **`control/adb/qr_pairing.py`** — smart ADB pairing:
-   - Run `adb tcpip 5555` on JARVIS PC
+   - Run `adb tcpip 5555` on NOVA PC
    - **Mode detection**:
      - Same network → use local DHCP IP (`socket.connect("8.8.8.8")`)
      - Remote network → use Tailscale IP
@@ -695,12 +695,12 @@ Each phase produces something **fully working and testable** before you move on.
    - Incoming call detected → TTS: *"Incoming call from X — answer?"*
    - New notifications → summarized proactively
 
-**Testable milestone:** Open tray → *"Show ADB QR"* → scan with phone → connected. *"Send WhatsApp to [contact] saying I'll be late"* → done. Incoming call → JARVIS announces it.
+**Testable milestone:** Open tray → *"Show ADB QR"* → scan with phone → connected. *"Send WhatsApp to [contact] saying I'll be late"* → done. Incoming call → NOVA announces it.
 
 ---
 
 ### ✅ PHASE 9 — Emotion Engine
-**Goal:** JARVIS has a personality that feels alive.
+**Goal:** NOVA has a personality that feels alive.
 
 **Features built:**
 - `[15]` Engine with emotion
@@ -719,7 +719,7 @@ Each phase produces something **fully working and testable** before you move on.
 ---
 
 ### ✅ PHASE 10 — Master MCP, Master API & Plugins
-**Goal:** Give JARVIS any API key and it figures out the rest.
+**Goal:** Give NOVA any API key and it figures out the rest.
 
 **Features built:**
 - `[24]` Master MCP
@@ -751,7 +751,7 @@ Each phase produces something **fully working and testable** before you move on.
 ---
 
 ### ✅ PHASE 11 — Safety Layer
-**Goal:** JARVIS never acts destructively without explicit confirmation.
+**Goal:** NOVA never acts destructively without explicit confirmation.
 
 **Features built:**
 - `[28]` Safety
@@ -765,7 +765,7 @@ Each phase produces something **fully working and testable** before you move on.
    - High (7–10): explicit confirmation, no timeout
    - Destructive action list: always High regardless of context
    - Dry-run mode: full plan explained without any execution
-   - Emergency stop: voice *"JARVIS stop"* or `Ctrl+Shift+X`
+   - Emergency stop: voice *"NOVA stop"* or `Ctrl+Shift+X`
    - Full action log: timestamp, tool, args, risk, who confirmed, result
 
 2. **Retrofit**: remove the safety stub from `dispatcher.py` and replace with:
@@ -857,7 +857,7 @@ Each phase produces something **fully working and testable** before you move on.
    # 7. Porcupine wake word reminder
    print("\n⚠️  Wake word setup required:")
    print("   1. Go to console.picovoice.ai")
-   print("   2. Create a custom 'Hey JARVIS' keyword for your OS")
+   print("   2. Create a custom 'Hey NOVA' keyword for your OS")
    print("   3. Download the .ppn file")
    print("   4. Place it at: assets/Hey-Jarvis_en_windows_v3_0_0.ppn")
    print("   5. Confirm the path matches PORCUPINE_KEYWORD_PATH in your .env")
@@ -875,7 +875,7 @@ Each phase produces something **fully working and testable** before you move on.
    - Integration: full conversation loop, tool call → validation → safety check → execution
    - Run: `pytest tests/ -v`
 
-**Testable milestone:** `python setup.py` on fresh Windows machine → JARVIS running in <5 minutes. Full test suite passes.
+**Testable milestone:** `python setup.py` on fresh Windows machine → NOVA running in <5 minutes. Full test suite passes.
 
 ---
 
@@ -987,7 +987,7 @@ pytest
 
 ---
 
-## The 6 Laws of Building JARVIS
+## The 6 Laws of Building NOVA
 
 1. **Never skip the test milestone** — if the milestone doesn't pass, the next phase breaks harder
 2. **LLM is the orchestrator, not the executor** — LLM decides what to do, modules do the actual work. Never execute raw LLM-generated Python
@@ -1003,4 +1003,4 @@ pytest
 *Phase 8 → controls your phone from anywhere on Earth.*
 *Phase 10 → infinitely extensible with any service or custom capability.*
 *Phase 12 → production-reliable, self-healing, 24/7.*
-*All 13 → JARVIS.*
+*All 13 → NOVA.*

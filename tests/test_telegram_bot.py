@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from interfaces.telegram_bot import format_status_message, telegram_photo_from_png
+from interfaces.telegram_bot import format_status_message, is_whitelisted, telegram_photo_from_png
 
 
 def test_format_status_message_renders_table_like_summary():
@@ -30,3 +30,14 @@ def test_telegram_photo_from_png_creates_named_buffer():
     buffer = telegram_photo_from_png(b"fake-png", filename="screen.png")
     assert buffer.name == "screen.png"
     assert buffer.read() == b"fake-png"
+
+
+def test_is_whitelisted_accepts_int_and_string_ids():
+    assert is_whitelisted(12345, allowed_chat_id="12345")
+    assert is_whitelisted("12345", allowed_chat_id="12345")
+
+
+def test_is_whitelisted_rejects_non_matching_and_invalid_values():
+    assert not is_whitelisted(12345, allowed_chat_id="999")
+    assert not is_whitelisted("abc", allowed_chat_id="12345")
+    assert not is_whitelisted(12345, allowed_chat_id="")
