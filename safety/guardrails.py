@@ -62,6 +62,7 @@ def _emergency_stop_paths() -> tuple[Path, Path]:
 # Backward-compatible module-level aliases for tests/patching.
 _EMERGENCY_STOP_FILE: Path | None = None
 _EMERGENCY_STOP_FILE_FALLBACK: Path | None = None
+_GUARDRAILS_LOGURU_SINK_ID: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -146,18 +147,23 @@ class Guardrails:
         global _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK
         if _EMERGENCY_STOP_FILE is None or _EMERGENCY_STOP_FILE_FALLBACK is None:
             _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths()
-        self._emergency_stop_file = _EMERGENCY_STOP_FILE
-        self._emergency_stop_file_fallback = _EMERGENCY_STOP_FILE_FALLBACK
-        if self._emergency_stop_file.exists() or self._emergency_stop_file_fallback.exists():
+        primary, fallback = self._resolve_emergency_stop_files()
+        if primary.exists() or fallback.exists():
             self._emergency_stop.set()
 
         # Fix 2.12: use loguru rotating sink (10 MB / 7 days)
         self._init_rotating_log()
 
     def _init_rotating_log(self) -> None:
+        global _GUARDRAILS_LOGURU_SINK_ID
         try:
             from loguru import logger as _lg
-            _lg.add(
+            if _GUARDRAILS_LOGURU_SINK_ID is not None:
+                try:
+                    _lg.remove(_GUARDRAILS_LOGURU_SINK_ID)
+                except Exception:
+                    pass
+            _GUARDRAILS_LOGURU_SINK_ID = _lg.add(
                 str(self._log_path),
                 rotation="10 MB",
                 retention="7 days",
@@ -169,6 +175,13 @@ class Guardrails:
             self._loguru_logger = _lg.bind(guardrails=True)
         except Exception:
             self._loguru_logger = None
+
+    def _resolve_emergency_stop_files(self) -> tuple[Path, Path]:
+        primary = _EMERGENCY_STOP_FILE
+        fallback = _EMERGENCY_STOP_FILE_FALLBACK
+        if primary is None or fallback is None:
+            primary, fallback = _emergency_stop_paths()
+        return primary, fallback
 
     def _log_line(self, line: str) -> None:
         """Write a JSONL line — via loguru if available, else direct append."""
@@ -287,27 +300,29 @@ class Guardrails:
     def emergency_stop(self) -> None:
         """Activate emergency stop and persist to disk so it survives restarts (fix 1.9)."""
         self._emergency_stop.set()
+        primary, fallback = self._resolve_emergency_stop_files()
         try:
-            self._emergency_stop_file.parent.mkdir(parents=True, exist_ok=True)
-            self._emergency_stop_file.write_text("1", encoding="utf-8")
+            primary.parent.mkdir(parents=True, exist_ok=True)
+            primary.write_text("1", encoding="utf-8")
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Failed to write to primary emergency stop file: %s", exc)
             try:
-                self._emergency_stop_file_fallback.parent.mkdir(parents=True, exist_ok=True)
-                self._emergency_stop_file_fallback.write_text("1", encoding="utf-8")
+                fallback.parent.mkdir(parents=True, exist_ok=True)
+                fallback.write_text("1", encoding="utf-8")
             except Exception:
                 pass
 
     def clear_emergency_stop(self) -> None:
         """Clear the emergency stop and remove the persistence file (fix 1.9)."""
         self._emergency_stop.clear()
+        primary, fallback = self._resolve_emergency_stop_files()
         try:
-            self._emergency_stop_file.unlink(missing_ok=True)
+            primary.unlink(missing_ok=True)
         except Exception:
             pass
         try:
-            self._emergency_stop_file_fallback.unlink(missing_ok=True)
+            fallback.unlink(missing_ok=True)
         except Exception:
             pass
 

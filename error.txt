@@ -1,0 +1,418 @@
+I'll now perform a comprehensive technical audit of the NOVA project by analyzing all provided files systematically.This is a substantial codebase — let me now do the deep technical analysis across all 135 files and produce the audit report.Here is the complete technical audit of the NOVA project.
+
+---
+
+## NOVA Technical Audit Report
+
+---
+
+### 🔴 CRITICAL ISSUES
+
+---
+
+**Issue 1: `_resolve_lock_file` function defined at wrong scope in `cli.py`**
+Severity: Critical | Priority: High
+
+The function `_resolve_lock_file` is defined *inside* the `run_cli()` function body but at the very end — after the `while True:` loop that uses it at the top. The function is referenced at lines like `lock_file = _resolve_lock_file(CLI_PIN_LOCK_FILE)` before it is ever defined in execution flow, causing a `NameError` crash on every CLI launch. The same defect exists identically in `interfaces/gui/app.py`. Root cause is the function being appended to the bottom of each function body as a late addition, after the code that calls it. Fix: move both `_resolve_lock_file` definitions to module level or above the first call site.
+
+---
+
+**Issue 2: Emergency stop file path monkeypatching breaks under concurrent access**
+Severity: Critical | Priority: High
+
+`safety/guardrails.py` exposes `_EMERGENCY_STOP_FILE` as a module-level global that tests patch via `monkeypatch.setattr`. When `Guardrails.__init__` runs, it copies the module-level values into instance attributes (`self._emergency_stop_file`). If a test patches the global *after* the singleton `guardrails` object is constructed (which happens at module import time at the bottom of the file), the patch has no effect on the already-running singleton. Tests in `test_guardrails_extended.py` work around this by constructing fresh `Guardrails()` instances, but production code uses the singleton, meaning emergency stop files can end up in unexpected locations. Fix: resolve the file path lazily inside `emergency_stop()` and `clear_emergency_stop()` rather than caching it at construction time.
+
+---
+
+**Issue 3: Plugin sandbox escape via `__builtins__` dict reconstruction**
+Severity: Critical | Priority: High
+
+`core/plugin_loader.py` attempts to sandbox plugins by replacing `__builtins__` with a restricted dict, but the AST check blocks `__subclasses__` only when used as a `Name` node — a plugin can still write `"".__class__.__mro__[-1].__subclasses__()` using chained attribute access, which the AST checker does not catch because each attribute (`__class__`, `__mro__`, `__subclasses__`) is accessed separately through legitimate `ast.Attribute` nodes. The `exec(code, restricted_globals)` call also cannot prevent a plugin from escaping via `type.__subclasses__()` using a `type` reference obtained through any object literal. This is a known fundamental limitation of Python's `exec` sandboxing. Fix: run plugins in a subprocess with OS-level isolation, or use a dedicated sandboxing library (e.g. `RestrictedPython`). Do not advertise plugin isolation as a security boundary.
+
+---
+
+**Issue 4: SSRF via IPv6-mapped IPv4 addresses not fully blocked**
+Severity: Critical | Priority: High
+
+`web/scraper.py`'s `_is_private_ip()` function checks `getattr(addr, "ipv4_mapped", None)` to unwrap IPv6-mapped IPv4 addresses. However, the private-network list `_PRIVATE_NETWORKS` contains `ipaddress.IPv4Network` objects while an IPv6 address (even after unwrapping) is still compared against them. The `try/except TypeError` inside `_connect_mcp` catches the `TypeError` that arises when comparing an IPv6 address to an IPv4 network, but swallows it and sets `resolved_private = False`, meaning the connection is allowed through. An attacker who controls a DNS record pointing to `::ffff:127.0.0.1` can bypass the SSRF guard in the MCP connector. Fix: explicitly unwrap `ipv4_mapped` before any network comparison and ensure all private-range checks succeed before allowing connection.
+
+---
+
+**Issue 5: Thread-unsafe hard-cap date reset — TOCTOU race**
+Severity: Critical | Priority: High
+
+In `main.py`, `_track_usage()` is called from multiple threads (the summarizer executor, the memory executor, and the main ask-stream path) and the `_usage_lock` wrapping is correct within `_track_usage` itself, but `ask_stream()` reads `self._hard_cap_hit` outside the lock at the very top:
+
+```python
+hard_cap_active = self._hard_cap_hit  # no lock here
+```
+
+Between reading `False` here and the next line, another thread could set `_hard_cap_hit = True` inside `_track_usage`. The result is that one extra LLM call slips through the hard cap. Worse, the date-reset logic (`if self._hard_cap_hit_date != today: self._hard_cap_hit = False`) also runs inside the lock in `_track_usage` but the read in `ask_stream` is outside it, so a stale `True` value can block calls on the new day until the next `_track_usage` call resets it. Fix: wrap the cap check in `ask_stream` with `self._usage_lock`.
+
+---
+
+**Issue 6: GoalRunner `ThreadPoolExecutor` deadlock under autonomy load**
+Severity: Critical | Priority: High
+
+The `goal_runner` and `autonomy_runner` both share `self._goal_execution_lock` (a `threading.Semaphore(1)`). If a manual goal step triggers a tool that itself enqueues an autonomy goal (e.g. `goal.add`), the autonomy loop will attempt to acquire the same semaphore while it is held by the manual-goal path, deadlocking both. The `ThreadPoolExecutor(max_workers=1)` inside each `GoalRunner` compound this: the single worker thread blocks waiting for the semaphore while the outer thread holding the semaphore is also waiting for the `future.result()`. Fix: use separate semaphores for manual and autonomy paths (as the comments suggest but the code does not actually implement — `self._autonomy_execution_lock = self._goal_execution_lock` makes them the same object).
+
+---
+
+**Issue 7: LLM output triggers arbitrary tool execution without user confirmation in autonomy mode**
+Severity: Critical | Priority: High
+
+In `_autonomy_loop`, medium-risk steps are force-escalated to high-risk via `force_confirm_medium=True` on `autonomy_runner`, which is correct. However, the `confirm_callback` used is `self._autonomy_confirm_callback`, which returns `False` (blocking the step) and sends a Telegram message. But `ask_stream()` with `allow_tools=True` is called by scheduled tasks (`_schedule_prompt`) with no `confirm_callback` at all, defaulting to the blocking `input()` call from `_interactive_confirm`. In a headless/Docker deployment, `sys.stdin.isatty()` returns `False`, so `_interactive_confirm` always returns `False` and blocks the tool forever without notifying the user. Fix: provide an explicit `confirm_callback` to all autonomy-initiated `ask_stream` paths.
+
+---
+
+**Issue 8: `ask_stream` finally block causes duplicate history entries**
+Severity: Critical | Priority: High
+
+The `finally` block in `ask_stream` re-adds `user_text` to session history if `not committed and (user_added or output_chunks)`. But `user_added` can be `True` even when `committed` is `False` (e.g. when the tool call execution raises an exception after `session.add_turn("user", ...)` was already called). The result is the user turn appearing twice. Additionally, `session.add_turn("assistant", partial)` in the finally block can run right after `self.session.add_turn("assistant", assistant_text)` in the try block if both paths execute — creating a duplicate assistant turn. Fix: remove the assistant turn re-addition in the finally block, or use an explicit flag to track whether each turn was already persisted.
+
+---
+
+**Issue 9: `sync_all_pending` blocks the hot path intermittently**
+Severity: Critical | Priority: High
+
+`_schedule_sync_all_pending()` is called on every `ask_stream` invocation when online. While it submits the work to `_memory_executor`, the 15-second cooldown uses `time.monotonic()` without any jitter, meaning all concurrent `ask_stream` calls will race to submit the sync job at exactly the 15-second mark. More critically, `memory.sync_all_pending()` calls `mem0.add()` for every pending item — a network call — on the memory executor thread. Since `_memory_executor` has `max_workers=1`, this blocks all concurrent `_commit_memory_async` jobs for the duration of the sync. In a busy session with hundreds of pending items, this creates multi-second memory-commit latency spikes. Fix: run sync on a dedicated background thread separate from the per-conversation memory commit path.
+
+---
+
+**Issue 10: Session persistence fails silently on cross-device temp file**
+Severity: Critical | Priority: High
+
+`core/session.py`'s `_persist_session` uses `tempfile.NamedTemporaryFile` inside the `.jarvis_sessions/` directory, then calls `tmp_path.replace(path)`. On Linux with Docker volume mounts (e.g. `/app/.jarvis_sessions` mounted from the host), the temp file and the destination can be on different devices, causing `OSError: [Errno 18] Invalid cross-device link`. The code catches this and logs a warning, but the session is silently not saved. In a crash scenario, the last N turns are lost permanently. Fix: fall back to `shutil.copy2` + `os.unlink` when the atomic replace fails, and surface a more prominent error to the operator.
+
+---
+
+**Issue 11: `web/scraper.py` prompt injection check swallows tuple return values incorrectly**
+Severity: Critical | Priority: High
+
+`scrape_text()` calls `detect_prompt_injection(text)` and then checks `if isinstance(detected, tuple)`. However, `detect_prompt_injection` in `core/think/reasoning.py` always returns `bool`, never a tuple. The tuple branch is dead code carried over from a previous API design. Meanwhile, `web/scraper.py` imports it and does: `is_injected, reason = bool(detected[0]), ...` — if `detected` is `True` (a bool), `detected[0]` raises `TypeError` because `bool` is not subscriptable in this context... except Python's `bool` *is* subscriptable via `int` indexing on iterables. `True[0]` actually raises `TypeError`. This means any web page that triggers the injection detector will crash `scrape_text` with an unhandled `TypeError` rather than returning the blocked message. Fix: remove the tuple branch and use the bool return directly.
+
+---
+
+### 🟠 MAJOR ISSUES
+
+---
+
+**Issue 12: `autonomy_loop` overwrites `cancelled` status back to `running`**
+Severity: Major | Priority: High
+
+In `_autonomy_loop`, after acquiring `self._goal_lock` to set `item["status"] = "running"`, the goal is deep-copied and the lock released. If `_cancel_goal` is called between the lock release and the later write-back (`item["status"] = status`), the cancel is overwritten. The code has a comment checking `if item.get("status") == "cancelled": break` in the write-back block, which partially mitigates this, but the window between setting `"running"` and the write-back check is not atomic. Fix: check for cancellation *before* setting `"running"`, inside the same lock scope.
+
+---
+
+**Issue 13: `background_plan` goal planning uses unbounded `_goal_plan_executor`**
+Severity: Major | Priority: High
+
+`_add_goal` submits background planning tasks to `_goal_plan_executor` with `max_workers=2`. If many goals are added rapidly (e.g. via Telegram `/goal` spam), all submitted tasks queue up. Each planning task calls `self.engine.ask()` — a blocking LLM call — consuming an API key token for the full plan. With no rate limit on the `/goal` command in `telegram_bot.py` (the `_allow_heavy_command` check covers it at 2/min, which is noted as a known issue #31 in `errors.txt`), a user can queue 2 planning calls per minute indefinitely. Fix: cap the `_goal_plan_executor` queue depth and reject additions when the queue is full.
+
+---
+
+**Issue 14: `ContextTrimmer` summary never updates after first successful summary**
+Severity: Major | Priority: High
+
+In `_context_messages()`, the `enough_new_turns` check requires `(older_count - last_trigger_count) >= 3`. After a successful summary, `_summary_last_trigger_count[session_id]` is set to `older_count`. On the next call, `older_count` will only have increased by 1 (one new turn was added), so `(older_count - last_trigger_count)` is 1, which is `< 3`. Only after 3 more turns will re-summarization trigger. This is the intended cooldown, but the 30-second `_summary_retry_after` cooldown is *also* applied additively, meaning the effective re-summarization window is `max(30s, 3 turns)`. With slow conversation pace, old context accumulates without summarization. The `_last_snippet_hashes` deduplication further prevents re-summarization even when the content has changed significantly. Fix: use only one cooldown mechanism, not two stacked ones.
+
+---
+
+**Issue 15: Health monitor `restart_fn` called without verifying recovery**
+Severity: Major | Priority: High
+
+In `core/health.py`, after calling `restart_fn()`, the monitor immediately calls `self.heartbeat(name, "restarting")` and moves on. On the *next* poll interval (60 seconds later), it will check again. But if the restart itself raises an exception, `restart_failed` is set — however if it succeeds silently but the subsystem stays down, the next poll will call `restart_fn()` again, incrementing the attempt counter. With `max_restart_attempts=3` and 60s intervals, a persistently-down service will be declared `restart_failed` after 3 minutes and then not retried for `restart_cooldown_seconds=300`. After 5 minutes, attempts reset and the cycle repeats. This means a persistently-failing service flip-flops between `restarting` and `restart_failed` indefinitely, sending Telegram alerts on every cycle. Fix: add a short re-check after `restart_fn()` (e.g. 5 seconds) before declaring `restarting` vs `restart_failed`.
+
+---
+
+**Issue 16: `OmniParserServer.restart()` regenerates `auth_token` but does not update `OmniParserClient`**
+Severity: Major | Priority: High
+
+When OmniParser is restarted by the health monitor, `OmniParserServer.restart()` generates a new `self.auth_token` via `secrets.token_urlsafe(32)`. The `_get_omniparser_client()` method in `NOVAApp` attempts to sync the token: `self._omniparser_client.auth_token = current_token`. However, `self.omniparser.auth_token` is the *new* token from the server object, but the client cache (`_UI_ELEMENT_CACHE`) in `vision/omniparser.py` uses a cache key that incorporates the old auth token for the first 500ms after restart (the `_UI_ELEMENT_CACHE_TTL_S`). More critically, the `is_running()` check itself sends the token as a query param (`?token=...`), and if the old process is still terminating and the new one not yet started, there's a race window where `is_running()` returns `False` with the new token but `True` with the old one. Fix: invalidate the client cache on restart and add a brief startup wait before the health monitor considers the service recovered.
+
+---
+
+**Issue 17: `UsageTracker.persist` serializes full history on every flush**
+Severity: Major | Priority: Medium
+
+`UsageTracker._persist()` serializes the entire `self._daily` dict (up to 8 days of data across all sessions and providers) on every 2-second timer flush. With many sessions, this can be a multi-KB JSON write on every flush. The timer is re-armed via `_schedule_persist()` only if no existing timer is alive, which means under sustained conversation load (multiple concurrent `add()` calls), the timer fires and refires every 2 seconds forever. Each fire holds `self._lock` for the duration of the disk write, blocking all concurrent `add()` calls. Fix: use a write-behind pattern — dirty-flag the dict and only serialize when dirty, not on every timer expiry.
+
+---
+
+**Issue 18: `web/crawler.py` `robots.txt` check uses `NOVA/1.0` user-agent but requests use `Mozilla/5.0 (NOVA/1.0)`**
+Severity: Major | Priority: Medium
+
+The robots parser checks permissions for `"NOVA/1.0"` but the actual HTTP request sends `"Mozilla/5.0 (NOVA/1.0)"`. A site that allows `Mozilla/5.0` but disallows `NOVA/1.0` in its `robots.txt` would be crawled when it shouldn't be. Conversely, a site that explicitly allows `NOVA/1.0` but the request goes out as `Mozilla/5.0` might confuse server-side rate limiters. Fix: use identical user-agent strings in both the robots check and the fetch headers.
+
+---
+
+**Issue 19: `core/plugin_loader.py` AST check does not cover `importlib.import_module`**
+Severity: Major | Priority: High
+
+The `_BLOCKED_IMPORTS` set blocks `importlib`, but the AST `_check_ast` function only checks for `ast.Name` and `ast.Attribute` nodes matching the restricted set. A plugin can bypass the blocked import list by calling `__import__` indirectly (e.g. `vars()["__import__"]("os")`), because `vars()` and `__import__` are not in the AST blocklist. The `_restricted_import` replacement only applies to direct `import` statements handled by Python's import machinery — it does not intercept `vars()["__import__"]("subprocess")`. Fix: add `vars`, `locals`, `globals`, `dir`, `hasattr` to the AST restricted identifiers set, and add them to the allowed-builtins exclusion list.
+
+---
+
+**Issue 20: `voice/tts_offline.py` worker thread leaks `pyttsx3` COM objects in pytest**
+Severity: Major | Priority: Medium
+
+The `_ensure_worker()` function detects pytest via `os.getenv("PYTEST_CURRENT_TEST")` and rebuilds the worker per test. Each rebuild creates a new `pyttsx3.init()` engine. On Windows, pyttsx3 uses COM, and COM objects must be released on the same thread they were created. The old worker thread's COM objects are abandoned when the thread is killed via `_QUEUE.put(None)` and `join(timeout=1)`. The 1-second timeout may be insufficient for the COM cleanup to complete, leaving dangling COM handles. Fix: send the `None` sentinel and `join()` with no timeout (or a much longer timeout), and only then create the new engine.
+
+---
+
+**Issue 21: `interfaces/cli.py` has misplaced function definition (syntax issue)**
+Severity: Major | Priority: High
+
+The `_resolve_lock_file` helper is defined *inside* `run_cli()` but after the main `while True:` loop — making it unreachable from the code that calls it at the top of `run_cli()`. Python's scoping means the function *is* technically defined before the loop executes (function bodies are compiled, not executed top-to-bottom at definition time), but the function defined at the bottom will shadow any module-level definition. Since Python does read function bodies top-to-bottom, the call to `_resolve_lock_file(CLI_PIN_LOCK_FILE)` happens before the nested `def _resolve_lock_file` is encountered — meaning at runtime the name is not yet in local scope and a `NameError` is raised. Fix: move the definition to module level.
+
+---
+
+**Issue 22: `MasterMCP._request_with_retry` uses `requests.request` which is not patched in unit tests**
+Severity: Major | Priority: Medium
+
+`test_master_mcp.py` monkeypatches `mcp.master_mcp.requests.request`. However, `_request_with_retry` also calls `response.raise_for_status()`, which raises `HTTPError` for 4xx/5xx responses. The `retryable_codes` set includes 429/500/502/503/504, but the logic first checks `response.status_code in retryable_codes` and only *then* calls `raise_for_status()` on the final attempt. For a 400 Bad Request (not in `retryable_codes`), `raise_for_status()` is called immediately — but the exception is caught by the outer `except Exception as exc` block and retried anyway (since the retry decision is made before `raise_for_status`). This means 400 errors are retried unnecessarily. Fix: check `raise_for_status()` before the retryable-code check, or only catch `requests.HTTPError` separately from connection errors.
+
+---
+
+**Issue 23: `config/settings.py` entropy check rejects valid short API keys**
+Severity: Major | Priority: Medium
+
+The `_is_placeholder_key` method rejects keys shorter than 20 characters. Some legitimate API keys (e.g. certain local Ollama API keys, internal service tokens) can be shorter. The entropy check (`entropy < 2.5`) also rejects keys that are valid but happen to have low character diversity (e.g. UUID-format keys with many dashes). This could silently disable cloud LLM access on startup for users with non-standard key formats, with the only signal being the `validate_startup` warning. Fix: allow operators to override the minimum key length via an env var, and log a specific warning when keys are rejected rather than silently treating them as placeholder.
+
+---
+
+**Issue 24: `brain/tasks/scheduler.py` uses global `_DEFAULT_DB` at import time**
+Severity: Major | Priority: Medium
+
+`_DATA_DIR` and `_DEFAULT_DB` are computed at module import time using `settings.DATA_DIR`. If `settings` is imported before the `.env` file is loaded (e.g. in test environments where `NOVA_ENV=test` skips `.env` loading), `DATA_DIR` defaults to `~/.jarvis/data`, and the scheduler DB is created there regardless of the test's temp dir. This means tests that instantiate `TaskScheduler()` without an explicit `db_url` can leave SQLite files in the developer's home directory. Fix: compute `_DEFAULT_DB` lazily inside `TaskScheduler.__init__` rather than at module level.
+
+---
+
+**Issue 25: `core/memory/backup.py` `restore_chromadb` is not wired to health monitor**
+Severity: Major | Priority: Medium
+
+The backup job runs daily and writes snapshots. But `restore_chromadb` is never called anywhere — not by the health monitor, not by setup.py, not on startup. If ChromaDB becomes corrupt, there is no automated recovery path. The health monitor's `_check_llm_engine` function checks Ollama but there is no ChromaDB health check registered. Fix: register a ChromaDB health check and wire `restore_chromadb` to the operator's recovery runbook; at minimum, add a `--restore` flag to `setup.py`.
+
+---
+
+**Issue 26: `docker-compose.yml` OmniParser container missing model weights**
+Severity: Major | Priority: High
+
+The `omniparser` service in `docker-compose.yml` runs `python3 -m vision.omniparser_app` but the `vendor/OmniParser` directory and model weights are not baked into the image or mounted as a volume. The `RUN python3 setup.py` line is in the compose command but not in the `Dockerfile` `RUN` layer, so weights are not downloaded during image build. At runtime, OmniParser starts but immediately fails to load the model, and the health check marks it as down after retries. Fix: either add a Dockerfile stage that downloads weights, or add a volume mount for `./vendor:/app/vendor` in the OmniParser service definition (already present for `nova` but not `omniparser`).
+
+---
+
+**Issue 27: No rate limiting on autonomy-triggered `goal.add` tool calls**
+Severity: Major | Priority: High
+
+A goal step can execute `goal.add` to create sub-goals, which will be picked up by `_autonomy_loop` and executed without further confirmation. Since `force_confirm_medium=True` only elevates risk scoring and does not block `goal.add` (which scores as medium-risk for "send"/"add" hints), a runaway goal can spawn an unbounded tree of sub-goals. With `AUTONOMY_MAX_STEPS=20` and `AUTONOMY_POLL_SECONDS=20`, 20 sub-goals could each consume 20 API calls, for 400 total calls from one user instruction. Fix: rate-limit `goal.add` when called from within goal execution, and cap total pending goals per session (the `_max_pending_goals=20` cap helps but applies globally, not per-execution-tree).
+
+---
+
+**Issue 28: `voice/vad.py` silero VAD `end_detected` check may never trigger**
+Severity: Major | Priority: Medium
+
+In `_capture_with_silero`, the loop breaks only if `end_detected is True`. But `silero_vad`'s `VADIterator` only emits an `"end"` key in the dict when it detects end-of-speech. If the user stops speaking but background noise keeps the VAD active, `"end"` is never returned and the recording runs until `max_capture_seconds`. At the default `max_capture_seconds=30.0`, this means 30 seconds of audio is buffered. The fallback energy-based VAD has proper `silence_frames` counting but is not used when silero succeeds in loading. Fix: add a fallback silence counter in the silero path to break after `silence_ms` milliseconds of non-speech frames, matching the energy-VAD behavior.
+
+---
+
+**Issue 29: `control/adb/watcher.py` `_tick` leaves temp PNG files on disk when `analyze_image` raises**
+Severity: Major | Priority: Low
+
+The `_tick()` method creates a temp file, calls `self.adb.screenshot_to_local(tmp_path)`, then opens and reads the file. The `finally` block correctly calls `os.unlink(tmp_path)`. However, if `screenshot_to_local` raises (e.g. device disconnected), the exception propagates past `os.unlink` because the `try/finally` wraps only the file creation and read, not the ADB call. Root cause: the ADB call is inside the `try` but the `finally` only runs `os.unlink` *after* the read — if the read raises, the file is cleaned up, but if the ADB call raises before the file is opened, the temp file path is already stored in `tmp_path` and the `finally` block will try to unlink a file that ADB may have partially written. This is generally handled, but if `tmp_path` is set but the ADB call fails mid-write, the partial file remains. Fix: restructure with a single `try/finally` wrapping the entire block including the ADB call.
+
+---
+
+**Issue 30: `NOVAApp.__del__` calls `shutdown()` which joins threads — unsafe in GC context**
+Severity: Major | Priority: Medium
+
+`NOVAApp.__del__` calls `self.shutdown()`, which calls `.join()` on background threads. CPython's garbage collector can call `__del__` from any thread, including the GC thread, during interpreter shutdown. Joining threads during interpreter shutdown can deadlock because the GIL may be partially released and other threads may be in cleanup. Fix: remove `__del__` entirely and rely on the explicit `shutdown()` call in `main()` + the `signal` handlers.
+
+---
+
+### 🟡 MINOR ISSUES
+
+---
+
+**Issue 31: `requirements.txt` and `requirements.lock` are not actually identical in dependency graph**
+Severity: Minor | Priority: Low
+
+`requirements.txt` pins direct dependencies. `requirements.lock` contains transitive dependencies (e.g. `accelerate`, `aiohttp`, `uvloop`) that are not in `requirements.txt`. This means `pip install -r requirements.txt` produces a different (and potentially incompatible) environment than `pip install -r requirements.lock`. The `Dockerfile` uses `requirements.lock` while `setup.py` uses whichever exists first. Developers who run `pip install -r requirements.txt` locally get a different environment than the Docker build. Fix: generate `requirements.lock` from `requirements.txt` using `pip-compile` and document the regeneration process.
+
+---
+
+**Issue 32: `JARVIS → NOVA` rename is incomplete in several places**
+Severity: Minor | Priority: Low
+
+`setup.py` still contains `Hey-Jarvis_en_windows_v3_0_0.ppn` as the default wake-word asset path. `config/constants.py` correctly uses `nova_personal`/`nova_work` but `.env.example` uses the NOVA names while `setup.py`'s `ensure_env_file()` still writes `nova_personal` but also `Hey-Jarvis_en_windows_v3_0_0.ppn`. The README still uses "JARVIS" in several phase descriptions. Session files are stored in `.jarvis_sessions/`, ChromaDB in `.jarvis_chroma/`, and data in `~/.jarvis/data` — none of which have been renamed. Fix: do a project-wide search-and-replace for `jarvis` (case-insensitive) and update all path constants in `config/constants.py`.
+
+---
+
+**Issue 33: `interfaces/cli.py` has unreachable code after `return` in `run_cli`**
+Severity: Minor | Priority: Low
+
+The `_resolve_lock_file` definition at the bottom of `run_cli()` is placed after the `while True: ...` loop which contains `return` statements. The function definition is syntactically valid (Python defines it before executing the loop body) but is confusingly placed. Any `return` at the top of `run_cli` (e.g. the "Access Denied" path) exits before Python ever "sees" the inner function definition in the execution sense. This is a code organization issue that causes confusion and can mask bugs.
+
+---
+
+**Issue 34: `HybridRanker` Jaccard fallback always used when BM25 also scores zero**
+Severity: Minor | Priority: Low
+
+When `BM25Okapi` is installed, the ranker computes BM25 and semantic (Jaccard) scores. However, if the query has no token overlap with any document, all BM25 scores are zero — the sort is stable, so documents are returned in insertion order. The Jaccard fallback would also return zero for all, so the RRF fusion does nothing meaningful. For zero-overlap queries (e.g. embeddings queries where semantic similarity drives ranking), BM25's zero scores drag down documents that should rank high on semantic grounds. Fix: when BM25 scores are all zero, fall back to Jaccard-only ranking or use cosine embedding similarity as the primary ranker.
+
+---
+
+**Issue 35: `vision/watcher.py` `_detect_issue` returns empty string for injected content — not logged as event**
+Severity: Minor | Priority: Medium
+
+When `detect_prompt_injection(combined)` returns `True`, `_detect_issue` returns a safe user-facing message. However this message goes through `on_alert`, which calls `self.record_event("proactive", message)`. The injection detection is therefore indistinguishable from a regular screen alert in the event log. Security-relevant injection attempts should be logged separately (e.g. as `"security"` kind events) so operators can audit them. Fix: call `self.record_event("security", f"injection_detected: {combined[:200]}")` in addition to the proactive alert.
+
+---
+
+**Issue 36: `core/context/environment.py` clipboard capture not thread-safe**
+Severity: Minor | Priority: Low
+
+`_ENVIRONMENT_CACHE`, `_ENVIRONMENT_CACHE_TIME`, and `_REFRESH_INFLIGHT` are module-level globals protected by `_ENVIRONMENT_LOCK`. However, `_REFRESH_INFLIGHT` is set to `True` inside the lock in `snapshot_environment` but reset to `False` in `_refresh_background` using a separate `with _ENVIRONMENT_LOCK` block. If `_refresh_background` raises an exception before the `finally` block resets `_REFRESH_INFLIGHT`, the flag is left as `True` and no further background refreshes will ever be scheduled. Fix: use `try/finally` in `_refresh_background` to guarantee `_REFRESH_INFLIGHT` is reset.
+
+---
+
+**Issue 37: `core/tools/dispatcher.py` rate limiter token bucket doesn't handle `rate_limit_rpm=0` in `_consume_token`**
+Severity: Minor | Priority: Low
+
+The `_consume_token` method returns early with `if self._max_tokens <= 0`. But `_refill_rate` is computed as `rate_limit_rpm / 60.0 if rate_limit_rpm > 0 else 0.0`. When `rate_limit_rpm=0`, `_refill_rate=0` and `_tokens=0`. If someone later modifies `_max_tokens` to a positive value without re-initializing `_refill_rate`, the bucket will never refill. This is not currently a user-facing issue but is a latent bug in the rate-limiter design. Fix: make `_max_tokens`, `_tokens`, and `_refill_rate` consistent by always deriving `_refill_rate` from `_max_tokens`.
+
+---
+
+**Issue 38: Docker health check for `nova` service references port 8765 but `NOVA_HEALTH_PORT` can be overridden**
+Severity: Minor | Priority: Medium
+
+The `docker-compose.yml` health check hardcodes `http://localhost:8765/health`, but `NOVA_HEALTH_PORT` is an env var that defaults to 8765. If an operator overrides the port in their `.env`, the Docker health check will fail even though the service is healthy. Fix: use `curl -fsS "http://localhost:${NOVA_HEALTH_PORT:-8765}/health"` in the health check command.
+
+---
+
+**Issue 39: `setup.py` `register_startup_entry` runs unconditionally on bare-metal installs if `NOVA_REGISTER_STARTUP` is not explicitly `false`**
+Severity: Minor | Priority: Low
+
+The condition `os.getenv("NOVA_REGISTER_STARTUP", "").strip().lower() in {"1", "true", "yes", "y"}` means startup registration only happens when explicitly opted in — which is correct. However, `deployment_mode` defaults to `"bare-metal"` even in environments where registration is inappropriate (e.g. CI pipelines). The check is gated correctly but the comment "Skipping startup registration (set NOVA_REGISTER_STARTUP=true to enable)" is misleading because it implies the default is safe. Fix: add a note to `.env.example` explaining when to set this.
+
+---
+
+**Issue 40: `core/memory/mem0_client.py` `_call_with_variants` tries up to 4 API calls on every add/search failure**
+Severity: Minor | Priority: Low
+
+The `_call_with_variants` method tries 4 different argument combinations before giving up. Each failed attempt is a network call to the mem0 API. If the mem0 API is down, every `router.add()` call makes 4 network requests before falling back to local storage. With 60-second socket timeouts on `requests`, this can block the memory commit thread for up to 240 seconds. Fix: add an exponential backoff and detect `ConnectionError` vs `TypeError` — only retry on `TypeError` (wrong argument signature), not on network errors.
+
+---
+
+**Issue 41: `safety/guardrails.py` log rotation creates a loguru sink on every `Guardrails()` instantiation**
+Severity: Minor | Priority: Low
+
+`Guardrails._init_rotating_log()` calls `_lg.add(...)` every time a `Guardrails` object is constructed. In tests, `test_guardrails_extended.py` creates multiple `Guardrails()` instances via `_make_guardrails()`. Each call adds a new loguru sink. With enough test runs, loguru accumulates many file sinks pointing to temp directories that have already been deleted, causing silent write errors on every log entry. Fix: track whether the sink has been added (e.g. store the sink ID returned by `_lg.add()`) and remove it before adding a new one.
+
+---
+
+**Issue 42: `main.py` `NOVAApp` constructor is ~900 lines with mixed initialization and side effects**
+Severity: Minor | Priority: Low
+
+The `__init__` method sets up all subsystems sequentially. If any subsystem raises an exception mid-init (e.g. the scheduler fails), partially-constructed subsystems (background threads, file handles, network connections) are not cleaned up because `__del__` only calls `shutdown()` if `_shutting_down` is not set — but `_shutting_down` is created early in `__init__`. A failed constructor at line 400 means threads started at line 200 are leaked. Fix: use a staged initialization pattern with a try/except that calls `shutdown()` on failure, or restructure initialization into separate methods called after `__init__` completes.
+
+---
+
+**Issue 43: No input length validation on Telegram `/goal` command body before injection check**
+Severity: Minor | Priority: Medium
+
+`on_goal` in `telegram_bot.py` joins `context.args` and strips whitespace, then passes the raw string to `agent.add_goal()`. `add_goal()` calls `detect_prompt_injection()` and then `_plan_goal()`, which feeds the goal string directly into the LLM planner prompt: `f"Goal: {goal}"`. A goal string of 2000 characters (the `GoalAddArgs` max) is injected verbatim into the planner system prompt, which is already complex. While the Pydantic validation enforces `max_length=2000`, a 2000-character goal can overflow the planner's context window or be crafted to manipulate the plan. Fix: sanitize and truncate the goal string before injecting into the planner prompt, and consider a stricter max length (e.g. 500 chars).
+
+---
+
+**Issue 44: `vision/omniparser_server.py` `_safe_env` excludes `PYTHONPATH` additions on Windows**
+Severity: Minor | Priority: Low
+
+`_safe_env` uses `os.pathsep` (`:` on Linux, `;` on Windows) to join PYTHONPATH components — this is correct. However, the function always reads `os.environ.get("PYTHONPATH", "")` from the parent process. On Windows in a virtual environment, `PYTHONPATH` is typically not set, and the `extra_pythonpath` arg adds the project root. But the `SYSTEMROOT` env var is included, while `COMSPEC` (the Windows command processor) is not — this can prevent subprocess spawning on some Windows configurations. Fix: add `COMSPEC` to the safe env pass-through list.
+
+---
+
+**Issue 45: Missing `__init__.py` in `plugins/` directory**
+Severity: Minor | Priority: Low
+
+The `plugins/` directory contains `demo_plugin.py` but has no `__init__.py`. The plugin loader uses `spec_from_file_location` which doesn't require `__init__.py`, but if any plugin tries to do relative imports or uses `__package__`, it will fail. The `demo_plugin.py` imports `from pydantic import BaseModel, Field` — this works. But documenting that plugins cannot use relative imports would prevent user confusion. Fix: add an empty `__init__.py` to `plugins/` and document the constraint.
+
+---
+
+**Issue 46: `core/health.py` `status_table()` returns shallow copies of `HealthItem.__dict__`**
+Severity: Minor | Priority: Low
+
+`status_table()` acquires `_lock` then returns `[item.__dict__ for item in self._state.values()]`. Since `HealthItem` is a dataclass, `__dict__` returns a reference to the instance's attribute dict. A caller who modifies the returned dicts will modify the live health state. Fix: return `[dataclasses.asdict(item) for item in self._state.values()]` or explicitly construct new dicts.
+
+---
+
+**Issue 47: `utils/exporter.py` redaction regex does not cover multi-line values**
+Severity: Minor | Priority: Low
+
+The `_SENSITIVE_PATTERNS` in `exporter.py` use `[^"\n]*` to match values — the `\n` exclusion prevents multi-line values from being redacted. A JSON export where an API key spans multiple lines (e.g. a PEM private key) would not be redacted. While API keys are typically single-line, this is a defensive gap. Fix: replace `[^"\n]*` with `[^"]*` and use `re.MULTILINE` where appropriate.
+
+---
+
+**Issue 48: No monitoring or alerting for `_summarize_executor` and `_memory_executor` job queue depths**
+Severity: Minor | Priority: Low
+
+`NOVAApp` tracks `_summary_jobs_inflight` and `_memory_jobs_inflight` but never surfaces these in `/status`, the health endpoint, or Telegram. An operator has no visibility into whether the background executors are saturated. If `_memory_jobs_inflight >= _max_background_memory_jobs` (200), new conversation memory is silently dropped. Fix: include `summary_jobs_inflight`, `memory_jobs_inflight`, and `goal_plan_jobs_inflight` in the `/status` JSON output and trigger a warning alert when either exceeds 80% of its cap.
+
+---
+
+## Summary Table
+
+| # | Issue | Severity | Priority | File(s) |
+|---|-------|----------|----------|---------|
+| 1 | `_resolve_lock_file` wrong scope | Critical | High | `cli.py`, `gui/app.py` |
+| 2 | Emergency stop singleton patching | Critical | High | `guardrails.py` |
+| 3 | Plugin sandbox escape | Critical | High | `plugin_loader.py` |
+| 4 | SSRF via IPv6-mapped IPv4 | Critical | High | `scraper.py`, `main.py` |
+| 5 | Hard-cap TOCTOU race | Critical | High | `main.py` |
+| 6 | GoalRunner deadlock | Critical | High | `main.py`, `goals.py` |
+| 7 | Autonomy headless confirm deadlock | Critical | High | `main.py` |
+| 8 | `ask_stream` duplicate history | Critical | High | `main.py` |
+| 9 | `sync_all_pending` blocks hot path | Critical | High | `main.py`, `memory_router.py` |
+| 10 | Session persistence cross-device fail | Critical | High | `core/session.py` |
+| 11 | Scraper injection check crashes | Critical | High | `web/scraper.py` |
+| 12 | Cancelled goal overwritten | Major | High | `main.py` |
+| 13 | Unbounded goal planning queue | Major | High | `main.py` |
+| 14 | Context trimmer stale summary | Major | High | `main.py` |
+| 15 | Health monitor no post-restart verify | Major | Medium | `core/health.py` |
+| 16 | OmniParser token sync race | Major | High | `main.py`, `omniparser_server.py` |
+| 17 | `UsageTracker` full serialize on flush | Major | Medium | `utils/usage_tracker.py` |
+| 18 | Crawler robot user-agent mismatch | Major | Medium | `web/crawler.py` |
+| 19 | Plugin AST `vars()` bypass | Major | High | `core/plugin_loader.py` |
+| 20 | `tts_offline` COM leak in pytest | Major | Medium | `voice/tts_offline.py` |
+| 21 | `cli.py` unreachable function | Major | High | `interfaces/cli.py` |
+| 22 | MCP retry retries 400 errors | Major | Medium | `mcp/master_mcp.py` |
+| 23 | Entropy check rejects valid keys | Major | Medium | `config/settings.py` |
+| 24 | Scheduler DB path at import time | Major | Medium | `tasks/scheduler.py` |
+| 25 | `restore_chromadb` unwired | Major | Medium | `core/memory/backup.py` |
+| 26 | Docker OmniParser missing weights | Major | High | `docker-compose.yml` |
+| 27 | Autonomy `goal.add` rate unlimited | Major | High | `main.py` |
+| 28 | Silero VAD no silence fallback | Major | Medium | `voice/vad.py` |
+| 29 | ADB watcher temp file cleanup | Major | Low | `control/adb/watcher.py` |
+| 30 | `__del__` thread join unsafe in GC | Major | Medium | `main.py` |
+| 31 | `requirements.txt` vs `requirements.lock` | Minor | Low | root |
+| 32 | JARVIS→NOVA rename incomplete | Minor | Low | multiple |
+| 33 | `cli.py` unreachable code | Minor | Low | `interfaces/cli.py` |
+| 34 | BM25 zero-score ranking | Minor | Low | `web/hybrid_ranker.py` |
+| 35 | Injection not logged as security event | Minor | Medium | `vision/watcher.py` |
+| 36 | `_REFRESH_INFLIGHT` not reset on error | Minor | Low | `core/context/environment.py` |
+| 37 | Rate limiter inconsistent zero-RPM | Minor | Low | `core/tools/dispatcher.py` |
+| 38 | Docker health check hardcoded port | Minor | Medium | `docker-compose.yml` |
+| 39 | Startup registration env var docs | Minor | Low | `setup.py` |
+| 40 | mem0 `_call_with_variants` 4x network | Minor | Low | `core/memory/mem0_client.py` |
+| 41 | Loguru sink accumulation in tests | Minor | Low | `safety/guardrails.py` |
+| 42 | 900-line constructor | Minor | Low | `main.py` |
+| 43 | Goal string injected into planner | Minor | Medium | `main.py`, `telegram_bot.py` |
+| 44 | `_safe_env` missing `COMSPEC` | Minor | Low | `vision/omniparser_server.py` |
+| 45 | Missing `__init__.py` in `plugins/` | Minor | Low | `plugins/` |
+| 46 | `status_table()` shallow copy | Minor | Low | `core/health.py` |
+| 47 | Redaction misses multi-line values | Minor | Low | `utils/exporter.py` |
+| 48 | No executor saturation monitoring | Minor | Low | `main.py` |
+
+---
+
+**Recommended fix order:** Issues 1 → 4 → 5 → 6 → 8 → 11 should be addressed first as they are runtime crashes or security bypasses that will manifest on first use. Issues 3, 7, 9, and 10 are the next priority as they affect reliability under load. The major issues (12–30) should be batched into a hardening sprint. The minor issues can be addressed incrementally during normal development.

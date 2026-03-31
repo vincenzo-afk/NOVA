@@ -229,13 +229,22 @@ class MasterMCP:
         for attempt in range(self.max_retries + 1):
             try:
                 response = requests.request(method=method, url=url, **kwargs)
-                if response.status_code in retryable_codes and attempt < self.max_retries:
-                    delay = self.backoff_base_seconds * (2 ** attempt)
-                    if delay > 0:
-                        self._sleep_fn(delay)
-                    continue
+                if response.status_code in retryable_codes:
+                    if attempt < self.max_retries:
+                        delay = self.backoff_base_seconds * (2 ** attempt)
+                        if delay > 0:
+                            self._sleep_fn(delay)
+                        continue
                 response.raise_for_status()
                 return response
+            except requests.HTTPError as exc:
+                last_error = exc
+                status_code = getattr(exc.response, "status_code", None)
+                if status_code not in retryable_codes or attempt >= self.max_retries:
+                    break
+                delay = self.backoff_base_seconds * (2 ** attempt)
+                if delay > 0:
+                    self._sleep_fn(delay)
             except Exception as exc:
                 last_error = exc
                 if attempt >= self.max_retries:

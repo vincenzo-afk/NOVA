@@ -44,6 +44,7 @@ def _safe_env(extra_pythonpath: str = "", auth_token: str = "") -> dict[str, str
         "TEMP",
         "TMP",
         "SYSTEMROOT",
+        "COMSPEC",
         "USERPROFILE",
         "LANG",
         "LC_ALL",

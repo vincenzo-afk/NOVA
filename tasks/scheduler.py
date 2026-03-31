@@ -12,15 +12,14 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 from config.settings import settings
 
-# Fix 6.7/Deploy-03: use configurable data dir for persistent scheduler DB.
-_DATA_DIR = Path(os.getenv("DATA_DIR", settings.DATA_DIR)).expanduser().resolve()
-_DATA_DIR.mkdir(parents=True, exist_ok=True)
-_DEFAULT_DB = f"sqlite:///{_DATA_DIR}/jarvis_jobs.sqlite"
-
 
 class TaskScheduler:
-    def __init__(self, db_url: str = _DEFAULT_DB):
+    def __init__(self, db_url: str | None = None):
         from sqlalchemy import create_engine
+        if db_url is None:
+            data_dir = Path(os.getenv("DATA_DIR", settings.DATA_DIR)).expanduser().resolve()
+            data_dir.mkdir(parents=True, exist_ok=True)
+            db_url = f"sqlite:///{data_dir}/jarvis_jobs.sqlite"
         connect_args = {"timeout": 30} if db_url.startswith("sqlite") else {}
         engine = create_engine(db_url, connect_args=connect_args)
         self.scheduler = BackgroundScheduler(

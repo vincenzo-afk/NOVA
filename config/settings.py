@@ -215,7 +215,12 @@ class Settings:
         k = key.strip()
         if k.lower() in self._PLACEHOLDER_KEYS:
             return True
-        if len(k) < self._MIN_REAL_KEY_LENGTH:
+        min_len = self._MIN_REAL_KEY_LENGTH
+        try:
+            min_len = max(0, int(os.getenv("NOVA_MIN_REAL_KEY_LENGTH", str(self._MIN_REAL_KEY_LENGTH))))
+        except Exception:
+            min_len = self._MIN_REAL_KEY_LENGTH
+        if len(k) < min_len:
             return True
         # Entropy check: real keys have varied characters.
         # A simple unique-char count misses low-entropy repeated patterns.
@@ -223,7 +228,7 @@ class Settings:
         import math
         probs = [count / len(k) for count in Counter(k).values()]
         entropy = -sum(p * math.log2(p) for p in probs if p > 0.0)
-        if entropy < 2.5:
+        if entropy < 2.0:
             return True
         return False
 

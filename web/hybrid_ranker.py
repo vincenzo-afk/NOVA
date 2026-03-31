@@ -22,6 +22,9 @@ class HybridRanker:
         bm25_scores = bm25.get_scores(query.lower().split())
 
         semantic_scores = [self._jaccard(query, d) for d in docs]
+        if max(bm25_scores, default=0.0) <= 0.0:
+            ranked = sorted(range(len(docs)), key=lambda i: semantic_scores[i], reverse=True)
+            return [docs[i] for i in ranked[:top_k]]
 
         bm25_ranks = sorted(range(len(docs)), key=lambda i: bm25_scores[i], reverse=True)
         sem_ranks = sorted(range(len(docs)), key=lambda i: semantic_scores[i], reverse=True)

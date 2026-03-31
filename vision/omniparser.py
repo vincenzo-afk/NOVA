@@ -19,6 +19,10 @@ _UI_ELEMENT_CACHE: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
 _UI_ELEMENT_CACHE_TTL_S = 0.5  # fix 3.2: 500 ms TTL
 
 
+def clear_ui_element_cache() -> None:
+    _UI_ELEMENT_CACHE.clear()
+
+
 class OmniParserClient:
     def __init__(self, base_url: str = "http://localhost:8000", auth_token: str | None = None):
         self.base_url = base_url.rstrip("/")

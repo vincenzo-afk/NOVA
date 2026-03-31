@@ -94,7 +94,7 @@ services:
     stdin_open: true
     tty: true
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8765/health >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS \"http://localhost:${NOVA_HEALTH_PORT:-8765}/health\" >/dev/null || exit 1"]
       interval: 20s
       timeout: 5s
       retries: 8

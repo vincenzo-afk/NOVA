@@ -34,16 +34,16 @@ _PRIVATE_NETWORKS = [
 def _is_private_ip(ip: str) -> bool:
     try:
         addr = ipaddress.ip_address(ip)
-        if getattr(addr, "ipv4_mapped", None):
-            addr = addr.ipv4_mapped
-        
-        # Check against all networks, catching type mismatches cleanly
+        mapped = getattr(addr, "ipv4_mapped", None)
+        if mapped is not None:
+            addr = mapped
+
+        # Reject if family mismatches ever occur; do not silently allow.
         for net in _PRIVATE_NETWORKS:
-            try:
-                if addr in net:
-                    return True
-            except TypeError:
+            if addr.version != net.version:
                 continue
+            if addr in net:
+                return True
         return False
     except ValueError:
         return False
@@ -130,14 +130,9 @@ def scrape_text(url: str) -> str:
     
     text = soup.get_text("\n", strip=True)
     
-    # Fix 16 & Sec 3: Prompt Injection Guard
-    detected = detect_prompt_injection(text)
-    if isinstance(detected, tuple):
-        is_injected, reason = bool(detected[0]), str(detected[1] or "injection_detected")
-    else:
-        is_injected, reason = bool(detected), "injection_detected"
-    if is_injected:
-        return f"[Content from web (untrusted) - BLOCKED due to prompt injection: {reason}]"
+    # Prompt Injection Guard
+    if detect_prompt_injection(text):
+        return "[Content from web (untrusted) - BLOCKED due to prompt injection: injection_detected]"
         
     text = re.sub(r"\[/?tool_call\]", "", text, flags=re.IGNORECASE)
     text = re.sub(r'\{[^{}]*"tool"\s*:\s*"[^"]+"[^{}]*\}', "", text, flags=re.IGNORECASE)

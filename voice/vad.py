@@ -115,11 +115,13 @@ class VADRecorder:
         frame_samples = max(1, int(self.sample_rate * self.frame_ms / 1000))
         max_frames = int((self.max_capture_seconds * 1000) / self.frame_ms)
         pre_roll_frames = max(1, int(250 / self.frame_ms))
+        silence_frames = max(1, int(self.silence_ms / self.frame_ms))
 
         captured: list[np.ndarray] = []
         pre_roll: list[np.ndarray] = []
         speaking = False
         end_detected = False
+        silent_count = 0
 
         def _frame_to_tensor(frame: np.ndarray) -> torch.Tensor:
             audio = frame.astype("float32") / 32768.0
@@ -151,7 +153,14 @@ class VADRecorder:
                     pre_roll = []
                 if speaking:
                     captured.append(frame.copy())
+                    if speech_dict:
+                        silent_count = 0
+                    else:
+                        silent_count += 1
                 if speech_dict and "end" in speech_dict and speaking:
+                    end_detected = True
+                    break
+                if speaking and silent_count >= silence_frames:
                     end_detected = True
                     break
 

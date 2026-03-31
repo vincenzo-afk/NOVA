@@ -6,6 +6,7 @@ import threading
 import hashlib
 import hmac
 import time
+from pathlib import Path
 from typing import Any
 
 from config.constants import CLI_PIN_HASH_FILE, CLI_PIN_LEGACY_FILE, CLI_PIN_LOCK_FILE
@@ -15,6 +16,13 @@ from vision.gemini_vision import analyze_image
 from utils.events import format_event_log
 from utils.goals import format_goal_list
 from utils.health import format_health_table, summarize_health
+
+
+def _resolve_lock_file(path_value: str) -> Path:
+    p = Path(path_value).expanduser()
+    if p.is_absolute():
+        return p
+    return Path.home() / path_value.lstrip("./")
 
 
 def build_status_snapshot(agent: Any) -> dict[str, Any]:
@@ -103,8 +111,6 @@ def launch_gui(agent: Any) -> None:
         return hmac.compare_digest(entered, value)
 
     # Reuse CLI PIN policy in GUI (hash file first, then legacy plaintext file).
-    from pathlib import Path
-
     pin_hash = ""
     pin_hash_file = Path(CLI_PIN_HASH_FILE)
     legacy_pin_file = Path(CLI_PIN_LEGACY_FILE)
@@ -453,8 +459,3 @@ def launch_gui(agent: Any) -> None:
     window.resize(1080, 760)
     window.show()
     app.exec()
-    def _resolve_lock_file(path_value: str):
-        p = Path(path_value).expanduser()
-        if p.is_absolute():
-            return p
-        return Path.home() / path_value.lstrip("./")

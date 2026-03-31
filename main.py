@@ -357,6 +357,7 @@ class NOVAApp:
         self._emergency_hotkey_listener = None
         self._summarize_executor = ThreadPoolExecutor(max_workers=1)
         self._memory_executor = ThreadPoolExecutor(max_workers=1)
+        self._sync_executor = ThreadPoolExecutor(max_workers=1)
         self._goal_plan_executor = ThreadPoolExecutor(max_workers=2)
         self.goal_runner = None
         self.autonomy_runner = None
@@ -395,6 +396,7 @@ class NOVAApp:
         self._summary_retry_after: dict[str, float] = {}
         self._summary_submit_lock = threading.Lock()
         self._memory_submit_lock = threading.Lock()
+        self._goal_plan_submit_lock = threading.Lock()
         self._summary_inflight: set[str] = set()
 
         # Add single thread for TTS execution (fix 5.1)
@@ -403,8 +405,10 @@ class NOVAApp:
         # Separate executors so goal planning and memory sync cannot block summarization.
         self._max_background_summary_jobs = 100
         self._max_background_memory_jobs = 200
+        self._max_goal_plan_jobs = 50
         self._summary_jobs_inflight = 0
         self._memory_jobs_inflight = 0
+        self._goal_plan_jobs_inflight = 0
         self._shutting_down = threading.Event()
         self._max_pending_goals = 20
         self._health_http_server: ThreadingHTTPServer | None = None
@@ -490,7 +494,7 @@ class NOVAApp:
         
         # Separate manual-goal execution from autonomy-goal execution to avoid cross-blocking.
         self._goal_execution_lock = threading.Semaphore(1)
-        self._autonomy_execution_lock = self._goal_execution_lock
+        self._autonomy_execution_lock = threading.Semaphore(1)
         self.goal_runner = GoalRunner(
             self.dispatcher,
             confirm_callback=self._interactive_confirm,
@@ -686,6 +690,9 @@ class NOVAApp:
                 "health_summary": summarize_health(health_items),
                 "health": health_items,
                 "health_table": format_health_table(health_items),
+                "summary_jobs_inflight": self._summary_jobs_inflight,
+                "memory_jobs_inflight": self._memory_jobs_inflight,
+                "goal_plan_jobs_inflight": self._goal_plan_jobs_inflight,
             },
             indent=2,
         )
@@ -713,7 +720,13 @@ class NOVAApp:
             )
         else:
             # Fix 2.2: ensure token stays updated across server restarts
-            self._omniparser_client.auth_token = current_token
+            if self._omniparser_client.auth_token != current_token:
+                self._omniparser_client.auth_token = current_token
+                try:
+                    from vision.omniparser import clear_ui_element_cache
+                    clear_ui_element_cache()
+                except Exception:
+                    pass
         return self._omniparser_client
 
     def _current_ui_elements(self) -> list[dict[str, Any]]:
@@ -810,7 +823,12 @@ class NOVAApp:
         job_id = job_id or f"job_{int(time.time())}"
 
         def _run(p=prompt, jid=job_id) -> None:
-            response = "".join(self.ask_stream(p, allow_tools=False))
+            response = "".join(
+                self.ask_stream(
+                    p,
+                    allow_tools=False,
+                )
+            )
             print(f"\n[scheduled:{jid}] {response}")
             # Bug fix: scheduled tasks now notify via Telegram/TTS (previously silent)
             self._notify_autonomy_event(f"[scheduled:{jid}] {response}")
@@ -904,6 +922,9 @@ class NOVAApp:
         return {"goal": goal, "status": "ok", "steps": steps, "raw": raw}
         
     def _add_goal(self, goal: str, max_steps: int = 20) -> dict:
+        goal = re.sub(r"\s+", " ", goal).strip()
+        if len(goal) > 500:
+            goal = goal[:500].rstrip() + "..."
         if detect_prompt_injection(goal):
             return {"status": "error", "reason": "goal_rejected_prompt_injection"}
         with self._goal_lock:
@@ -926,15 +947,31 @@ class NOVAApp:
         with self._goal_lock:
             self._goals.append(record)
             self._persist_goals()
+        with self._goal_plan_submit_lock:
+            if self._goal_plan_jobs_inflight >= self._max_goal_plan_jobs:
+                with self._goal_lock:
+                    for item in self._goals:
+                        if item.get("id") == goal_id:
+                            item["status"] = "failed"
+                            item["last_result"] = {"status": "failed", "reason": "goal_planning_queue_full"}
+                            self._persist_goals()
+                            break
+                return {"status": "error", "reason": "goal_planning_queue_full", "id": goal_id}
 
         def background_plan():
+            with self._goal_plan_submit_lock:
+                self._goal_plan_jobs_inflight += 1
             if self._shutting_down.is_set():
+                with self._goal_plan_submit_lock:
+                    self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
                 return
             try:
                 plan = self._plan_goal(goal, max_steps=min(max_steps, 30))
             except Exception as exc:
                 plan = {"status": "failed", "reason": f"planning_exception:{exc}"}
             if self._shutting_down.is_set():
+                with self._goal_plan_submit_lock:
+                    self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
                 return
             with self._goal_lock:
                 for item in self._goals:
@@ -947,6 +984,8 @@ class NOVAApp:
                             item["last_result"] = plan
                         self._persist_goals()
                         break
+            with self._goal_plan_submit_lock:
+                self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
 
         future = self._goal_plan_executor.submit(background_plan)
         def _on_done(fut):
@@ -960,6 +999,8 @@ class NOVAApp:
                             item["last_result"] = {"status": "failed", "reason": f"planning_future_exception:{exc}"}
                             self._persist_goals()
                             break
+                with self._goal_plan_submit_lock:
+                    self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
         future.add_done_callback(_on_done)
         return record
 
@@ -1414,7 +1455,12 @@ class NOVAApp:
             if candidate_id:
                 with self._goal_lock:
                     for item in self._goals:
-                        if item.get("id") == candidate_id and item.get("status") in {"pending", "approved_for_step"} and item.get("steps"):
+                        if item.get("id") != candidate_id:
+                            continue
+                        if item.get("status") == "cancelled":
+                            goal = None
+                            break
+                        if item.get("status") in {"pending", "approved_for_step"} and item.get("steps"):
                             # If it was specifically approved, we will pass a flag down
                             goal = copy.deepcopy(item)
                             item["status"] = "running"
@@ -1575,6 +1621,7 @@ class NOVAApp:
         kwargs = {"cancel_futures": True} if _sys.version_info >= (3, 9) else {}
         self._summarize_executor.shutdown(wait=False, **kwargs)
         self._memory_executor.shutdown(wait=False, **kwargs)
+        self._sync_executor.shutdown(wait=False, **kwargs)
         self._goal_plan_executor.shutdown(wait=False, **kwargs)
         # Bug fix: drain TTS queue on shutdown so the worker thread exits cleanly
         try:
@@ -1584,13 +1631,11 @@ class NOVAApp:
             pass
 
     def __del__(self):
-        try:
-            if getattr(self, "_shutting_down", None) and not self._shutting_down.is_set():
-                self.shutdown()
-        except Exception:
-            pass
+        return
 
     def _handle_proactive_alert(self, message: str) -> None:
+        if "potentially malicious on-screen text" in message.lower():
+            self.record_event("security", message)
         self.record_event("proactive", message)
         if self._muted:
             return
@@ -2042,7 +2087,11 @@ class NOVAApp:
             assistant_text = "".join(output_chunks).strip()
             tool_call = self.dispatcher.try_parse_tool_call(assistant_text) if allow_tools else None
             if tool_call:
-                result = self.dispatcher.execute(tool_call, dry_run=dry_run_tools)
+                result = self.dispatcher.execute(
+                    tool_call,
+                    confirm_callback=self._interactive_confirm,
+                    dry_run=dry_run_tools,
+                )
                 tool_result_text = f"[tool_result] {json.dumps(result, ensure_ascii=False)}"
                 if output_chunks:
                     yield "\n"
@@ -2064,12 +2113,14 @@ class NOVAApp:
                     return
                 if not user_added:
                     self.session.add_turn("user", user_text)
+                    user_added = True
                 try:
                     if not usage_tracked:
                         self._track_usage(system_prompt, history, user_text, partial, day_anchor=today)
                 except Exception:
                     pass
-                self.session.add_turn("assistant", partial)
+                if not assistant_text:
+                    self.session.add_turn("assistant", partial)
                 self._commit_memory_async(user_text, partial)
 
     def _commit_memory_async(self, user_text: str, assistant_text: str) -> None:
@@ -2181,7 +2232,7 @@ class NOVAApp:
                     self._sync_all_inflight = False
 
         try:
-            self._memory_executor.submit(_job)
+            self._sync_executor.submit(_job)
         except Exception:
             with self._sync_all_lock:
                 self._sync_all_inflight = False
@@ -2190,6 +2241,7 @@ class NOVAApp:
         try:
             import sys
             if not sys.stdin or not sys.stdin.isatty():
+                self._notify_telegram(f"High-risk confirmation required but no interactive stdin is available.\n{prompt}")
                 return False
             answer = input(prompt).strip().lower()
             return answer in {"y", "yes", "confirm"}
