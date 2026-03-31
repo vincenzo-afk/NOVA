@@ -10,8 +10,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 
+from config.settings import settings
+
 # Fix 6.7/Deploy-03: use configurable data dir for persistent scheduler DB.
-_DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parent.parent)).expanduser().resolve()
+_DATA_DIR = Path(os.getenv("DATA_DIR", settings.DATA_DIR)).expanduser().resolve()
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
 _DEFAULT_DB = f"sqlite:///{_DATA_DIR}/jarvis_jobs.sqlite"
 
@@ -84,20 +86,32 @@ def parse_schedule_text(schedule_text: str) -> dict:
             seconds = n * 3600
         return {"interval_seconds": max(1, seconds)}
 
-    daily_match = re.search(r"(daily|every day)\s+at\s+(\d{1,2}):(\d{2})", text)
+    def _normalize_time(hour_str: str, min_str: str, ampm: str | None) -> tuple[int, int]:
+        h = int(hour_str)
+        m = int(min_str)
+        if ampm:
+            if ampm == "pm" and h < 12:
+                h += 12
+            if ampm == "am" and h == 12:
+                h = 0
+        return h, m
+
+    daily_match = re.search(r"(daily|every day)\s+at\s+(\d{1,2}):(\d{2})(?:\s*(am|pm))?", text)
     if daily_match:
-        return {"hour": int(daily_match.group(2)), "minute": int(daily_match.group(3))}
+        h, m = _normalize_time(daily_match.group(2), daily_match.group(3), daily_match.group(4))
+        return {"hour": h, "minute": m}
 
     weekday_match = re.search(
-        r"every\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+at\s+(\d{1,2}):(\d{2})",
+        r"every\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+at\s+(\d{1,2}):(\d{2})(?:\s*(am|pm))?",
         text,
     )
     if weekday_match:
         day = weekday_match.group(1)[:3]
+        h, m = _normalize_time(weekday_match.group(2), weekday_match.group(3), weekday_match.group(4))
         return {
             "day_of_week": day,
-            "hour": int(weekday_match.group(2)),
-            "minute": int(weekday_match.group(3)),
+            "hour": h,
+            "minute": m,
         }
 
     raise ValueError(f"Unsupported schedule text: {schedule_text}")

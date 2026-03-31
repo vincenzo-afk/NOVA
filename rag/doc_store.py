@@ -44,7 +44,13 @@ class DocumentStore:
 
             if not EmbeddingBackend.is_available():
                 return False
-            self._client = chromadb.PersistentClient(path=str(self.persist_dir))
+            import os
+            host = os.getenv("CHROMA_HOST")
+            port = os.getenv("CHROMA_PORT")
+            if host and port:
+                self._client = chromadb.HttpClient(host=host, port=port)
+            else:
+                self._client = chromadb.PersistentClient(path=str(self.persist_dir))
             self._collection = self._client.get_or_create_collection(
                 self.collection_name,
                 metadata={"hnsw:space": "cosine"},
@@ -96,11 +102,15 @@ class DocumentStore:
 
         if self._use_chroma and self._collection and self._embedder:
             try:
-                embeddings = self._embedder.encode([c.text for c in self._docs[filename]])
+                texts = [c.text for c in self._docs[filename]]
+                embeddings = []
+                batch_size = 64
+                for i in range(0, len(texts), batch_size):
+                    embeddings.extend(self._embedder.encode(texts[i : i + batch_size]))
                 ids = [self._chunk_id(filename, idx, c.text) for idx, c in enumerate(self._docs[filename])]
                 self._collection.upsert(
                     ids=ids,
-                    documents=[c.text for c in self._docs[filename]],
+                    documents=texts,
                     metadatas=[c.metadata for c in self._docs[filename]],
                     embeddings=embeddings,
                 )

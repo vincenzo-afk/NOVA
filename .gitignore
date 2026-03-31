@@ -19,11 +19,13 @@ jarvis_jobs.sqlite
 .jarvis/
 
 # Logs — may contain sensitive action audit trails (Security 4.1)
-logs/
+logs/*
+!logs/.gitkeep
 *.jsonl
 
 # Session exports — contain full conversation history (Security 4.1)
-exports/
+exports/*
+!exports/.gitkeep
 
 # OmniParser vendor checkout — handled as submodule or download
 vendor/
@@ -40,3 +42,5 @@ vendor/
 *.swp
 *.swo
 .jarvis/
+BUG.TXT
+BUG.TXT

@@ -357,7 +357,7 @@ class NOVAApp:
         self._emergency_hotkey_listener = None
         self._summarize_executor = ThreadPoolExecutor(max_workers=1)
         self._memory_executor = ThreadPoolExecutor(max_workers=1)
-        self._goal_plan_executor = ThreadPoolExecutor(max_workers=1)
+        self._goal_plan_executor = ThreadPoolExecutor(max_workers=2)
         self.goal_runner = None
         self.autonomy_runner = None
         self._tts_queue = queue.Queue()
@@ -388,6 +388,8 @@ class NOVAApp:
         self._summary_cache = OrderedDict()  # Fix 11
         self._summary_cache_lock = threading.Lock()  # fix 3.2
         self._last_snippet_hashes: dict[str, str] = {}
+        self._summary_last_trigger_count: dict[str, int] = {}
+        self._summary_retry_after: dict[str, float] = {}
         self._summary_submit_lock = threading.Lock()
         self._memory_submit_lock = threading.Lock()
         self._summary_inflight: set[str] = set()
@@ -396,9 +398,6 @@ class NOVAApp:
         self._tts_thread.start()
 
         # Separate executors so goal planning and memory sync cannot block summarization.
-        self._summarize_executor = ThreadPoolExecutor(max_workers=1)
-        self._memory_executor = ThreadPoolExecutor(max_workers=1)
-        self._goal_plan_executor = ThreadPoolExecutor(max_workers=2)
         self._max_background_summary_jobs = 100
         self._max_background_memory_jobs = 200
         self._summary_jobs_inflight = 0
@@ -457,6 +456,9 @@ class NOVAApp:
                     self._goals_file, exc
                 )
         self._goal_lock = threading.Lock()
+        self._goal_persist_lock = threading.Lock()
+        self._goal_persist_timer: threading.Timer | None = None
+        self._goal_persist_interval_seconds = 0.5
         self._autonomy_stop = threading.Event()
         self._autonomy_thread: threading.Thread | None = None
         self._autonomy_start_lock = threading.Lock()
@@ -953,7 +955,7 @@ class NOVAApp:
                 item["cursor"] = step_index + 1
                 item["last_step_result"] = step_result
                 item["updated_at"] = time.time()
-                self._persist_goals()
+                self._persist_goals_debounced()
                 break
 
     def _doc_ingest(self, filepath: str) -> dict:
@@ -992,6 +994,22 @@ class NOVAApp:
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning("Failed to persist goals: %s", e)
+
+    def _persist_goals_debounced(self) -> None:
+        with self._goal_persist_lock:
+            if self._goal_persist_timer and self._goal_persist_timer.is_alive():
+                return
+
+            def _flush() -> None:
+                with self._goal_persist_lock:
+                    self._goal_persist_timer = None
+                with self._goal_lock:
+                    self._persist_goals()
+
+            timer = threading.Timer(self._goal_persist_interval_seconds, _flush)
+            timer.daemon = True
+            self._goal_persist_timer = timer
+            timer.start()
 
     def _list_goals(self) -> list[dict]:
         with self._goal_lock:
@@ -1470,6 +1488,16 @@ class NOVAApp:
             phone_watcher.stop()
         if getattr(self, "scheduler", None):
             self.scheduler.stop()
+        try:
+            with self._goal_persist_lock:
+                timer = self._goal_persist_timer
+                self._goal_persist_timer = None
+            if timer and timer.is_alive():
+                timer.cancel()
+            with self._goal_lock:
+                self._persist_goals()
+        except Exception:
+            pass
         self._stop_autonomy_loop()
         self._stop_probe_server()
         if self._emergency_hotkey_listener is not None:
@@ -1485,6 +1513,10 @@ class NOVAApp:
         except Exception:
             pass
         try:
+            self.usage.flush()
+        except Exception:
+            pass
+        try:
             summary_file = Path(".jarvis/trimmer_summaries.json")
             summary_file.parent.mkdir(parents=True, exist_ok=True)
             with self.trimmer._lock:
@@ -1494,20 +1526,38 @@ class NOVAApp:
                 )
         except Exception:
             pass
-        import sys as _sys
-        kwargs = {"cancel_futures": True} if _sys.version_info >= (3, 9) else {}
-        self._summarize_executor.shutdown(wait=False, **kwargs)
-        self._memory_executor.shutdown(wait=False, **kwargs)
-        self._goal_plan_executor.shutdown(wait=False, **kwargs)
+        lock_acquired = False
+        try:
+            lock_acquired = self._autonomy_execution_lock.acquire(timeout=5)
+        except Exception:
+            lock_acquired = False
         try:
             self.goal_runner.close()
             self.autonomy_runner.close()
         except Exception:
             pass
+        finally:
+            if lock_acquired:
+                try:
+                    self._autonomy_execution_lock.release()
+                except Exception:
+                    pass
+        import sys as _sys
+        kwargs = {"cancel_futures": True} if _sys.version_info >= (3, 9) else {}
+        self._summarize_executor.shutdown(wait=False, **kwargs)
+        self._memory_executor.shutdown(wait=False, **kwargs)
+        self._goal_plan_executor.shutdown(wait=False, **kwargs)
         # Bug fix: drain TTS queue on shutdown so the worker thread exits cleanly
         try:
             self._tts_queue.put(None)   # sentinel to stop the worker
             self._tts_thread.join(timeout=5)
+        except Exception:
+            pass
+
+    def __del__(self):
+        try:
+            if getattr(self, "_shutting_down", None) and not self._shutting_down.is_set():
+                self.shutdown()
         except Exception:
             pass
 
@@ -1601,13 +1651,23 @@ class NOVAApp:
         self.dispatcher.register("web.crawl", crawl, WebCrawlArgs)
         self.dispatcher.register("doc.ingest", self._doc_ingest, DocIngestArgs)
         self.dispatcher.register("doc.query", self.docs.query, DocQueryArgs)
-        self.dispatcher.register("doc.list", self.docs.list_docs, EmptyArgs)
+        self.dispatcher.register(
+            "doc.list",
+            self.docs.list_docs,
+            EmptyArgs,
+            description="List ingested documents with filename and metadata.",
+        )
         self.dispatcher.register("session.switch", lambda name: self.switch_session(name).name, SessionSwitchArgs)
         self.dispatcher.register("win32_api.read", win32_api.read_file, FileReadArgs)
         self.dispatcher.register("win32_api.write", win32_api.write_file, FileWriteArgs)
         self.dispatcher.register("win32_api.move", win32_api.move_file, FileMoveArgs)
         self.dispatcher.register("win32_api.delete", win32_api.delete_file, FileDeleteArgs)
-        self.dispatcher.register("win32_api.list_processes", win32_api.list_processes, EmptyArgs)
+        self.dispatcher.register(
+            "win32_api.list_processes",
+            win32_api.list_processes,
+            EmptyArgs,
+            description="List currently running local processes as names/identifiers.",
+        )
         self.dispatcher.register("win32_api.search", win32_api.search_files, FileSearchArgs)
         self.dispatcher.register("win32_api.copy", win32_api.copy_file, FileMoveArgs)
         self.dispatcher.register("win32_api.kill_process", win32_api.kill_process, ProcessKillArgs)
@@ -1648,8 +1708,18 @@ class NOVAApp:
             self.dispatcher.register("adb.pull", self.adb.pull, ADBPullArgs)
             self.dispatcher.register("adb.push", self.adb.push, ADBPushArgs)
             self.dispatcher.register("adb.send_sms", self._adb_send_sms, ADBSmsArgs)
-            self.dispatcher.register("adb.notifications_dump", self.adb.notifications_dump, EmptyArgs)
-            self.dispatcher.register("adb.sms_dump", self.adb.sms_dump, EmptyArgs)
+            self.dispatcher.register(
+                "adb.notifications_dump",
+                self.adb.notifications_dump,
+                EmptyArgs,
+                description="Dump recent Android notifications as text.",
+            )
+            self.dispatcher.register(
+                "adb.sms_dump",
+                self.adb.sms_dump,
+                EmptyArgs,
+                description="Dump recent Android SMS messages as text.",
+            )
             self.dispatcher.register("adb.screenshot_to_local", self.adb.screenshot_to_local, EmptyArgs)
             self.dispatcher.register("adb.qr_generate", self.qr.generate, QRGenerateArgs)
             self.dispatcher.register("adb.qr_terminal", self.qr.print_terminal_qr, QRTerminalArgs)
@@ -1690,9 +1760,20 @@ class NOVAApp:
             # Trigger background summarization if snippet changed
             snippet_hash = hashlib.sha256(snippet.encode("utf-8")).hexdigest()
             with self._summary_submit_lock:
+                retry_after = self._summary_retry_after.get(session_id, 0.0)
                 last_hash = self._last_snippet_hashes.get(session_id)
-                if snippet_hash != last_hash and session_id not in self._summary_inflight:
+                older_count = len(older)
+                last_trigger_count = self._summary_last_trigger_count.get(session_id, 0)
+                has_existing_summary = bool(self.trimmer.summaries.get(session_id, "").strip())
+                enough_new_turns = (older_count - last_trigger_count) >= 3 or not has_existing_summary
+                if (
+                    time.time() >= retry_after
+                    and snippet_hash != last_hash
+                    and session_id not in self._summary_inflight
+                    and enough_new_turns
+                ):
                     self._last_snippet_hashes[session_id] = snippet_hash
+                    self._summary_last_trigger_count[session_id] = older_count
                     self._summary_inflight.add(session_id)
 
                     def _job(sn=snippet, sid=session_id):
@@ -1791,9 +1872,14 @@ class NOVAApp:
                     self._summary_cache.popitem(last=False)
             with self.trimmer._lock:
                 self.trimmer.summaries[session_id] = summary
+            with self._summary_submit_lock:
+                self._summary_retry_after.pop(session_id, None)
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning("Summarizer thread failed unconditionally: %s", e)
+            with self._summary_submit_lock:
+                self._summary_retry_after[session_id] = time.time() + 60.0
+                self._last_snippet_hashes.pop(session_id, None)
 
     def _apply_text_commands(self, user_text: str) -> str | None:
         """Handle built-in text shortcuts without calling the LLM.
@@ -1935,7 +2021,7 @@ class NOVAApp:
 
             self.session.add_turn("assistant", assistant_text)
             committed = True
-            self._track_usage(system_prompt, history, user_text, assistant_text)
+            self._track_usage(system_prompt, history, user_text, assistant_text, day_anchor=today)
             usage_tracked = True
             self._commit_memory_async(user_text, assistant_text)
         except Exception as exc:
@@ -1950,7 +2036,7 @@ class NOVAApp:
                     self.session.add_turn("user", user_text)
                 try:
                     if not usage_tracked:
-                        self._track_usage(system_prompt, history, user_text, partial)
+                        self._track_usage(system_prompt, history, user_text, partial, day_anchor=today)
                 except Exception:
                     pass
                 self.session.add_turn("assistant", partial)
@@ -1991,15 +2077,23 @@ class NOVAApp:
             return "Error: ADB not available"
         return self.adb.send_sms(phone_number, body)
 
-    def _track_usage(self, system_prompt: str, history: list[dict], user_text: str, assistant_text: str) -> None:
+    def _track_usage(
+        self,
+        system_prompt: str,
+        history: list[dict],
+        user_text: str,
+        assistant_text: str,
+        *,
+        day_anchor: date | None = None,
+    ) -> None:
         input_tokens = estimate_tokens(system_prompt) + estimate_tokens(user_text)
         input_tokens += sum(estimate_tokens(str(m.get("content", ""))) for m in history)
         output_tokens = estimate_tokens(assistant_text)
 
         session_id = self.session.current.session_id
         provider = self.engine.last_provider
-        self.usage.add(provider, input_tokens, output_tokens, session_id=session_id)
-        today = date.today()
+        today = day_anchor or date.today()
+        self.usage.add(provider, input_tokens, output_tokens, session_id=session_id, when=today)
         total = self.usage.total_tokens_today(session_id=session_id)
 
         with self._usage_lock:

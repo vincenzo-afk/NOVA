@@ -36,7 +36,13 @@ class LocalMemoryStore:
 
             if not EmbeddingBackend.is_available():
                 return False
-            self._client = chromadb.PersistentClient(path=str(self.persist_dir))
+            import os
+            host = os.getenv("CHROMA_HOST")
+            port = os.getenv("CHROMA_PORT")
+            if host and port:
+                self._client = chromadb.HttpClient(host=host, port=port)
+            else:
+                self._client = chromadb.PersistentClient(path=str(self.persist_dir))
             self._collection = self._client.get_or_create_collection(
                 self.collection_name,
                 metadata={"hnsw:space": "cosine"},

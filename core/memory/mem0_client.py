@@ -67,18 +67,18 @@ class Mem0Client:
             {**kwargs, "user_id": kwargs.get("session_id"), "memory": kwargs.get("text")},
             {**kwargs, "user_id": kwargs.get("session_id"), "content": kwargs.get("text")},
         ]
-        last_type_error: TypeError | None = None
+        last_signature_error: Exception | None = None
         for payload in variants:
             payload = {k: v for k, v in payload.items() if v is not None}
             try:
                 return fn(**payload)
-            except TypeError as exc:
-                last_type_error = exc
+            except (TypeError, AttributeError) as exc:
+                last_signature_error = exc
                 continue
         raise TypeError(
             f"mem0 SDK call failed for all argument variants. "
             f"Tried keys: {[sorted([k for k, v in p.items() if v is not None]) for p in variants]}"
-        ) from last_type_error
+        ) from last_signature_error
 
     def add(self, text: str, session_id: str, metadata: dict | None = None) -> dict:
         if self._remote_enabled and self._client is not None:
