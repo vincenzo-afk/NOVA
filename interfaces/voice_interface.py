@@ -92,7 +92,16 @@ def _normalize_hotkey(spec: str) -> str:
     }
     normalized: list[str] = []
     for part in parts:
-        normalized.append(mapping.get(part, part if part.startswith("<") else part))
+        if part in mapping:
+            normalized.append(mapping[part])
+        elif part.startswith("<") and part.endswith(">"):
+            # Already in angle-bracket form — keep as-is.
+            normalized.append(part)
+        else:
+            # Bug 5 fix: pynput requires ALL key tokens to use angle brackets,
+            # including single characters. Without this, the hotkey string
+            # `<ctrl>+<shift>+x` is silently invalid on Linux/Mac.
+            normalized.append(f"<{part}>")
     return "+".join(normalized)
 
 
