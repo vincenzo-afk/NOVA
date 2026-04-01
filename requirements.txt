@@ -59,6 +59,7 @@ pystray==0.19.5
 # Tasks
 APScheduler==3.10.4
 SQLAlchemy==2.0.29
+watchdog==4.0.1          # Tier 1: File System Event Watcher (NOVAFSWatcher)
 
 # Validation
 pydantic==2.12.5

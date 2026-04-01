@@ -29,6 +29,30 @@ def _get_clipboard() -> str:
     return ""
 
 
+# ── Tier 1: Clipboard Content-Type Classifier (zero LLM cost) ─────────────────
+
+def _classify_clipboard(text: str) -> str:
+    """Classify clipboard content into one of four semantic types.
+
+    Returns: 'CODE_BLOCK' | 'ERROR_TRACE' | 'URL' | 'PLAIN_TEXT'
+    """
+    if not text or not text.strip():
+        return "PLAIN_TEXT"
+    t = text[:4000]  # cap before pattern matching
+    # Error trace
+    if any(kw in t for kw in ("Traceback", "Error:", "Exception:", "EXCEPTION", "stack trace")):
+        return "ERROR_TRACE"
+    # Code block
+    if any(kw in t for kw in ("def ", "class ", "import ", "function ", "return ", "const ", "let ", "var ")):
+        return "CODE_BLOCK"
+    if any(ch in t for ch in ("{}", "():", "() {", ";\n", "\t")):
+        return "CODE_BLOCK"
+    # URL
+    if t.strip().startswith(("http://", "https://")) or "http://" in t or "https://" in t:
+        return "URL"
+    return "PLAIN_TEXT"
+
+
 def _foreground_app_and_title() -> tuple[str, str]:
     system = platform.system().lower()
 
@@ -128,6 +152,7 @@ _REFRESH_INFLIGHT = False
 
 def _compute_snapshot(include_clipboard: bool) -> dict:
     clipboard = _get_clipboard()[:1000] if include_clipboard else ""
+    clipboard_type = _classify_clipboard(clipboard) if include_clipboard else "PLAIN_TEXT"
     app, title = _foreground_app_and_title()
     return {
         "time": datetime.now().isoformat(timespec="seconds"),
@@ -136,6 +161,7 @@ def _compute_snapshot(include_clipboard: bool) -> dict:
         "hostname": socket.gethostname(),
         "network": _network_status(),
         "clipboard": clipboard,
+        "clipboard_type": clipboard_type,
         "foreground_app": app,
         "window_title": title,
         "battery_pct": _battery_pct(),
