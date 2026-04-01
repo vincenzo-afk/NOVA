@@ -427,7 +427,7 @@ class NOVAApp:
 
         # Bug 1 fix: if the persisted usage was from a previous day, don't carry
         # _hard_cap_hit forward — the user would be silently blocked all of day 2.
-        total_today = self.usage.total_tokens_today(session_id=settings.DEFAULT_SESSION)
+        total_today = self.usage.total_tokens_today(session_id=None)
         _today = date.today()
         if total_today >= settings.DAILY_TOKEN_HARD_CAP:
             self._hard_cap_hit = True
@@ -941,8 +941,7 @@ class NOVAApp:
 
     def _run_goal(self, goal: str, steps: list[GoalStepArgs], max_steps: int = 20, dry_run: bool = False) -> dict:
         step_dicts = [{"tool": step.tool, "args": step.args} for step in steps]
-        with self._goal_execution_lock:
-            result = self.goal_runner.run(step_dicts, max_steps=max_steps, dry_run=dry_run)
+        result = self.goal_runner.run(step_dicts, max_steps=max_steps, dry_run=dry_run)
         
         return {
             "goal": goal,
@@ -1193,9 +1192,59 @@ class NOVAApp:
             for item in self._goals:
                 if item.get("id") == goal_id:
                     if item.get("status") in {"paused", "failed"}:
-                        item["status"] = "pending"
-                        self._persist_goals()
-                        return {"goal_id": goal_id, "status": "pending"}
+                        if not item.get("steps"):
+                            item["status"] = "planning"
+                            self._persist_goals()
+                            
+                            def background_plan():
+                                with self._goal_plan_submit_lock:
+                                    self._goal_plan_jobs_inflight += 1
+                                if self._shutting_down.is_set():
+                                    with self._goal_plan_submit_lock:
+                                        self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
+                                    return
+                                try:
+                                    plan = self._plan_goal(item.get("goal", ""), max_steps=min(item.get("max_steps", 20), 30))
+                                except Exception as exc:
+                                    plan = {"status": "failed", "reason": f"planning_exception:{exc}"}
+                                if self._shutting_down.is_set():
+                                    with self._goal_plan_submit_lock:
+                                        self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
+                                    return
+                                with self._goal_lock:
+                                    for g in self._goals:
+                                        if g.get("id") == goal_id:
+                                            if plan.get("status") == "ok":
+                                                g["steps"] = plan["steps"]
+                                                g["status"] = "pending"
+                                            else:
+                                                g["status"] = "failed"
+                                                g["last_result"] = plan
+                                            self._persist_goals()
+                                            break
+                                with self._goal_plan_submit_lock:
+                                    self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
+                            
+                            future = self._goal_plan_executor.submit(background_plan)
+                            def _on_done(fut):
+                                try:
+                                    fut.result()
+                                except Exception as exc:
+                                    with self._goal_lock:
+                                        for g in self._goals:
+                                            if g.get("id") == goal_id and g.get("status") == "planning":
+                                                g["status"] = "failed"
+                                                g["last_result"] = {"status": "failed", "reason": f"planning_future_exception:{exc}"}
+                                                self._persist_goals()
+                                                break
+                                    with self._goal_plan_submit_lock:
+                                        self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
+                            future.add_done_callback(_on_done)
+                            return {"goal_id": goal_id, "status": "planning"}
+                        else:
+                            item["status"] = "pending"
+                            self._persist_goals()
+                            return {"goal_id": goal_id, "status": "pending"}
                     if item.get("status") == "completed":
                         return {"goal_id": goal_id, "status": "already_completed"}
                     return {"goal_id": goal_id, "status": item.get("status")}
@@ -2136,7 +2185,7 @@ class NOVAApp:
         try:
             system = "Summarize the conversation history into a concise paragraph for future context."
             summary = self.engine.ask(prompt=text, system=system, history=[])
-            self._track_usage(system, [], "[history_summary]", summary)
+            self._track_usage(system, [], "[history_summary]", summary, session_id=session_id)
             if not str(summary).strip():
                 return
             # Fix 3.2 & 11: Lock around LRU ordered dict cache 
@@ -2371,6 +2420,7 @@ class NOVAApp:
         assistant_text: str,
         *,
         day_anchor: date | None = None,
+        session_id: str | None = None,
     ) -> None:
         input_tokens = estimate_tokens(system_prompt) + estimate_tokens(user_text)
         input_tokens += sum(estimate_tokens(str(m.get("content", ""))) for m in history)
@@ -2378,7 +2428,7 @@ class NOVAApp:
 
         today = day_anchor or date.today()
         with self._usage_lock:
-            session_id = self.session.current.session_id
+            session_id = session_id or self.session.current.session_id
             provider = self.engine.last_provider
             self.usage.add(provider, input_tokens, output_tokens, session_id=session_id, when=today)
             total = self.usage.total_tokens_today(session_id=session_id)
