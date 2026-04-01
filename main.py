@@ -70,6 +70,19 @@ from control.window_manager import WindowManager
 from control.macos_permissions import check_permissions as _check_macos_permissions
 from interfaces.onboarding import run_onboarding
 from core.plugin_generator import PluginGenerator
+# ── Proactive Intelligence layer ──────────────────────────────────────────────
+from utils.behavior_model import BehaviorModel
+from utils.commitment_extractor import extract_commitments, iter_commitments_from_history
+from utils.tool_profiler import ToolProfiler
+from utils.presence_manager import PresenceManager
+from utils.insight_extractor import InsightExtractor
+from core.memory.intent_graph import IntentGraph
+from core.context.fs_watcher import NOVAFSWatcher
+from core.llm.network_context import NetworkContextDetector
+from core.goals.template_library import GoalTemplateLibrary
+from core.goals.proactive_goal_engine import ProactiveGoalEngine
+from core.think.prompt_evolver import PromptEvolver
+from tasks.maintenance import MaintenanceOrchestrator
 
 
 class WebSearchArgs(BaseModel):
@@ -596,6 +609,108 @@ class NOVAApp:
         self._sync_all_inflight = False
         self._sync_all_lock = threading.Lock()
 
+        # ── Proactive Intelligence — Tier 1-5 components ──────────────────────
+        self._behavior_model   = BehaviorModel(privacy_mode=False)
+        self._intent_graph     = IntentGraph(privacy_mode=False)
+        self._tool_profiler    = ToolProfiler()
+        self._template_library = GoalTemplateLibrary()
+        self._prefetch_cache: dict[str, list] = {}      # Tier 3 speculative RAG
+        self._queued_alerts: deque = deque(maxlen=20)   # Tier 3 attention-aware queue
+        self._error_detections_this_hour: int = 0       # Tier 2 emotion predictor input
+        self._last_process_set: set[str] = set()        # Tier 1 process monitor
+        self._session_start_time = time.monotonic()     # Tier 2 session length tracking
+
+        self._presence_manager = PresenceManager(
+            telegram_fn=self._notify_telegram,
+            record_event_fn=self.record_event,
+            muted_fn=lambda: self._muted,
+        )
+
+        def _on_network_change(old_ctx: str, new_ctx: str) -> None:
+            import logging
+            logging.getLogger(__name__).info("[proactive] Network context: %s → %s", old_ctx, new_ctx)
+            if settings.AUTONOMY_ENABLED:
+                target = "nova_work" if new_ctx == "work" else "nova_personal"
+                try:
+                    self.switch_session(target)
+                    self._notify_telegram(f"🌐 Network context changed to *{new_ctx}* — switched to {target} session.")
+                except Exception:
+                    pass
+
+        self._network_ctx_detector = NetworkContextDetector(on_change=_on_network_change)
+
+        def _on_doc_changed(filepath: str) -> None:
+            try:
+                self.docs.update(filepath)
+            except Exception:
+                pass
+
+        def _on_git_commit(msg: str) -> None:
+            try:
+                sid = self.session.current.session_id
+                self.memory.add(f"Git commit: {msg}", sid, {"source": "git"})
+            except Exception:
+                pass
+
+        watched_paths = list(getattr(self.docs, "_doc_meta", {}).keys())
+        self._fs_watcher = NOVAFSWatcher(
+            watched_paths=watched_paths,
+            on_file_changed=_on_doc_changed,
+            on_git_commit=_on_git_commit,
+        )
+
+        self._insight_extractor = InsightExtractor(
+            llm_ask_fn=lambda p, s: self.engine.ask(prompt=p, system=s, history=[]),
+            memory_get_all_fn=lambda sid: self.memory.get_all(sid) if hasattr(self.memory, 'get_all') else [],
+            memory_add_fn=lambda text, sid, meta: self.memory.add(text, sid, meta),
+            notify_fn=self._notify_telegram,
+            estimate_tokens_fn=lambda t: estimate_tokens(t),
+            session_list_fn=lambda: list(self.session._sessions.keys()) if hasattr(self.session, '_sessions') else [self.session.current.session_id],
+        )
+
+        def _get_baseline_success() -> float:
+            goals = self._goals
+            completed = sum(1 for g in goals if g.get("status") == "completed")
+            total = max(1, len(goals))
+            return completed / total
+
+        self._prompt_evolver = PromptEvolver(
+            llm_ask_fn=lambda p, s: self.engine.ask(prompt=p, system=s, history=[]),
+            notify_fn=self._notify_telegram,
+            get_baseline_success_rate_fn=_get_baseline_success,
+        )
+
+        def _propose_proactive_goal(goal_dict: dict) -> None:
+            """Add a proposed goal to the goals list and notify."""
+            with self._goal_lock:
+                if len(self._goals) >= self._max_pending_goals:
+                    return
+                self._goals.append(goal_dict)
+                self._persist_goals()
+            desc = goal_dict.get("goal", "")[:80]
+            gid = goal_dict.get("id", "")
+            self._notify_telegram(
+                f"💡 *Proactive goal queued:* {desc}\n"
+                f"It will auto-start in 5 min unless cancelled: `/cancel_goal {gid}`"
+            )
+
+        self._proactive_engine = ProactiveGoalEngine(
+            propose_fn=_propose_proactive_goal,
+            risk_check_fn=lambda tool, args: guardrails.check(tool, args),
+            behavior_model=self._behavior_model,
+            intent_graph=self._intent_graph,
+            template_library=self._template_library,
+            autonomy_enabled=settings.AUTONOMY_ENABLED,
+        )
+
+        self._maintenance = MaintenanceOrchestrator(
+            notify_fn=self._notify_telegram,
+            backup_fn=None,   # wired after scheduler starts
+            memory_sync_fn=lambda: self.memory.sync_pending(self.session.current.session_id),
+            health_check_fn=lambda: {k: v.status for k, v in self.health._subsystems.items()} if hasattr(self.health, '_subsystems') else {},
+        )
+        # ── end proactive intelligence init ─────────────────────────────────────
+
         if settings.PLUGINS_ENABLED:
             try:
                 load_plugins(self.dispatcher)
@@ -643,6 +758,13 @@ class NOVAApp:
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Failed to schedule ChromaDB backup: %s", exc)
+        # Start proactive systems after scheduler is ready
+        try:
+            self._network_ctx_detector.start()
+            self._fs_watcher.start()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Proactive system startup failed: %s", exc)
 
     def last_provider_label(self) -> str:
         return self.engine.last_provider
@@ -952,12 +1074,34 @@ class NOVAApp:
         }
 
     def _plan_goal(self, goal: str, max_steps: int = 10) -> dict:
+        # ── Tier 5: Try template before calling LLM ──────────────────────────
+        if hasattr(self, '_template_library') and self._template_library:
+            available = set(self.dispatcher._tools.keys()) if hasattr(self.dispatcher, '_tools') else set()
+            tmpl = self._template_library.find_matching_template(goal, available_tools=available)
+            if tmpl:
+                import logging
+                logging.getLogger(__name__).info("[plan_goal] using template '%s' (skipping LLM)", tmpl.name)
+                return {
+                    "steps": list(tmpl.steps),
+                    "goal": goal,
+                    "from_template": True,
+                    "template_name": tmpl.name,
+                }
+
+        # ── Tier 5: Inject tool reliability warning from profiler ─────────────
+        reliability_warning = ""
+        if hasattr(self, '_tool_profiler') and self._tool_profiler:
+            reliability_warning = self._tool_profiler.get_planner_warning()
+
         planner_prompt = (
             "You are a planning assistant. Break the user's goal into a short sequence of tool calls.\n"
             "Return ONLY valid JSON. Prefer this format:\n"
             '[{"tool": "<tool_name>", "args": {...}}, ...]\n'
             "No prose, no markdown. Keep it concise."
         )
+        if reliability_warning:
+            planner_prompt += f"\n\nNOTE: {reliability_warning}"
+
         system_prompt = build_system_prompt(
             planner_prompt,
             dispatcher=self.dispatcher,
@@ -1498,6 +1642,139 @@ class NOVAApp:
             logging.getLogger(__name__).warning("OmniParser startup check failed: %s", exc)
         self.health.start(interval_seconds=settings.HEALTH_MONITOR_INTERVAL)
 
+        # ── Proactive Intelligence scheduled jobs ─────────────────────────────
+        from datetime import datetime as _dt
+        _log_pi = __import__('logging').getLogger(__name__)
+
+        # Tier 2: Emotional trajectory update every 10 minutes
+        def _emotion_trajectory_job() -> None:
+            try:
+                now = _dt.now()
+                session_mins = (time.monotonic() - self._session_start_time) / 60.0
+                self.emotion.proactive_update(
+                    hour=now.hour,
+                    weekday=now.weekday(),
+                    recent_errors=self._error_detections_this_hour,
+                    session_length_minutes=session_mins,
+                )
+            except Exception:
+                pass
+        try:
+            self.scheduler.add_interval(func=_emotion_trajectory_job, seconds=600)
+        except Exception as e:
+            _log_pi.warning("[proactive] emotion job register failed: %s", e)
+
+        # Tier 1: Process lifecycle monitor every 60 seconds
+        _PROCESS_CTX_MAP = {
+            "zoom": "meeting", "teams": "meeting", "webex": "meeting",
+            "pycharm": "python_dev", "vscode": "coding", "code": "coding",
+            "docker": "containerized_workload", "obs": "recording",
+            "slack": "comms", "discord": "comms",
+        }
+        def _process_monitor_job() -> None:
+            try:
+                procs = win32_api.list_processes()
+                current_set = {p.lower() for p in (procs or [])}
+                appeared = current_set - self._last_process_set
+                self._last_process_set = current_set
+                for proc in appeared:
+                    ctx = _PROCESS_CTX_MAP.get(proc)
+                    if ctx == "meeting":
+                        self.emotion.update_from_signal("cautious")
+                        if settings.VOICE_BARGEIN_ENABLED:
+                            self._muted = True
+                            self._notify_telegram("🎙️ Looks like you're in a call — I've paused voice output.")
+                    if ctx:
+                        self._handle_proactive_alert(f"[process] {proc} started ({ctx} context)")
+            except Exception:
+                pass
+        try:
+            self.scheduler.add_interval(func=_process_monitor_job, seconds=60)
+        except Exception as e:
+            _log_pi.warning("[proactive] process monitor register failed: %s", e)
+
+        # Tier 4: Daily maintenance at 3am
+        def _maintenance_job() -> None:
+            try:
+                self._maintenance.run_daily_maintenance()
+            except Exception:
+                pass
+        try:
+            self.scheduler.add_daily(func=_maintenance_job, hour=3, minute=0)
+        except Exception as e:
+            _log_pi.warning("[proactive] maintenance job register failed: %s", e)
+
+        # Tier 2: Weekly insight extraction on Sunday at 2:30am
+        def _weekly_insight_job() -> None:
+            try:
+                from datetime import datetime as _dti, timezone as _tz
+                if _dti.now(_tz.utc).weekday() == 6:  # Sunday
+                    self._insight_extractor.run_weekly_extraction()
+            except Exception:
+                pass
+        try:
+            self.scheduler.add_daily(func=_weekly_insight_job, hour=2, minute=30)
+        except Exception as e:
+            _log_pi.warning("[proactive] insight job register failed: %s", e)
+
+        # Tier 5: Network context detect at 5-min intervals
+        # (NetworkContextDetector runs its own thread; no extra scheduler job needed)
+
+        # Tier 3: Drain queued alerts every 60s if attention state allows
+        def _drain_queued_alerts() -> None:
+            try:
+                if not self._queued_alerts:
+                    return
+                alerts = []
+                while self._queued_alerts:
+                    alerts.append(self._queued_alerts.popleft())
+                if not alerts:
+                    return
+                digest = "\n".join(f"• {a}" for a in alerts[:10])
+                self._notify_telegram(f"📋 *While you were focused:*\n{digest}")
+            except Exception:
+                pass
+        try:
+            self.scheduler.add_interval(func=_drain_queued_alerts, seconds=60)
+        except Exception as e:
+            _log_pi.warning("[proactive] alert drain job register failed: %s", e)
+
+        # Tier 3: Commitment deadline reminder daily at 9am
+        def _commitment_reminder_job() -> None:
+            try:
+                from utils.commitment_extractor import Commitment
+                from datetime import datetime as _dtime, timezone as _tz2
+                import json as _json
+                now = _dtime.now(_tz2.utc)
+                results = self.memory.search(
+                    "commitment deadline", self.session.current.session_id, top_k=10
+                )
+                for item in (results or []):
+                    meta = item.get("metadata") or {}
+                    if meta.get("source") != "commitment":
+                        continue
+                    dl_ts = meta.get("deadline_ts")
+                    if not dl_ts:
+                        continue
+                    try:
+                        from datetime import datetime as _dp
+                        dl = _dp.fromisoformat(dl_ts)
+                        diff_h = (dl - now.replace(tzinfo=None)).total_seconds() / 3600
+                        if 0 < diff_h <= 48:
+                            desc = item.get("memory") or item.get("text") or ""
+                            self._notify_telegram(
+                                f"⏰ *Commitment reminder:*\n{desc[:200]}\n"
+                                f"_(due in {diff_h:.0f}h)_"
+                            )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            self.scheduler.add_daily(func=_commitment_reminder_job, hour=9, minute=0)
+        except Exception as e:
+            _log_pi.warning("[proactive] commitment reminder failed: %s", e)
+
     def _start_watchers_if_enabled(self) -> None:
         if settings.PROACTIVE_WATCHER_ENABLED:
             try:
@@ -1705,6 +1982,44 @@ class NOVAApp:
 
             if self._shutting_down.is_set():
                 break
+
+            # ── Tier 4: Goal outcome learning + auto-doc ──────────────────────
+            if status == "completed":
+                self._memory_executor.submit(self._auto_document_goal_outcome, goal, result)
+                # Tier 5: Record success to template library and prompt evolver
+                try:
+                    elapsed = time.time() - float(goal.get("started_at") or time.time())
+                    self._template_library.record_success(
+                        goal_description=str(goal.get("goal", "")),
+                        steps=steps,
+                        completion_time=elapsed,
+                        available_tools=set(self.dispatcher._tools.keys()) if hasattr(self.dispatcher, '_tools') else set(),
+                    )
+                    self._prompt_evolver.record_goal_outcome(self.session.current.session_id, succeeded=True)
+                except Exception:
+                    pass
+            elif status == "failed":
+                # Tier 4: Goal outcome learning — attempt replanning
+                self._memory_executor.submit(self._handle_goal_failure, goal, result)
+                try:
+                    self._prompt_evolver.record_goal_outcome(self.session.current.session_id, succeeded=False)
+                except Exception:
+                    pass
+            # ── Tier 3: Drain proposed goals that have waited their grace period
+            if hasattr(self, '_proactive_engine'):
+                try:
+                    running_count = sum(1 for g in self._goals if g.get("status") == "running")
+                    new_goals = self._proactive_engine.drain_auto_approvable(running_count)
+                    if new_goals:
+                        with self._goal_lock:
+                            for ng in new_goals:
+                                if not any(g.get("id") == ng.get("id") for g in self._goals):
+                                    self._goals.append(ng)
+                            self._persist_goals()
+                except Exception:
+                    pass
+            # ─────────────────────────────────────────────────────────────────
+
             message = build_goal_status_message(
                 goal_id=str(goal.get("id")),
                 goal=str(goal.get("goal")),
@@ -1827,9 +2142,18 @@ class NOVAApp:
     def _handle_proactive_alert(self, message: str) -> None:
         if "potentially malicious on-screen text" in message.lower():
             self.record_event("security", message)
+        if "error" in message.lower() or "crash" in message.lower():
+            self._error_detections_this_hour = getattr(self, '_error_detections_this_hour', 0) + 1
         self.record_event("proactive", message)
         if self._muted:
             return
+        # ── Tier 3: Attention-aware interrupt scheduling ──────────────────────
+        # Queue non-urgent alerts during deep focus; drain happens in scheduler job
+        _is_urgent = any(kw in message.lower() for kw in ("error", "crash", "security", "disk", "failed"))
+        if not _is_urgent and hasattr(self, '_queued_alerts'):
+            self._queued_alerts.append(message)
+            return
+        # ─────────────────────────────────────────────────────────────────────
         print(f"\n[proactive] {message}")
         self.session.add_turn("assistant", message)
         _ = notify_background_event(
@@ -2061,6 +2385,53 @@ class NOVAApp:
             description=(
                 "Generate a new NOVA plugin from a natural-language description. "
                 "The generated code is shown for human approval before being loaded."
+            ),
+        )
+
+        # ── Proactive Intelligence exposed tools ───────────────────────────────
+        self.dispatcher.register(
+            "behavior.profile",
+            lambda: self._behavior_model.get_profile_summary(),
+            EmptyArgs,
+            description=(
+                "Return the behavioral rhythm profile: predicted next activities "
+                "based on historical patterns for the current time slot."
+            ),
+        )
+        self.dispatcher.register(
+            "tool.stats",
+            lambda: self._tool_profiler.all_stats(),
+            EmptyArgs,
+            description=(
+                "Return reliability statistics for all tools: success rate, "
+                "average latency, and top failure reasons."
+            ),
+        )
+        self.dispatcher.register(
+            "intent.graph",
+            lambda: self._intent_graph.summary(),
+            EmptyArgs,
+            description=(
+                "Return a summary of the intent co-occurrence graph: "
+                "hot topics and node count."
+            ),
+        )
+        self.dispatcher.register(
+            "goal.templates",
+            lambda: {"templates": self._template_library.all_templates()},
+            EmptyArgs,
+            description=(
+                "List all learned goal templates including trigger keywords, "
+                "steps, and success counts."
+            ),
+        )
+        self.dispatcher.register(
+            "insight.weekly",
+            lambda: self._insight_extractor.run_weekly_extraction() or {"status": "extraction_queued"},
+            EmptyArgs,
+            description=(
+                "Manually trigger a cross-session weekly insight extraction "
+                "and surface the results."
             ),
         )
 
@@ -2382,6 +2753,28 @@ class NOVAApp:
             return
         session_id = self.session.current.session_id
 
+        # ── Tier 2: Intent Graph update ───────────────────────────────────────
+        if hasattr(self, '_intent_graph') and self._intent_graph:
+            try:
+                self._intent_graph.ingest_turn(user_text)
+            except Exception:
+                pass
+
+        # ── Tier 3: Commitment extraction ─────────────────────────────────────
+        if hasattr(self, 'session') and user_text:
+            try:
+                commitments = extract_commitments(user_text, role="user", min_confidence=0.65)
+                for c in commitments[:5]:
+                    self._memory_executor.submit(
+                        self.memory.add,
+                        c.to_memory_text(),
+                        session_id,
+                        {"source": "commitment", "deadline_ts": c.deadline.isoformat() if c.deadline else None},
+                    )
+            except Exception:
+                pass
+        # ─────────────────────────────────────────────────────────────────────
+
         def _job() -> None:
             try:
                 self.memory.add(
@@ -2412,6 +2805,99 @@ class NOVAApp:
             return "Error: ADB not available"
         return self.adb.send_sms(phone_number, body)
 
+    def _handle_goal_failure(self, goal: dict, result: Any) -> None:
+        """Tier 4: Goal Outcome Learning — attempt LLM replanning on failure."""
+        try:
+            replan_count = int(goal.get("replan_count") or 0)
+            steps = goal.get("steps") or []
+            fail_index = int(getattr(result, 'next_index', 0))
+            fail_step = steps[fail_index] if fail_index < len(steps) else {}
+            reason = getattr(result, 'reason', 'unknown')
+
+            if replan_count >= 2:
+                # Second failure: escalate to human
+                self._notify_telegram(
+                    f"🛑 *Goal stuck:* {goal.get('goal', '')[:60]}\n"
+                    f"Step {fail_index + 1} failed: `{fail_step.get('tool', '?')}` — {reason}\n"
+                    "I've tried replanning once already. Want me to try a different approach?"
+                )
+                with self._goal_lock:
+                    for g in self._goals:
+                        if g.get("id") == goal.get("id"):
+                            g["status"] = "requires_human"
+                return
+
+            # First failure: generate alternative step via LLM
+            tool_hint = self.dispatcher.get_tool_schema_prompt() if hasattr(self.dispatcher, 'get_tool_schema_prompt') else ""
+            prompt = (
+                f"This goal step failed:\n{json.dumps(fail_step)}\n"
+                f"Error: {reason}\n"
+                f"Available tools:\n{tool_hint[:2000]}\n"
+                "Suggest ONE alternative step as JSON: {\"tool\": \"...\", \"args\": {...}}"
+            )
+            raw = self.engine.ask(prompt=prompt, system="You are a goal replanning assistant.", history=[])
+            new_step: dict = {}
+            try:
+                import re as _re
+                m = _re.search(r'\{.*\}', raw, flags=_re.DOTALL)
+                if m:
+                    new_step = json.loads(m.group(0))
+            except Exception:
+                pass
+
+            if not new_step or not new_step.get("tool"):
+                return
+
+            # Risk-check the new step
+            check = guardrails.check(new_step.get("tool", ""), new_step.get("args", {}))
+            if getattr(check, 'score', 10) > 6:
+                return  # too risky to auto-insert
+
+            with self._goal_lock:
+                for g in self._goals:
+                    if g.get("id") == goal.get("id"):
+                        new_steps = list(g.get("steps") or [])
+                        new_steps.insert(fail_index, new_step)
+                        g["steps"] = new_steps
+                        g["status"] = "pending"
+                        g["replan_count"] = replan_count + 1
+                        self._persist_goals()
+                        break
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("[goal_failure] replanning failed: %s", exc)
+
+    def _auto_document_goal_outcome(self, goal: dict, result: Any) -> None:
+        """Tier 4: Proactive Documentation — store a 2-sentence completion note."""
+        try:
+            steps = goal.get("steps") or []
+            if len(steps) < 3:
+                return  # only doc multi-step goals
+            total_today = self.usage.total_tokens_today(session_id=None)
+            budget_ok = total_today < int(settings.DAILY_TOKEN_ALERT_THRESHOLD * 0.8) if settings.DAILY_TOKEN_ALERT_THRESHOLD else True
+            if not budget_ok:
+                return
+            step_summary = ", ".join(s.get("tool", "?") for s in steps[:5])
+            prompt = (
+                f"Summarize what was accomplished: {goal.get('goal', '')}\n"
+                f"Steps taken: {step_summary}\n"
+                "Write a 2-sentence note that future-you would want to know."
+            )
+            note = self.engine.ask(
+                prompt=prompt,
+                system="You are a concise technical note-taker.",
+                history=[],
+            ).strip()
+            if note:
+                self.memory.add(
+                    note,
+                    self.session.current.session_id,
+                    {"source": "goal_outcome", "goal_id": str(goal.get("id", ""))},
+                )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("[auto_doc] documentation failed: %s", exc)
+
     def _track_usage(
         self,
         system_prompt: str,
@@ -2431,6 +2917,17 @@ class NOVAApp:
             session_id = session_id or self.session.current.session_id
             provider = self.engine.last_provider
             self.usage.add(provider, input_tokens, output_tokens, session_id=session_id, when=today)
+
+        # ── Tier 2: Behavior model recording ─────────────────────────────────
+        if hasattr(self, '_behavior_model') and self._behavior_model:
+            try:
+                self._behavior_model.record_activity(
+                    provider=provider,
+                    session_id=session_id,
+                )
+            except Exception:
+                pass
+        # ─────────────────────────────────────────────────────────────────────
             total = self.usage.total_tokens_today(session_id=session_id)
             if self._hard_cap_hit_date != today:
                 self._hard_cap_hit = False
