@@ -114,7 +114,7 @@ def run_cli(agent) -> None:
                 lock_file.chmod(0o600)
             except Exception:
                 pass
-            print("Access Denied. Too many failed attempts.")
+            print("Access Denied. Too many failed attempts. Locked for 5 minutes.")
             return
 
     console = Console()

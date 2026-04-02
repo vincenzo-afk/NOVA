@@ -543,8 +543,10 @@ class NOVAApp:
             try:
                 self._goals = json.loads(self._goals_file.read_text(encoding="utf-8"))
                 for goal in self._goals:
-                    if goal.get("status") in {"planning", "running"}:
+                    if goal.get("status") == "running":
                         goal["status"] = "pending"
+                    elif goal.get("status") == "planning":
+                        goal["status"] = "failed"
             except Exception as exc:
                 import logging
                 logging.getLogger(__name__).warning(
@@ -779,6 +781,13 @@ class NOVAApp:
         # Clear per-session summary state on switch to avoid stale bleed-through.
         self._clear_session_context_state(previous_session_id, clear_summary=False)
         self._clear_session_context_state(state.session_id, clear_summary=True)
+        # Cancel any running goal on this session before closing resources
+        with self._goal_lock:
+            for g in self._goals:
+                if g.get("status") in {"planning", "pending", "running", "approved_for_step", "awaiting_confirmation"}:
+                    g["status"] = "cancelled"
+                    if "last_result" not in g:
+                        g["last_result"] = {"status": "cancelled", "reason": "session_switched"}
         # Session isolation: reset stateful tool clients on session switch.
         with self._browser_lock:
             self._browser_close()
@@ -1901,6 +1910,8 @@ class NOVAApp:
                             goal = None
                             break
                         if item.get("status") in {"pending", "approved_for_step"} and item.get("steps"):
+                            if self._is_goal_cancelled(item.get("id")):
+                                continue
                             # If it was specifically approved, we will pass a flag down
                             goal = copy.deepcopy(item)
                             item["status"] = "running"
@@ -2203,6 +2214,9 @@ class NOVAApp:
                 break
                 
             if speak_offline is None:
+                if not getattr(self, "_tts_warning_printed", False):
+                    print("[tts] Warning: pyttsx3 not installed. Voice output unavailable.")
+                    self._tts_warning_printed = True
                 self._tts_queue.task_done()
                 continue
                 
@@ -2484,7 +2498,6 @@ class NOVAApp:
         summary, recent = self.trimmer.trim(
             history,
             session_id=session_id,
-            summarizer=lambda snippet: self._summarize_history(snippet, session_id),
         )
         memories = self.memory.search(user_text, session_id=session_id, top_k=DEFAULT_MEMORY_TOP_K)
         world_state = snapshot_environment(include_clipboard=settings.INCLUDE_CLIPBOARD_IN_CONTEXT)
@@ -2929,9 +2942,6 @@ class NOVAApp:
                 pass
         # ─────────────────────────────────────────────────────────────────────
             total = self.usage.total_tokens_today(session_id=session_id)
-            if self._hard_cap_hit_date != today:
-                self._hard_cap_hit = False
-                self._hard_cap_hit_date = None
             if self._hard_cap_warning_day != today:
                 self._hard_cap_warning_day = None
             hardcap = settings.DAILY_TOKEN_HARD_CAP
