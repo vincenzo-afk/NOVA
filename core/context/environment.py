@@ -143,11 +143,11 @@ def _network_status() -> str:
 
 import time
 
-_ENVIRONMENT_CACHE: dict = {}
 _ENVIRONMENT_CACHE_TTL = 10.0
-_ENVIRONMENT_CACHE_TIME = 0.0
+_ENVIRONMENT_CACHE: dict[bool, dict] = {True: {}, False: {}}
+_ENVIRONMENT_CACHE_TIME: dict[bool, float] = {True: 0.0, False: 0.0}
 _ENVIRONMENT_LOCK = threading.RLock()
-_REFRESH_INFLIGHT = False
+_REFRESH_INFLIGHT: dict[bool, bool] = {True: False, False: False}
 
 
 def _compute_snapshot(include_clipboard: bool) -> dict:
@@ -174,19 +174,21 @@ def _refresh_background(include_clipboard: bool) -> None:
     try:
         snapshot = _compute_snapshot(include_clipboard=include_clipboard)
         with _ENVIRONMENT_LOCK:
-            _ENVIRONMENT_CACHE = dict(snapshot)
-            _ENVIRONMENT_CACHE_TIME = time.monotonic()
+            _ENVIRONMENT_CACHE[include_clipboard] = dict(snapshot)
+            _ENVIRONMENT_CACHE_TIME[include_clipboard] = time.monotonic()
     finally:
         with _ENVIRONMENT_LOCK:
-            _REFRESH_INFLIGHT = False
+            _REFRESH_INFLIGHT[include_clipboard] = False
 
 def snapshot_environment(include_clipboard: bool = True) -> dict:
     global _ENVIRONMENT_CACHE, _ENVIRONMENT_CACHE_TIME, _REFRESH_INFLIGHT
     now = time.monotonic()
     with _ENVIRONMENT_LOCK:
-        if now - _ENVIRONMENT_CACHE_TIME < _ENVIRONMENT_CACHE_TTL:
+        cache_time = _ENVIRONMENT_CACHE_TIME.get(include_clipboard, 0.0)
+        cache = dict(_ENVIRONMENT_CACHE.get(include_clipboard, {}))
+        if now - cache_time < _ENVIRONMENT_CACHE_TTL and cache:
             # Return copied cache but update to current time dynamically
-            cached = dict(_ENVIRONMENT_CACHE)
+            cached = dict(cache)
             cached["time"] = datetime.now().isoformat(timespec="seconds")
             if not include_clipboard:
                 cached.pop("clipboard", None)
@@ -194,14 +196,14 @@ def snapshot_environment(include_clipboard: bool = True) -> dict:
             return cached
 
         # If we already have data, return stale data immediately and refresh asynchronously.
-        if _ENVIRONMENT_CACHE:
-            cached = dict(_ENVIRONMENT_CACHE)
+        if cache:
+            cached = dict(cache)
             cached["time"] = datetime.now().isoformat(timespec="seconds")
             if not include_clipboard:
                 cached.pop("clipboard", None)
                 cached["last_active_file"] = None
-            if not _REFRESH_INFLIGHT:
-                _REFRESH_INFLIGHT = True
+            if not _REFRESH_INFLIGHT.get(include_clipboard, False):
+                _REFRESH_INFLIGHT[include_clipboard] = True
                 threading.Thread(
                     target=_refresh_background,
                     args=(include_clipboard,),
@@ -224,8 +226,8 @@ def snapshot_environment(include_clipboard: bool = True) -> dict:
     if include_clipboard:
         fallback["clipboard"] = ""
     with _ENVIRONMENT_LOCK:
-        if not _REFRESH_INFLIGHT:
-            _REFRESH_INFLIGHT = True
+        if not _REFRESH_INFLIGHT.get(include_clipboard, False):
+            _REFRESH_INFLIGHT[include_clipboard] = True
             threading.Thread(
                 target=_refresh_background,
                 args=(include_clipboard,),

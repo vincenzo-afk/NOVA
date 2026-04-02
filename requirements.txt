@@ -14,7 +14,7 @@ google-generativeai==0.3.0  # pin loosely — changes with Gemini API
 pvporcupine==3.0.0           # wake word; binary wheels vary per platform
 pyaudio==0.2.13
 sounddevice==0.4.6
-# silero-vad                 # install separately from torch ecosystem
+silero-vad==5.1.2
 faster-whisper==1.0.0
 pyttsx3==2.90
 gTTS==2.3.2

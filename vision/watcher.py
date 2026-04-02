@@ -32,11 +32,13 @@ class ScreenWatcher:
         interval_seconds: float = 6.0,
         cooldown_seconds: float = 120.0,
         on_alert: Callable[[str], None] | None = None,
+        on_screen_state: Callable[[str, str], None] | None = None,
         omniparser_url: str = "http://localhost:8000",
     ):
         self.interval_seconds = max(1.0, float(interval_seconds))
         self.cooldown_seconds = max(10.0, float(cooldown_seconds))
         self.on_alert = on_alert or (lambda msg: print(msg))
+        self.on_screen_state = on_screen_state
         self.omniparser = OmniParserClient(omniparser_url)
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -79,6 +81,14 @@ class ScreenWatcher:
 
         if NetworkState.is_online():
             analysis = analyze_image(image_bytes)
+            if isinstance(analysis, dict) and self.on_screen_state:
+                try:
+                    self.on_screen_state(
+                        str(analysis.get("active_app", "") or ""),
+                        str(analysis.get("scene_type", "") or ""),
+                    )
+                except Exception:
+                    pass
         else:
             try:
                 ocr_text = self.omniparser.ocr_text(image_bytes)

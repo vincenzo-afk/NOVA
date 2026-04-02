@@ -109,6 +109,7 @@ class NOVAFSWatcher:
                     src = str(Path(event.src_path).expanduser().resolve())
                     # New code/doc file — add to doc store if under line limit
                     if src.endswith((".py", ".md", ".txt", ".rst")) and watcher._debounce.ok(src):
+                        watcher.add_path(src)
                         if watcher._on_file_changed:
                             try:
                                 watcher._on_file_changed(src)
