@@ -1387,9 +1387,8 @@ class NOVAApp:
                             
                             future = self._goal_plan_executor.submit(background_plan)
                             def _on_done(fut):
-                                try:
-                                    fut.result()
-                                except Exception as exc:
+                                exc = fut.exception()
+                                if exc is not None:
                                     with self._goal_lock:
                                         for g in self._goals:
                                             if g.get("id") == goal_id and g.get("status") == "planning":
