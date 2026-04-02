@@ -116,7 +116,7 @@ class GoalTemplateLibrary:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock:
                 payload = [t.to_dict() for t in self._templates[:_MAX_TEMPLATES]]
-            self._path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                self._path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception:
             pass
 

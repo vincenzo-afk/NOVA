@@ -45,16 +45,20 @@ class BehaviorModel:
             except Exception:
                 pass
 
-    def _save(self) -> None:
+    def _snapshot_locked(self) -> dict[str, dict[str, dict[str, Any]]]:
+        payload: dict[str, dict[str, dict[str, Any]]] = {}
+        for wd, hours in self._data.items():
+            payload[wd] = {}
+            for hr, counts in hours.items():
+                payload[wd][hr] = dict(counts)
+        return payload
+
+    def _save(self, snapshot: dict[str, dict[str, dict[str, Any]]] | None = None) -> None:
         if self.privacy_mode:
             return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            payload: dict = {}
-            for wd, hours in self._data.items():
-                payload[wd] = {}
-                for hr, counts in hours.items():
-                    payload[wd][hr] = dict(counts)
+            payload = snapshot if snapshot is not None else {}
             self._path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception:
             pass
@@ -81,7 +85,8 @@ class BehaviorModel:
             self._data[wd][hr][f"session_{session_id[:16]}"] = (
                 self._data[wd][hr].get(f"session_{session_id[:16]}", 0) + 1
             )
-        self._save()
+            snapshot = self._snapshot_locked()
+        self._save(snapshot)
 
     def record_screen_state(
         self,
@@ -102,7 +107,8 @@ class BehaviorModel:
             if scene_type:
                 key = f"scene_{scene_type[:32]}"
                 self._data[wd][hr][key] = self._data[wd][hr].get(key, 0) + 1
-        self._save()
+            snapshot = self._snapshot_locked()
+        self._save(snapshot)
 
     # ── prediction ────────────────────────────────────────────────────────────
 

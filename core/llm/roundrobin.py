@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import logging
 import threading
 from typing import Callable
 
@@ -85,11 +86,13 @@ class RoundRobinPool:
             record.cooldown_until = self._now_fn() + timedelta(seconds=backoff)
 
         try:
-            from utils.logger import get_logger
             label = self.key_label(key)
-            get_logger(__name__).warning(
-                f"Key {label} is rate-limited (failure #{failure_count}); "
-                f"cooldown {backoff}s (capped at {MAX_BACKOFF_SECONDS}s)"
+            logging.getLogger(__name__).warning(
+                "Key %s is rate-limited (failure #%s); cooldown %ss (capped at %ss)",
+                label,
+                failure_count,
+                backoff,
+                MAX_BACKOFF_SECONDS,
             )
         except Exception:
             pass
