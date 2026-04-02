@@ -92,15 +92,17 @@ def run_tray(agent: Any) -> None:
     def on_open_gui(_icon, _item):
         if gui_thread["ref"] is not None and gui_thread["ref"].is_alive():
             print("Tray action: GUI already running")
+            _notify("NOVA", "GUI is already running.")
             return
 
         def _launch():
             try:
                 from interfaces.gui.app import launch_gui
 
-                launch_gui(agent)
+                launch_gui(agent, notify_fn=_notify)
             except Exception as exc:
                 print(f"Tray action: failed to open GUI: {exc}")
+                _notify("NOVA GUI Error", f"Failed to launch GUI: {exc}")
 
         gui_thread["ref"] = threading.Thread(target=_launch, daemon=True)
         gui_thread["ref"].start()

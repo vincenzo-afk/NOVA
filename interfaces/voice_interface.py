@@ -72,12 +72,20 @@ def _speak_text(
     tts_offline(text, stop_event=stop_event)
 
 
-def _wait_for_wakeword(enabled: bool, event: threading.Event) -> None:
+def _wait_for_wakeword(
+    enabled: bool,
+    event: threading.Event,
+    stop_event: threading.Event | None = None,
+) -> None:
     if not enabled:
         return
     print("Waiting for wake word...")
-    event.wait()
-    event.clear()
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return
+        if event.wait(timeout=0.2):
+            event.clear()
+            return
 
 
 def _normalize_hotkey(spec: str) -> str:
@@ -127,6 +135,7 @@ def run_voice_loop(
     agent,
     interactive_text_fallback: bool = True,
     use_wakeword: bool = False,
+    stop_event: threading.Event | None = None,
 ) -> None:
     recorder = VADRecorder(silence_ms=settings.VAD_SILENCE_MS)
     whisper = OfflineWhisper(model_size=settings.WHISPER_MODEL)
@@ -142,8 +151,14 @@ def run_voice_loop(
     print("Voice mode started. Press Ctrl+C to stop.")
     try:
         while True:
+            if stop_event is not None and stop_event.is_set():
+                print("Voice mode stopped.")
+                return
             barge_in_event.clear()
-            _wait_for_wakeword(use_wakeword, wakeword_event)
+            _wait_for_wakeword(use_wakeword, wakeword_event, stop_event=stop_event)
+            if stop_event is not None and stop_event.is_set():
+                print("Voice mode stopped.")
+                return
 
             audio: bytes = b""
             capture_done = threading.Event()

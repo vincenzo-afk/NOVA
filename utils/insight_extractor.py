@@ -8,12 +8,15 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import date, datetime, timezone
+import json
+from pathlib import Path
 from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
 _INSIGHT_MAX_TOKENS = 8000
 _INSIGHT_MEMORY_SOURCE = "weekly_insight"
+_INSIGHT_STATE_PATH = Path(".jarvis/insight_extractor_state.json")
 
 
 class InsightExtractor:
@@ -40,6 +43,28 @@ class InsightExtractor:
         self._last_insight_week: int | None = None
         self._pending_insight: str | None = None
         self._lock = threading.Lock()
+        self._state_path = _INSIGHT_STATE_PATH
+        self._load_state()
+
+    def _load_state(self) -> None:
+        try:
+            if not self._state_path.exists():
+                return
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+            last_week = payload.get("last_insight_week")
+            self._last_insight_week = int(last_week) if last_week is not None else None
+        except Exception:
+            return
+
+    def _save_state(self) -> None:
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(
+                json.dumps({"last_insight_week": self._last_insight_week}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            return
 
     # ── weekly job (runs Sunday ~2:30am via scheduler) ─────────────────────────
 
@@ -52,6 +77,7 @@ class InsightExtractor:
             if self._last_insight_week == week_num:
                 return None  # already ran this week
             self._last_insight_week = week_num
+            self._save_state()
 
         try:
             sessions = self._list_sessions()

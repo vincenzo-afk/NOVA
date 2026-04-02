@@ -157,6 +157,13 @@ class GoalRunner:
                 confirm_callback=confirm_callback if confirm_callback is not None else self.confirm_callback,
                 dry_run=dry_run,
             )
+            if dry_run or authorized.reason == "dry_run":
+                return GoalResult(
+                    status="dry_run",
+                    reason="dry_run",
+                    results=[],
+                    next_index=idx,
+                )
             if authorized.blocked:
                 return GoalResult(
                     status="blocked",

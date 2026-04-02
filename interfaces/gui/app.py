@@ -71,7 +71,7 @@ def format_usage_line(snapshot: dict[str, Any]) -> str:
     return f"Today: {tokens} tokens | Active cloud keys: {active_keys}"
 
 
-def launch_gui(agent: Any) -> None:
+def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     try:
         from PyQt6.QtCore import QTimer
         from PyQt6.QtWidgets import (
@@ -88,6 +88,11 @@ def launch_gui(agent: Any) -> None:
         )
     except Exception:  # pragma: no cover
         print("PyQt6 not installed; GUI unavailable.")
+        if callable(notify_fn):
+            try:
+                notify_fn("NOVA GUI", "PyQt6 not installed; GUI unavailable.")
+            except Exception:
+                pass
         return
 
     app = QApplication([])
@@ -175,6 +180,7 @@ def launch_gui(agent: Any) -> None:
 
     send_btn = QPushButton("Send")
     mic_btn = QPushButton("Mic (One Shot)")
+    voice_loop_btn = QPushButton("Voice Loop Start")
     upload_btn = QPushButton("Upload Image")
     export_btn = QPushButton("Export")
     mute_btn = QPushButton("Mute")
@@ -208,6 +214,7 @@ def launch_gui(agent: Any) -> None:
 
     whisper_holder: dict[str, Any] = {"instance": None}
     mic_lock = threading.Lock()
+    voice_loop_state: dict[str, Any] = {"thread": None, "stop_event": None}
 
     def refresh_status() -> None:
         snapshot = build_status_snapshot(agent)
@@ -396,6 +403,38 @@ def launch_gui(agent: Any) -> None:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def toggle_voice_loop() -> None:
+        thread = voice_loop_state.get("thread")
+        if thread is not None and thread.is_alive():
+            stop_event = voice_loop_state.get("stop_event")
+            if stop_event is not None:
+                stop_event.set()
+            append_line("[voice] stopping continuous voice loop...")
+            voice_loop_btn.setText("Voice Loop Start")
+            return
+
+        stop_event = threading.Event()
+        voice_loop_state["stop_event"] = stop_event
+
+        def _loop_worker() -> None:
+            try:
+                from interfaces.voice_interface import run_voice_loop
+                run_voice_loop(
+                    agent,
+                    interactive_text_fallback=False,
+                    use_wakeword=bool(getattr(settings, "has_wakeword", False)),
+                    stop_event=stop_event,
+                )
+            except Exception as exc:
+                QTimer.singleShot(0, lambda: append_line(f"[voice-error] {exc}"))
+            finally:
+                QTimer.singleShot(0, lambda: voice_loop_btn.setText("Voice Loop Start"))
+
+        voice_loop_state["thread"] = threading.Thread(target=_loop_worker, daemon=True)
+        voice_loop_state["thread"].start()
+        append_line("[voice] continuous voice loop started")
+        voice_loop_btn.setText("Voice Loop Stop")
+
     # Top controls
     top_row = QHBoxLayout()
     top_row.addWidget(session_input)
@@ -403,6 +442,7 @@ def launch_gui(agent: Any) -> None:
     top_row.addWidget(status_btn)
     top_row.addWidget(upload_btn)
     top_row.addWidget(mic_btn)
+    top_row.addWidget(voice_loop_btn)
     top_row.addWidget(export_btn)
     top_row.addWidget(mute_btn)
 
@@ -439,6 +479,7 @@ def launch_gui(agent: Any) -> None:
     status_btn.clicked.connect(show_status_json)
     upload_btn.clicked.connect(upload_image)
     mic_btn.clicked.connect(mic_one_shot)
+    voice_loop_btn.clicked.connect(toggle_voice_loop)
     export_btn.clicked.connect(export_session)
     mute_btn.clicked.connect(toggle_mute)
     goal_add_btn.clicked.connect(add_goal)
