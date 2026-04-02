@@ -94,6 +94,17 @@ def _validate_url(url: str) -> tuple[str, str, str]:
     return scheme, hostname, resolved_ips[0]
 
 
+def _format_host_for_netloc(host: str) -> str:
+    """Format host for URL netloc, bracketing IPv6 literals when needed."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if ip.version == 6:
+        return f"[{host}]"
+    return host
+
+
 def scrape_text(url: str) -> str:
     current_url = url
     response = None
@@ -103,9 +114,10 @@ def scrape_text(url: str) -> str:
         request_url = current_url
         if scheme == "http":
             parsed = urlparse(current_url)
-            netloc = resolved_ip
+            safe_host = _format_host_for_netloc(resolved_ip)
+            netloc = safe_host
             if parsed.port:
-                netloc = f"{resolved_ip}:{parsed.port}"
+                netloc = f"{safe_host}:{parsed.port}"
             request_url = parsed._replace(netloc=netloc).geturl()
             headers["Host"] = hostname
         else:
@@ -245,4 +257,3 @@ def scrape_visual(
             result["omniparser_error"] = str(exc)
 
     return result
-

@@ -109,12 +109,13 @@ def run_cli(agent) -> None:
             time.sleep(delay)
         else:
             lock_file.parent.mkdir(parents=True, exist_ok=True)
-            lock_file.write_text(str(time.time() + 300), encoding="utf-8")
+            lock_seconds = 300
+            lock_file.write_text(str(time.time() + lock_seconds), encoding="utf-8")
             try:
                 lock_file.chmod(0o600)
             except Exception:
                 pass
-            print("Access Denied. Too many failed attempts. Locked for 300 seconds.")
+            print(f"Access Denied. Too many failed attempts. Locked for {lock_seconds} seconds.")
             return
 
     console = Console()

@@ -64,13 +64,11 @@ class LocalMemoryStore:
 
     def _dedup_exists(self, hash_id: str) -> bool:
         import time
-        if not self._use_chroma:
-            if time.time() > self._chroma_retry_time:
-                with self._chroma_init_lock:
-                    if not self._use_chroma and time.time() > self._chroma_retry_time:
-                        self._use_chroma = self._init_chroma()
-                        if not self._use_chroma:
-                            self._chroma_retry_time = time.time() + 60.0
+        with self._chroma_init_lock:
+            if not self._use_chroma and time.time() > self._chroma_retry_time:
+                self._use_chroma = self._init_chroma()
+                if not self._use_chroma:
+                    self._chroma_retry_time = time.time() + 60.0
             
         if not self._use_chroma:
             return hash_id in self._item_hashes
@@ -80,8 +78,9 @@ class LocalMemoryStore:
                 return True
             return hash_id in self._item_hashes
         except Exception:
-            self._use_chroma = False
-            self._chroma_retry_time = time.time() + 60.0
+            with self._chroma_init_lock:
+                self._use_chroma = False
+                self._chroma_retry_time = time.time() + 60.0
             return hash_id in self._item_hashes
 
     def add(self, text: str, session_id: str, metadata: dict | None = None) -> dict:

@@ -111,7 +111,7 @@ class IntentGraph:
                     if src != dst:
                         self._adj[src][dst] += 1
                         self._adj[dst][src] += 1
-            self._save()
+        self._save()
         return kws
 
     # ── queries ───────────────────────────────────────────────────────────────

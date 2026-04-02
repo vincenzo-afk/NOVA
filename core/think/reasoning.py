@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 
 from config.constants import DEFAULT_AMBIGUITY_THRESHOLD
 
@@ -45,6 +46,7 @@ _ACTION_VERBS = {
 
 
 _SOUL_PATH = "SOUL.md"
+_SOUL_FILE_LOCK = threading.Lock()
 
 
 def _load_soul() -> str:
@@ -55,7 +57,8 @@ def _load_soul() -> str:
     path = Path(_SOUL_PATH)
     if not path.exists():
         return ""
-    text = path.read_text(encoding="utf-8").strip()
+    with _SOUL_FILE_LOCK:
+        text = path.read_text(encoding="utf-8").strip()
     # Remove HTML comment blocks (the <!-- … --> wrapper at the top)
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL).strip()
     # Strip any unfilled onboarding placeholders gracefully

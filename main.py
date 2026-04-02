@@ -15,7 +15,7 @@ import threading
 import sys
 from collections import deque, OrderedDict
 from typing import Any, Generator
-from datetime import date
+from datetime import date, datetime
 import copy
 import queue
 from concurrent.futures import ThreadPoolExecutor
@@ -698,7 +698,7 @@ class NOVAApp:
 
         self._proactive_engine = ProactiveGoalEngine(
             propose_fn=_propose_proactive_goal,
-            risk_check_fn=lambda tool, args: guardrails.check(tool, args),
+            risk_check_fn=lambda tool, args: guardrails.check(__import__("core.tools.dispatcher", fromlist=["ToolCall"]).ToolCall(tool=tool, args=args)),
             behavior_model=self._behavior_model,
             intent_graph=self._intent_graph,
             template_library=self._template_library,
@@ -709,7 +709,7 @@ class NOVAApp:
             notify_fn=self._notify_telegram,
             backup_fn=None,   # wired after scheduler starts
             memory_sync_fn=lambda: self.memory.sync_pending(self.session.current.session_id),
-            health_check_fn=lambda: {k: v.status for k, v in self.health._subsystems.items()} if hasattr(self.health, '_subsystems') else {},
+            health_check_fn=lambda: self.health.status_table(),
         )
         # ── end proactive intelligence init ─────────────────────────────────────
 
@@ -789,8 +789,15 @@ class NOVAApp:
                     if "last_result" not in g:
                         g["last_result"] = {"status": "cancelled", "reason": "session_switched"}
         # Session isolation: reset stateful tool clients on session switch.
-        with self._browser_lock:
-            self._browser_close()
+        if self._browser_lock.acquire(timeout=1.0):
+            try:
+                if self._browser is not None:
+                    self._browser.close()
+                    self._browser = None
+            except Exception:
+                pass
+            finally:
+                self._browser_lock.release()
         self._mouse_keyboard = None
         # Bug 7 fix: reset omniparser client so it is not shared across sessions.
         self._omniparser_client = None
@@ -1085,7 +1092,7 @@ class NOVAApp:
     def _plan_goal(self, goal: str, max_steps: int = 10) -> dict:
         # ── Tier 5: Try template before calling LLM ──────────────────────────
         if hasattr(self, '_template_library') and self._template_library:
-            available = set(self.dispatcher._tools.keys()) if hasattr(self.dispatcher, '_tools') else set()
+            available = set(self.dispatcher.registry.keys()) if hasattr(self.dispatcher, 'registry') else set()
             tmpl = self._template_library.find_matching_template(goal, available_tools=available)
             if tmpl:
                 import logging
@@ -1669,7 +1676,7 @@ class NOVAApp:
             except Exception:
                 pass
         try:
-            self.scheduler.add_interval(func=_emotion_trajectory_job, seconds=600)
+            self.scheduler.add_interval(fn=_emotion_trajectory_job, seconds=600, job_id="emotion_traj")
         except Exception as e:
             _log_pi.warning("[proactive] emotion job register failed: %s", e)
 
@@ -1698,7 +1705,7 @@ class NOVAApp:
             except Exception:
                 pass
         try:
-            self.scheduler.add_interval(func=_process_monitor_job, seconds=60)
+            self.scheduler.add_interval(fn=_process_monitor_job, seconds=60, job_id="proc_mon")
         except Exception as e:
             _log_pi.warning("[proactive] process monitor register failed: %s", e)
 
@@ -1709,7 +1716,7 @@ class NOVAApp:
             except Exception:
                 pass
         try:
-            self.scheduler.add_daily(func=_maintenance_job, hour=3, minute=0)
+            self.scheduler.add_from_text(fn=_maintenance_job, schedule_text="every day at 03:00", job_id="maint_daily")
         except Exception as e:
             _log_pi.warning("[proactive] maintenance job register failed: %s", e)
 
@@ -1722,7 +1729,7 @@ class NOVAApp:
             except Exception:
                 pass
         try:
-            self.scheduler.add_daily(func=_weekly_insight_job, hour=2, minute=30)
+            self.scheduler.add_from_text(fn=_weekly_insight_job, schedule_text="every day at 02:30", job_id="insight_weekly")
         except Exception as e:
             _log_pi.warning("[proactive] insight job register failed: %s", e)
 
@@ -1744,7 +1751,7 @@ class NOVAApp:
             except Exception:
                 pass
         try:
-            self.scheduler.add_interval(func=_drain_queued_alerts, seconds=60)
+            self.scheduler.add_interval(fn=_drain_queued_alerts, seconds=60, job_id="drain_alerts")
         except Exception as e:
             _log_pi.warning("[proactive] alert drain job register failed: %s", e)
 
@@ -1780,7 +1787,7 @@ class NOVAApp:
             except Exception:
                 pass
         try:
-            self.scheduler.add_daily(func=_commitment_reminder_job, hour=9, minute=0)
+            self.scheduler.add_from_text(fn=_commitment_reminder_job, schedule_text="every day at 09:00", job_id="commit_remind")
         except Exception as e:
             _log_pi.warning("[proactive] commitment reminder failed: %s", e)
 
@@ -1891,18 +1898,13 @@ class NOVAApp:
         poll = max(2.0, float(settings.AUTONOMY_POLL_SECONDS))
         while not self._autonomy_stop.is_set():
             goal = None
-            # Deep copy to avoid reading mutable dict references outside the lock.
-            with self._goal_lock:
-                goals_snapshot = copy.deepcopy(self._goals)
-                
             candidate_id = None
-            for item in goals_snapshot:
-                if item.get("status") in {"pending", "approved_for_step"} and item.get("steps"):
-                    candidate_id = item.get("id")
-                    break
-                    
-            if candidate_id:
-                with self._goal_lock:
+            with self._goal_lock:
+                for item in self._goals:
+                    if item.get("status") in {"pending", "approved_for_step"} and item.get("steps"):
+                        candidate_id = item.get("id")
+                        break
+                if candidate_id:
                     for item in self._goals:
                         if item.get("id") != candidate_id:
                             continue
@@ -1910,8 +1912,6 @@ class NOVAApp:
                             goal = None
                             break
                         if item.get("status") in {"pending", "approved_for_step"} and item.get("steps"):
-                            if self._is_goal_cancelled(item.get("id")):
-                                continue
                             # If it was specifically approved, we will pass a flag down
                             goal = copy.deepcopy(item)
                             item["status"] = "running"
@@ -2004,7 +2004,7 @@ class NOVAApp:
                         goal_description=str(goal.get("goal", "")),
                         steps=steps,
                         completion_time=elapsed,
-                        available_tools=set(self.dispatcher._tools.keys()) if hasattr(self.dispatcher, '_tools') else set(),
+                        available_tools=set(self.dispatcher.registry.keys()) if hasattr(self.dispatcher, 'registry') else set(),
                     )
                     self._prompt_evolver.record_goal_outcome(self.session.current.session_id, succeeded=True)
                 except Exception:
@@ -2679,6 +2679,17 @@ class NOVAApp:
             return
 
         self.emotion.update_from_signal(user_text)
+        try:
+            now_dt = datetime.now()
+            session_mins = (time.monotonic() - self._session_start_time) / 60.0
+            self.emotion.proactive_update(
+                hour=now_dt.hour,
+                weekday=now_dt.weekday(),
+                recent_errors=self._error_detections_this_hour,
+                session_length_minutes=session_mins,
+            )
+        except Exception:
+            pass
         self.memory.set_online(NetworkState.is_online())
         if self.memory.online:
             self._schedule_sync_all_pending()
@@ -2749,6 +2760,8 @@ class NOVAApp:
                 partial = assistant_text or "".join(output_chunks).strip()
                 if not partial:
                     return
+                if self._shutting_down.is_set():
+                    partial = f"{partial}\n[truncated: shutdown]"
                 if not user_added:
                     self.session.add_turn("user", user_text)
                     user_added = True
@@ -2862,7 +2875,7 @@ class NOVAApp:
                 return
 
             # Risk-check the new step
-            check = guardrails.check(new_step.get("tool", ""), new_step.get("args", {}))
+            from core.tools.dispatcher import ToolCall; check = guardrails.check(ToolCall(tool=new_step.get("tool", ""), args=new_step.get("args", {})))
             if getattr(check, 'score', 10) > 6:
                 return  # too risky to auto-insert
 
