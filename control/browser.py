@@ -9,6 +9,7 @@ from playwright.sync_api import sync_playwright
 
 class Browser:
     def __init__(self, headless: bool = True, timeout_ms: int = 20_000):
+        self._headless = headless
         self._pw = sync_playwright().start()
         self.browser = self._pw.chromium.launch(headless=headless)
         self.page = self.browser.new_page()
@@ -81,7 +82,7 @@ class Browser:
             pass
         # Re-initialize
         self._pw = sync_playwright().start()
-        self.browser = self._pw.chromium.launch(headless=True)
+        self.browser = self._pw.chromium.launch(headless=self._headless)
         self.page = self.browser.new_page()
 
     def __enter__(self) -> "Browser":

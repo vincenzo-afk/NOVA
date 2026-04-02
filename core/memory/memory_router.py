@@ -83,23 +83,26 @@ class MemoryRouter:
             return 0
 
         with self._sync_lock:
-            items = list(self._pending_sync.get(session_id, []))
+            original_items = list(self._pending_sync.get(session_id, []))
 
         synced = []
-        failed = []
-        for item in items:
+        for item in original_items:
             try:
                 result = self.mem0.add(item["text"], session_id, item["metadata"])
                 if isinstance(result, dict) and result.get("status") == "ok":
                     synced.append(item)
                 else:
-                    failed.append(item)
+                    continue
             except Exception:
-                failed.append(item)
+                continue
 
         with self._sync_lock:
-            # Keep only items that failed — remove successfully synced ones
-            self._pending_sync[session_id] = failed
+            # Remove only items from the original snapshot that synced successfully.
+            # Any items appended concurrently after snapshotting must be preserved.
+            current_items = list(self._pending_sync.get(session_id, []))
+            synced_ids = {id(item) for item in synced}
+            retained = [item for item in current_items if id(item) not in synced_ids]
+            self._pending_sync[session_id] = retained
 
         return len(synced)
 

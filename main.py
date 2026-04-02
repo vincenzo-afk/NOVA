@@ -442,7 +442,7 @@ class NOVAApp:
         # _hard_cap_hit forward — the user would be silently blocked all of day 2.
         total_today = self.usage.total_tokens_today(session_id=None)
         _today = date.today()
-        if total_today >= settings.DAILY_TOKEN_HARD_CAP:
+        if settings.DAILY_TOKEN_HARD_CAP > 0 and total_today >= settings.DAILY_TOKEN_HARD_CAP:
             self._hard_cap_hit = True
             self._hard_cap_hit_date = _today
         else:
@@ -891,7 +891,8 @@ class NOVAApp:
     def export_session(self, fmt: str = "md", history: list[dict] | None = None) -> str:
         session = self.session.current
         timestamp = int(time.time())
-        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", session.name).strip("_") or "session"
+        base_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", session.name).strip("_") or "session"
+        safe_name = f"{base_name}_{session.session_id[:8]}"
         if history is None:
             with session._lock:
                 payload = list(session.history)
@@ -1876,7 +1877,11 @@ class NOVAApp:
 
     def _start_probe_server(self) -> None:
         if self._health_http_server is not None:
-            return
+            if self._health_http_thread is not None and not self._health_http_thread.is_alive():
+                self._health_http_server = None
+                self._health_http_thread = None
+            else:
+                return
 
         app = self
 
@@ -2699,6 +2704,17 @@ class NOVAApp:
         allow_tools: bool = True,
         dry_run_tools: bool = False,
     ) -> Generator[str, None, None]:
+        current_session = self.session.current
+        current_session_id = current_session.session_id
+
+        def _append_turn(role: str, content: str) -> None:
+            with current_session._lock:
+                current_session.history.append({"role": role, "content": content})
+                max_turns = getattr(self.session, "_max_history_turns", 500)
+                if len(current_session.history) > max_turns:
+                    current_session.history = current_session.history[-max_turns:]
+            self.session._persist_session(current_session)
+
         command_response = self._apply_text_commands(user_text)
         if command_response:
             yield command_response
@@ -2733,8 +2749,8 @@ class NOVAApp:
 
         if needs_clarification(user_text):
             question = clarifying_question(user_text)
-            self.session.add_turn("user", user_text)
-            self.session.add_turn("assistant", question)
+            _append_turn("user", user_text)
+            _append_turn("assistant", question)
             yield question
             return
 
@@ -2750,7 +2766,7 @@ class NOVAApp:
         try:
             try:
                 first_token = next(stream)
-                self.session.add_turn("user", user_text)
+                _append_turn("user", user_text)
                 user_added = True
                 output_chunks.append(first_token)
                 yield first_token
@@ -2759,13 +2775,13 @@ class NOVAApp:
                     yield token
             except StopIteration:
                 if not user_added:
-                    self.session.add_turn("user", user_text)
+                    _append_turn("user", user_text)
                     user_added = True
             except RuntimeError as exc:
                 # PEP 479: inner StopIteration may surface as RuntimeError.
                 if "StopIteration" in str(exc):
                     if not user_added:
-                        self.session.add_turn("user", user_text)
+                        _append_turn("user", user_text)
                         user_added = True
                 else:
                     raise
@@ -2784,11 +2800,19 @@ class NOVAApp:
                 yield tool_result_text
                 assistant_text = tool_result_text
 
-            self.session.add_turn("assistant", assistant_text)
-            committed = True
-            self._track_usage(system_prompt, history, user_text, assistant_text, day_anchor=today)
-            usage_tracked = True
-            self._commit_memory_async(user_text, assistant_text)
+            if assistant_text:
+                _append_turn("assistant", assistant_text)
+                committed = True
+                self._track_usage(
+                    system_prompt,
+                    history,
+                    user_text,
+                    assistant_text,
+                    day_anchor=today,
+                    session_id=current_session_id,
+                )
+                usage_tracked = True
+                self._commit_memory_async(user_text, assistant_text, session_id=current_session_id)
         except Exception as exc:
             yield f"[ERROR] Generation failed: {exc}"
         finally:
@@ -2800,20 +2824,27 @@ class NOVAApp:
                 if self._shutting_down.is_set():
                     partial = f"{partial}\n[truncated: shutdown]"
                 if not user_added:
-                    self.session.add_turn("user", user_text)
+                    _append_turn("user", user_text)
                     user_added = True
                 try:
                     if not usage_tracked:
-                        self._track_usage(system_prompt, history, user_text, partial, day_anchor=today)
+                        self._track_usage(
+                            system_prompt,
+                            history,
+                            user_text,
+                            partial,
+                            day_anchor=today,
+                            session_id=current_session_id,
+                        )
                 except Exception:
                     pass
-                self.session.add_turn("assistant", partial)
-                self._commit_memory_async(user_text, partial)
+                _append_turn("assistant", partial)
+                self._commit_memory_async(user_text, partial, session_id=current_session_id)
 
-    def _commit_memory_async(self, user_text: str, assistant_text: str) -> None:
+    def _commit_memory_async(self, user_text: str, assistant_text: str, session_id: str | None = None) -> None:
         if self._shutting_down.is_set():
             return
-        session_id = self.session.current.session_id
+        session_id = session_id or self.session.current.session_id
 
         # ── Tier 2: Intent Graph update ───────────────────────────────────────
         if hasattr(self, '_intent_graph') and self._intent_graph:
