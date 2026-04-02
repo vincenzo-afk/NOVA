@@ -141,4 +141,17 @@ class MemoryRouter:
         return [item for _, item in fused[:top_k]]
 
     def get_all(self, session_id: str) -> list[dict]:
-        return self.local.get_all(session_id)
+        local_items = self.local.get_all(session_id)
+        if self._online:
+            try:
+                remote_items = self.mem0.get_all(session_id)
+                if remote_items:
+                    seen = {i.get("text") for i in local_items if i.get("text")}
+                    for r in remote_items:
+                        t = r.get("text") or r.get("memory") or r.get("content") or ""
+                        if t and t not in seen:
+                            local_items.append({"text": t, "metadata": r.get("metadata", {}), "id": r.get("id", "")})
+                            seen.add(t)
+            except Exception:
+                pass
+        return local_items
