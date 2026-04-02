@@ -1,91 +1,91 @@
-Here are the most impactful user-facing bugs found:
+## User-Facing Bugs Found
 
 ---
 
 **Bug 1**
-- **What the user sees:** The app blocks forever and never responds after typing a message.
-- **When it happens:** When `ContextTrimmer.trim()` is called with a `summarizer` that itself calls `ask_stream()`, which calls `_context_messages()`, which calls `trim()` again — infinite recursion/deadlock via `trimmer._lock` (RLock, same thread, but the summarizer executor blocks).
+- **What the user sees:** The app blocks all responses for the rest of the day, even after midnight.
+- **When it happens:** `_hard_cap_hit` is checked in `ask_stream()` before the date-reset logic inside `_track_usage()` runs, so the first message of a new day is still blocked.
 - **How bad:** Major
-- **File:** `main.py` → `_context_messages()` passes `summarizer=lambda snippet: self._summarize_history(...)` which tries to acquire `trimmer._lock` already held.
-- **Fix hint:** Remove the inline `summarizer` argument; always use the background path only.
+- **File:** `main.py` → `ask_stream()`, hard cap check block
+- **Fix hint:** Move the `_hard_cap_hit_date != today` reset logic to before the `hard_cap_active` read in `ask_stream`, not inside `_track_usage`.
 
 ---
 
 **Bug 2**
-- **What the user sees:** Goals stay stuck in "planning" forever after a restart — they can never be resumed or cancelled.
-- **When it happens:** On startup, goals with status "planning" are set to "pending" (line in `__init__`), but goals with no steps stay pending and can never execute, and the background planner that should re-plan them is never re-triggered.
+- **What the user sees:** Goals stay stuck in "pending" forever after a restart and can never execute.
+- **When it happens:** On startup, goals with `status == "planning"` are set to `"pending"` but have no steps, so the autonomy loop skips them and the planner is never re-triggered.
 - **How bad:** Major
-- **File:** `main.py` → `NOVAApp.__init__` goal loading block.
-- **Fix hint:** Set goals with `status == "planning"` back to `"failed"` on restart, not `"pending"`, so users can resume them explicitly.
+- **File:** `main.py` → `NOVAApp.__init__`, goal loading block
+- **Fix hint:** Set goals with `status == "planning"` to `"failed"` on restart so users can explicitly resume them.
 
 ---
 
 **Bug 3**
-- **What the user sees:** The daily token hard cap blocks ALL responses for the rest of the day even after midnight.
-- **When it happens:** `_hard_cap_hit` is set to `True` during the day; on the next day's first message, the date check inside `_track_usage` resets it — but `ask_stream` checks `hard_cap_active` *before* `_track_usage` runs, so the very first message of the new day is still blocked.
+- **What the user sees:** A cancelled goal still executes its steps — `/cancel_goal` doesn't actually stop it.
+- **When it happens:** Between copying the goal snapshot with `deepcopy` and setting status to `"running"`, a cancel can arrive and be missed because the check happens outside the lock block.
 - **How bad:** Major
-- **File:** `main.py` → `ask_stream()`, hard cap check block.
-- **Fix hint:** Move the date-reset logic to before the `hard_cap_active` read, not inside `_track_usage`.
+- **File:** `main.py` → `_autonomy_loop()`, goal status transition block
+- **Fix hint:** Re-check `item["status"] != "cancelled"` immediately before setting it to `"running"` inside the same `_goal_lock` block.
 
 ---
 
 **Bug 4**
-- **What the user sees:** The CLI is completely locked out for 5 minutes after 5 wrong PIN attempts, with no way to recover without deleting the lock file manually.
-- **When it happens:** User enters wrong PIN 5 times; lockout file is written but the message just says "Access Denied" with no hint about the timeout or how long to wait.
+- **What the user sees:** Voice output silently stops working mid-session with no warning.
+- **When it happens:** If `pyttsx3` isn't installed, `speak_offline` is `None` and the TTS worker loop silently skips every queued item forever.
 - **How bad:** Minor
-- **File:** `interfaces/cli.py` → failed PIN block.
-- **Fix hint:** Print the lockout duration in the "Access Denied" message so users know when to retry.
+- **File:** `main.py` → `_tts_worker()`
+- **Fix hint:** Print a one-time warning when `speak_offline is None` so the user knows voice is unavailable.
 
 ---
 
 **Bug 5**
-- **What the user sees:** Sending an SMS via ADB silently does nothing even when `ALLOWED_PHONE_NUMBERS` is set correctly.
-- **When it happens:** `adb.send_sms` is registered in the dispatcher only `if getattr(self, "adb", None)` — but `self.adb` is always set (even to a valid `ADBClient()`), so this isn't the issue. The real bug: `settings.ALLOWED_PHONE_NUMBERS` is checked against a monkeypatched empty list in tests but in production the `config.settings.settings` singleton is loaded once; if `.env` is missing `ALLOWED_PHONE_NUMBERS`, it defaults to `[]` and every SMS call raises `ValueError` that the dispatcher catches and returns as `validation_error` with no user-visible explanation.
-- **How bad:** Major
-- **File:** `control/adb/adb_client.py` → `send_sms()`.
-- **Fix hint:** Return a clear error message string instead of raising `ValueError` so the user sees why SMS was blocked.
+- **What the user sees:** After typing `/cancel_goal`, then `/resume_goal`, goals with no steps get stuck in `"planning"` again and never resolve.
+- **When it happens:** `_resume_goal()` submits a background plan future but the `_on_done` callback double-decrements `_goal_plan_jobs_inflight` when `background_plan` already ran successfully.
+- **How bad:** Minor
+- **File:** `main.py` → `_resume_goal()`, `_on_done` callback
+- **Fix hint:** Only decrement the counter in `_on_done` if the future itself raised — same pattern as the fix already applied in `_add_goal`.
 
 ---
 
 **Bug 6**
-- **What the user sees:** The `/export` command in the CLI exports an empty file when called mid-conversation.
-- **When it happens:** `export_session()` in `NOVAApp` acquires `session._lock` but `add_turn()` also acquires the same `RLock` — however `export_session` takes a snapshot correctly. The real bug: the CLI `/export` code path calls `agent.export_session(fmt, history=history_snapshot)` but passes `history_snapshot` captured *outside* the lock in `cli.py`.
-- **How bad:** Minor
-- **File:** `interfaces/cli.py` → `/export` handler.
-- **Fix hint:** The snapshot is already taken with the lock correctly; this is fine — actually reviewing more carefully, the export passes history correctly. Skip.
-
----
-
-**Bug 6 (revised)**
-- **What the user sees:** After switching sessions, the browser automation tools keep operating on the previous session's page.
-- **When it happens:** `switch_session()` calls `_browser_close()` inside `_browser_lock`, but if a background goal is mid-execution using `_browser_open`, the close races with the active browser call.
+- **What the user sees:** After switching sessions mid-conversation, the browser keeps operating on the previous session's page.
+- **When it happens:** `switch_session()` calls `_browser_close()` but a background goal running `_browser_open` can race against the close.
 - **How bad:** Major
-- **File:** `main.py` → `switch_session()`.
-- **Fix hint:** Set a flag to cancel any running goal before closing the browser on session switch.
+- **File:** `main.py` → `switch_session()`
+- **Fix hint:** Cancel all running goals before closing the browser on session switch.
 
 ---
 
 **Bug 7**
-- **What the user sees:** The TTS worker thread silently dies and voice output stops working for the rest of the session.
-- **When it happens:** `_tts_worker` imports `speak_offline` at thread start; if `pyttsx3` isn't installed, `speak_offline` is set to `None` and the worker loop continues running but skips every item silently — no error, no fallback notification.
+- **What the user sees:** The CLI is locked out for 5 minutes after 5 wrong PINs with no message about how long to wait.
+- **When it happens:** After 5 failed PIN attempts, the lockout file is written but the printed message just says "Access Denied" with no timeout hint.
 - **How bad:** Minor
-- **File:** `main.py` → `_tts_worker()`.
-- **Fix hint:** Log a one-time warning when `speak_offline` is `None` so the user knows voice is unavailable.
+- **File:** `interfaces/cli.py` → failed PIN block
+- **Fix hint:** Print the remaining lockout duration (300 seconds) in the "Access Denied" message.
 
 ---
 
 **Bug 8**
-- **What the user sees:** Autonomy loop executes a cancelled goal — steps run even after the user typed `/cancel_goal`.
-- **When it happens:** Between when the autonomy loop copies the goal snapshot (`copy.deepcopy`) and when it checks for cancellation inside `_is_goal_cancelled`, a cancel can arrive and be missed because the status check happens *after* the goal is already set to `"running"`.
-- **How bad:** Major
-- **File:** `main.py` → `_autonomy_loop()`, goal status transition block.
-- **Fix hint:** Re-check `item["status"] != "cancelled"` immediately before setting it to `"running"` inside the same lock block.
+- **What the user sees:** Offline memories written without internet are permanently lost and never synced after reconnecting.
+- **When it happens:** `sync_pending()` calls `mem0.add()` and treats any non-exception as success, but if `Mem0Client.add()` returns `{"status": "duplicate"}`, the item is removed from the pending queue even though it was never actually synced to remote.
+- **How bad:** Critical
+- **File:** `core/memory/memory_router.py` → `sync_pending()`
+- **Fix hint:** Only remove items from `_pending_sync` when `mem0.add()` returns `status == "ok"`, not `"duplicate"`.
 
 ---
 
 **Bug 9**
-- **What the user sees:** Memory sync fails silently and offline memories are lost when reconnecting to the internet.
-- **When it happens:** `sync_pending()` in `memory_router.py` only syncs `mem0.add()` results where `result.get("status") == "ok"` — but `Mem0Client.add()` returns `{"status": "ok", "result": ...}` wrapping the SDK result, so the inner status is never `"ok"` at the top level; the comparison always fails, leaving all pending items in the queue forever.
+- **What the user sees:** Sending an SMS via ADB always fails silently even when the phone number is in the allowlist.
+- **When it happens:** `send_sms()` raises `ValueError` when `ALLOWED_PHONE_NUMBERS` is empty, but the dispatcher catches it as a `tool_signature_error` and returns a cryptic JSON error with no user-readable explanation.
+- **How bad:** Major
+- **File:** `control/adb/adb_client.py` → `send_sms()`
+- **Fix hint:** Return a plain error string instead of raising `ValueError` so the dispatcher surfaces a readable message to the user.
+
+---
+
+**Bug 10**
+- **What the user sees:** The context trimmer deadlocks and the app freezes when history gets long.
+- **When it happens:** `_context_messages()` calls `trim()` which tries to acquire `trimmer._lock`; if the background summarizer is mid-execution holding the same lock on the same thread (RLock re-entry), the second acquire blocks forever.
 - **How bad:** Critical
-- **File:** `core/memory/memory_router.py` → `sync_pending()`, status check.
-- **Fix hint:** Change the status check to `result.get("status") in {"ok", "duplicate"}` or check if the call didn't raise an exception as success criterion.
+- **File:** `main.py` → `_context_messages()` / `core/memory/context_trimmer.py`
+- **Fix hint:** Never pass a `summarizer` lambda that calls back into the LLM engine from within `trim()`; always use the async background path only. 

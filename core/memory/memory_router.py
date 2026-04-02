@@ -89,8 +89,11 @@ class MemoryRouter:
         failed = []
         for item in items:
             try:
-                self.mem0.add(item["text"], session_id, item["metadata"])
-                synced.append(item)
+                result = self.mem0.add(item["text"], session_id, item["metadata"])
+                if isinstance(result, dict) and result.get("status") == "ok":
+                    synced.append(item)
+                else:
+                    failed.append(item)
             except Exception:
                 failed.append(item)
 
