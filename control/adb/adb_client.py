@@ -86,9 +86,9 @@ class ADBClient:
         from config.settings import settings
         # Security: fail closed when allowlist is empty.
         if not settings.ALLOWED_PHONE_NUMBERS:
-            raise ValueError("ALLOWED_PHONE_NUMBERS is empty; SMS sending is blocked.")
+            return "Error: ALLOWED_PHONE_NUMBERS is empty; SMS sending is blocked."
         if phone_number not in settings.ALLOWED_PHONE_NUMBERS:
-            raise ValueError(f"Phone number {phone_number} is not in ALLOWED_PHONE_NUMBERS.")
+            return f"Error: Phone number {phone_number} is not in ALLOWED_PHONE_NUMBERS."
         
         return self.shell(
             "am", "start",

@@ -1,319 +1,91 @@
-## PROACTIVE INTELLIGENCE TIER 1 — Perception Layer
-
-### Continuous Semantic Work Context Graph
-
-- **Trigger**: Every `ScreenWatcher._tick()` cycle (currently every 30s per `settings.PROACTIVE_WATCHER_INTERVAL`)
-- **Mechanism**: `ScreenWatcher._tick()` calls `analyze_image()` and `self.omniparser.ocr_text()` but throws away the structured result after checking `_detect_issue()`. A new `WorkContextTracker` class should intercept the full `analysis: dict` from `analyze_image()` and the `ui_elements` list from `OmniParserClient.ui_elements()` *before* `_detect_issue()` discards them. Maintain a rolling `deque[WorkContextFrame]` (last 20 frames) with fields: `active_app`, `scene_type`, `visible_text_hash`, `ui_element_fingerprint`, `timestamp`. On each tick, compute a *context drift score* by comparing the current frame against the last 5. If drift score exceeds threshold AND no alert fired, call a new `_infer_work_context_change()` hook in `NOVAApp._handle_proactive_alert`.
-- **Action**: NOVA silently pre-loads relevant `DocumentStore` chunks and `MemoryRouter` memories for the detected context. If user switches from a browser to a terminal, NOVA pre-fetches recent git log, last error from logs, and relevant code memories — all without any output.
-- **Output**: Silent pre-load only. No user notification unless the drift triggers an active transition (e.g., switching from writing to debugging).
-- **Safeguard**: The existing `cooldown_seconds` in `ScreenWatcher.__init__` applies. Pre-load is capped at 3 `DocumentStore.query()` calls per context switch and runs on `NOVAApp._memory_executor` (already exists) so it cannot block the main loop.
-- **Competitive Edge**: AutoGen and CrewAI have no screen awareness whatsoever. Open Interpreter can see the screen on demand but builds no temporal context graph. This is NOVA maintaining a *rolling understanding* of what the developer is doing — not a snapshot.
+Here are the most impactful user-facing bugs found:
 
 ---
 
-### Clipboard Content Intelligence Pipeline
-
-- **Trigger**: `snapshot_environment()` in `core/context/environment.py` already calls `_get_clipboard()` but `settings.INCLUDE_CLIPBOARD_IN_CONTEXT` defaults `False` and the clipboard content is only injected as a passive string. The trigger here is a *content-type change* in clipboard — not just "did the clipboard change" but "what category of thing was just copied."
-- **Mechanism**: In `_refresh_background()` inside `environment.py`, after `_get_clipboard()`, run a 3-way classifier (regex-based, zero LLM cost): `CODE_BLOCK` (contains `def `, `class `, `import `, `{`, `;`), `ERROR_TRACE` (contains `Traceback`, `Error:`, `Exception`), `URL` (`http://` or `https://`). Store the classified result in `_ENVIRONMENT_CACHE` under a new `clipboard_type` key. In `NOVAApp._context_messages()`, inspect `world_state["clipboard_type"]` — if `ERROR_TRACE`, call a new `_prefetch_error_context(clipboard_text)` that runs `MemoryRouter.search(clipboard_text, session_id, top_k=5)` and stores the result in `NOVAApp._prefetch_cache` (a simple `dict` with TTL).
-- **Action**: When the user's next message arrives and `_prefetch_cache` is populated for the current session, those memories are injected into `_context_messages()` *ahead of* the standard memory search, effectively giving NOVA a head start on the answer.
-- **Output**: Invisible to the user — the answer simply arrives faster and more accurately.
-- **Safeguard**: `_prefetch_cache` TTL is 90 seconds. Clipboard content longer than 4000 chars is truncated before classification. The existing `_scrub_args` pattern in `safety/guardrails.py` is extended to strip clipboard content from any logs.
-- **Competitive Edge**: No open-source assistant prefetches context based on clipboard semantic type. This specifically addresses the "I copied an error, now I'm about to ask about it" pattern — one of the highest-frequency developer interactions.
+**Bug 1**
+- **What the user sees:** The app blocks forever and never responds after typing a message.
+- **When it happens:** When `ContextTrimmer.trim()` is called with a `summarizer` that itself calls `ask_stream()`, which calls `_context_messages()`, which calls `trim()` again — infinite recursion/deadlock via `trimmer._lock` (RLock, same thread, but the summarizer executor blocks).
+- **How bad:** Major
+- **File:** `main.py` → `_context_messages()` passes `summarizer=lambda snippet: self._summarize_history(...)` which tries to acquire `trimmer._lock` already held.
+- **Fix hint:** Remove the inline `summarizer` argument; always use the background path only.
 
 ---
 
-### File System Event Watcher
-
-- **Trigger**: File saves in directories that `DocumentStore` has previously ingested (tracked via `DocumentStore._doc_meta` which already stores `filepath`).
-- **Mechanism**: On `NOVAApp.__init__`, after `DocumentStore` is initialized, iterate `self.docs._doc_meta` to collect all watched directories. Use `watchdog` (add to `requirements.txt`) to create a `FileSystemEventHandler` subclass `NOVADocRefreshHandler`. On `on_modified` events matching ingested filenames, call `self.docs.update(filepath)` — which already exists in `rag/doc_store.py` as `DocumentStore.update()`. Register this watcher on `NOVAApp._memory_executor` so file I/O doesn't block the main thread. Additionally, watch `.git/COMMIT_EDITMSG` in the current working directory — on change, extract the commit message and call `MemoryRouter.add(f"Git commit: {msg}", session_id, {"source": "git"})`.
-- **Action**: RAG store stays fresh without any user command. Git commit history becomes searchable memory automatically.
-- **Output**: None unless the file update triggers a downstream goal (e.g., a scheduled job that depends on the file). NOVA can mention "I noticed you updated `config.py` — I've refreshed my understanding of it" the next time the file is referenced in conversation.
-- **Safeguard**: `DocumentStore.update()` calls `delete()` then `ingest()`. Rate-limit to one re-ingest per file per 30 seconds. Maximum 50 watched paths total (prevent inotify descriptor exhaustion). Respect `MAX_DOC_SIZE_BYTES = 50MB` already defined in `rag/doc_loader.py`.
-- **Competitive Edge**: Every RAG-based assistant requires manual re-ingestion when files change. NOVA's store self-heals in real time.
+**Bug 2**
+- **What the user sees:** Goals stay stuck in "planning" forever after a restart — they can never be resumed or cancelled.
+- **When it happens:** On startup, goals with status "planning" are set to "pending" (line in `__init__`), but goals with no steps stay pending and can never execute, and the background planner that should re-plan them is never re-triggered.
+- **How bad:** Major
+- **File:** `main.py` → `NOVAApp.__init__` goal loading block.
+- **Fix hint:** Set goals with `status == "planning"` back to `"failed"` on restart, not `"pending"`, so users can resume them explicitly.
 
 ---
 
-### Process Lifecycle Delta Monitor
-
-- **Trigger**: `win32_api.list_processes()` exists but is never called proactively. Add a 60-second poll via `TaskScheduler.add_interval()` during `NOVAApp._start_health_monitoring()`.
-- **Mechanism**: Maintain `_last_process_set: set[str]` on `NOVAApp`. On each poll, call `win32_api.list_processes()`, compute `appeared = current - last` and `disappeared = last - current`. For appeared processes, look up a static `PROCESS_CONTEXT_MAP` dict (e.g., `{"zoom": "meeting", "pycharm": "python_dev", "docker": "containerized_workload", "obs": "recording"}`). If a known process appears, fire `NOVAApp._handle_proactive_alert()` with a structured event carrying the context label. This feeds `EmotionEngine.update_from_signal()` — "meeting detected" → `cautious` state; "obs detected" → `focused` state.
-- **Action**: NOVA silently switches `EmotionEngine` state, pre-mutes TTS if `zoom` or `teams` is detected, and queues a session switch check (work vs personal based on process signature).
-- **Output**: If TTS was active and a meeting app appeared, NOVA sends one Telegram message: "I've paused voice output — looks like you're in a call." Otherwise silent.
-- **Safeguard**: Process list is never sent to LLM. The `PROCESS_CONTEXT_MAP` lookup is purely local dictionary matching. Auto-mute only applies if `settings.VOICE_BARGEIN_ENABLED` is True.
-- **Competitive Edge**: No existing open-source assistant detects meeting software and self-silences. This eliminates the embarrassing "NOVA is talking loudly while you're on a client call" failure mode.
+**Bug 3**
+- **What the user sees:** The daily token hard cap blocks ALL responses for the rest of the day even after midnight.
+- **When it happens:** `_hard_cap_hit` is set to `True` during the day; on the next day's first message, the date check inside `_track_usage` resets it — but `ask_stream` checks `hard_cap_active` *before* `_track_usage` runs, so the very first message of the new day is still blocked.
+- **How bad:** Major
+- **File:** `main.py` → `ask_stream()`, hard cap check block.
+- **Fix hint:** Move the date-reset logic to before the `hard_cap_active` read, not inside `_track_usage`.
 
 ---
 
-### Network Topology Context Detector
-
-- **Trigger**: `NetworkState.is_online()` in `core/llm/fallback.py` checks only reachability. Extend this to a new `NetworkContextDetector` that checks DNS suffix, gateway IP range, and hostname patterns once per 5-minute interval via `TaskScheduler`.
-- **Mechanism**: Add `_detect_network_context() -> str` to `core/llm/fallback.py`. It runs `socket.getfqdn()`, checks if the result contains corporate domain patterns stored in a user-configurable list in `.env` as `WORK_NETWORK_DOMAINS=corp.example.com,vpn.company.io`. Returns `"work"`, `"home"`, or `"unknown"`. Hook this result into `NOVAApp._start_health_monitoring()` as a registered subsystem check that also calls `self.switch_session()` when the network context changes.
-- **Action**: NOVA automatically switches between `nova_work` and `nova_personal` sessions when the network environment changes — loading the correct memory set, adjusting TTS behavior, and switching MCP connections.
-- **Output**: One Telegram notification: "Network context changed to work — switched to work session."
-- **Safeguard**: Only switches if the current session history is empty or if `settings.AUTONOMY_ENABLED` is True. The user can always override by explicit `/session` command.
-- **Competitive Edge**: Context-aware session switching based on physical network topology is not implemented in any open-source assistant project.
+**Bug 4**
+- **What the user sees:** The CLI is completely locked out for 5 minutes after 5 wrong PIN attempts, with no way to recover without deleting the lock file manually.
+- **When it happens:** User enters wrong PIN 5 times; lockout file is written but the message just says "Access Denied" with no hint about the timeout or how long to wait.
+- **How bad:** Minor
+- **File:** `interfaces/cli.py` → failed PIN block.
+- **Fix hint:** Print the lockout duration in the "Access Denied" message so users know when to retry.
 
 ---
 
-## PROACTIVE INTELLIGENCE TIER 2 — Inference Layer
-
-### Behavioral Rhythm Modeler
-
-- **Trigger**: Every `NOVAApp._track_usage()` call (currently fired after every `ask_stream()` completion) and every `ScreenWatcher._tick()`.
-- **Mechanism**: Create `utils/behavior_model.py` with class `BehaviorModel`. It maintains a persistent `dict` (serialized to `.jarvis/behavior_model.json`) with structure: `{weekday: {hour: {app: count, topic_cluster: count, avg_session_length: float}}}`. In `NOVAApp._track_usage()`, after the existing token tracking, call `behavior_model.record_activity(provider, hour=datetime.now().hour, weekday=datetime.now().weekday(), session_id=session_id)`. In `ScreenWatcher._tick()`, after `analyze_image()`, call `behavior_model.record_screen_state(active_app, scene_type, hour)`. The `BehaviorModel` exposes `predict_next_activity(current_hour, weekday) -> list[str]` using simple frequency-weighted ranking over the last 30 days of observations.
-- **Action**: Feeds into `Tier 3` anticipation — NOVA uses predicted next activity to pre-warm relevant tool registrations and memory searches.
-- **Output**: Exposed as a new `behavior.profile` tool registered in `NOVAApp._register_builtin_tools()` so the user can query it: "What do I usually do at this time on Tuesdays?"
-- **Safeguard**: All data stored locally in `.jarvis/`. Added to `.gitignore` (already has `.jarvis/` entry). No behavioral data ever sent to mem0 or external services. `BehaviorModel` has a `privacy_mode: bool` flag that disables all recording when set.
-- **Competitive Edge**: CrewAI and AutoGen operate on task-level instructions with no awareness of the human's temporal work rhythm. This creates genuine personalization that deepens over weeks.
+**Bug 5**
+- **What the user sees:** Sending an SMS via ADB silently does nothing even when `ALLOWED_PHONE_NUMBERS` is set correctly.
+- **When it happens:** `adb.send_sms` is registered in the dispatcher only `if getattr(self, "adb", None)` — but `self.adb` is always set (even to a valid `ADBClient()`), so this isn't the issue. The real bug: `settings.ALLOWED_PHONE_NUMBERS` is checked against a monkeypatched empty list in tests but in production the `config.settings.settings` singleton is loaded once; if `.env` is missing `ALLOWED_PHONE_NUMBERS`, it defaults to `[]` and every SMS call raises `ValueError` that the dispatcher catches and returns as `validation_error` with no user-visible explanation.
+- **How bad:** Major
+- **File:** `control/adb/adb_client.py` → `send_sms()`.
+- **Fix hint:** Return a clear error message string instead of raising `ValueError` so the user sees why SMS was blocked.
 
 ---
 
-### Intent Graph Builder
-
-- **Trigger**: Every `_commit_memory_async()` call in `NOVAApp` — currently fires `MemoryRouter.add()` with flat text. Add a secondary async step on `NOVAApp._memory_executor`.
-- **Mechanism**: Create `core/memory/intent_graph.py` with class `IntentGraph`. It wraps a ChromaDB collection named `"nova_intent_graph"` (separate from `"jarvis_memory"`). After `MemoryRouter.add()` succeeds, extract a lightweight intent tuple from the conversation turn using a fast local LLM call via `LLMEngine.ask()` with a compact system prompt: `"Extract: (verb, object, context) from this exchange. Return JSON only."` Store the tuple as a node. On the second occurrence of the same `(verb, object)` pair, create an edge with weight. Expose `IntentGraph.most_common_intents(session_id, top_k=5) -> list[tuple]` and `IntentGraph.predict_next_intent(current_verb, current_object) -> list[tuple]`.
-- **Action**: `IntentGraph.predict_next_intent()` is called at the start of every `ask_stream()` invocation, before the LLM call. The top predicted intent is injected as a silent hint into the system prompt: `"Based on prior patterns, the user may next want to: [predicted_intent]. Pre-consider this."`.
-- **Output**: Invisible to the user. The LLM's responses become subtly more anticipatory.
-- **Safeguard**: Intent extraction LLM call is made only every 5th conversation turn (tracked by a counter on `SessionState`) to avoid token cost spiral. Intent nodes are capped at 10,000 total across all sessions — oldest are pruned when exceeded.
-- **Competitive Edge**: AutoGen's memory systems store facts, not *intent transition probabilities*. This is a Markov-style intent model that makes NOVA's responses statistically aligned with how the user thinks, not just what they said.
+**Bug 6**
+- **What the user sees:** The `/export` command in the CLI exports an empty file when called mid-conversation.
+- **When it happens:** `export_session()` in `NOVAApp` acquires `session._lock` but `add_turn()` also acquires the same `RLock` — however `export_session` takes a snapshot correctly. The real bug: the CLI `/export` code path calls `agent.export_session(fmt, history=history_snapshot)` but passes `history_snapshot` captured *outside* the lock in `cli.py`.
+- **How bad:** Minor
+- **File:** `interfaces/cli.py` → `/export` handler.
+- **Fix hint:** The snapshot is already taken with the lock correctly; this is fine — actually reviewing more carefully, the export passes history correctly. Skip.
 
 ---
 
-### Emotional Trajectory Predictor
-
-- **Trigger**: Currently `EmotionEngine.update_from_signal()` only reacts to the current input. New trigger: a background thread that samples `BehaviorModel` + `ScreenWatcher._last_seen_summary` + current time every 10 minutes.
-- **Mechanism**: Add `EmotionEngine.predict_from_context(hour: int, weekday: int, recent_errors: int, session_length_minutes: float) -> str` to `core/emotion/engine.py`. Implement a simple decision tree: if `hour >= 22 and session_length_minutes > 180` → `"empathetic"`; if `recent_errors >= 3` → `"urgent"`; if `weekday in {0,1}` and `hour in range(9, 11)` → `"focused"`. The `recent_errors` count comes from a new counter `NOVAApp._error_detections_this_hour` incremented in `_handle_proactive_alert()` when `"error"` is in the alert message. In `NOVAApp._start_health_monitoring()`, add a 10-minute `TaskScheduler` interval job that calls this predictor and calls `self.emotion.update_from_signal(predicted_state)` only if the current state is `"neutral"` (don't override an already-active state).
-- **Action**: NOVA's tone shifts proactively before the user even types. At 11pm after a long debugging session, NOVA switches to empathetic mode — shorter responses, gentler phrasing, occasional "you've been at this for 3 hours, want to call it?" check-in.
-- **Output**: The TTS prosody (via `voice/tts.py`'s `_emotion_hint()`) and `build_system_prompt()` emotion parameter shift automatically.
-- **Safeguard**: Predicted emotion only takes effect if current `EmotionEngine.state == "neutral"`. User can always say "focus mode" to override.
-- **Competitive Edge**: No open-source assistant models emotional trajectory. They react to tone in text; NOVA predicts *need states* from behavioral signals before text is even typed.
+**Bug 6 (revised)**
+- **What the user sees:** After switching sessions, the browser automation tools keep operating on the previous session's page.
+- **When it happens:** `switch_session()` calls `_browser_close()` inside `_browser_lock`, but if a background goal is mid-execution using `_browser_open`, the close races with the active browser call.
+- **How bad:** Major
+- **File:** `main.py` → `switch_session()`.
+- **Fix hint:** Set a flag to cancel any running goal before closing the browser on session switch.
 
 ---
 
-### Cross-Session Insight Extractor
-
-- **Trigger**: `ContextTrimmer.trim()` in `core/memory/context_trimmer.py` runs `_summarize_history_background()` for a single session. Add a new weekly cross-session analysis job.
-- **Mechanism**: Add `utils/insight_extractor.py` with `InsightExtractor.extract_weekly_themes(session_ids: list[str]) -> list[str]`. On every Sunday at 2:30am (registered via `schedule_daily_backup` pattern in `main.py`), call `MemoryRouter.get_all(session_id)` for all known sessions, concatenate the last 200 memory texts, call `LLMEngine.ask()` with prompt: `"Identify 5 recurring themes, unresolved problems, or emerging patterns across these work sessions. Be specific and actionable."` Store the result as a special memory with `metadata={"source": "weekly_insight", "date": today}`. On Monday morning (detected via `BehaviorModel` first activity trigger), surface the insight unprompted via Telegram.
-- **Action**: Monday morning NOVA message: "Based on last week, you spent 40% of your time on auth-related issues — 3 different sessions. Want me to schedule a focused debugging block today?"
-- **Output**: One Telegram message on first Monday activity. Also stored as a memory so it persists and can be queried.
-- **Safeguard**: The weekly job runs on `NOVAApp._memory_executor`. Total memory texts passed to LLM are capped at 8,000 tokens using `estimate_tokens_from_messages()` which already exists in `utils/token_estimator.py`.
-- **Competitive Edge**: No existing assistant performs cross-session synthesis as a background routine. This is the "weekly review" that most developers know they should do but never do — NOVA does it automatically.
+**Bug 7**
+- **What the user sees:** The TTS worker thread silently dies and voice output stops working for the rest of the session.
+- **When it happens:** `_tts_worker` imports `speak_offline` at thread start; if `pyttsx3` isn't installed, `speak_offline` is set to `None` and the worker loop continues running but skips every item silently — no error, no fallback notification.
+- **How bad:** Minor
+- **File:** `main.py` → `_tts_worker()`.
+- **Fix hint:** Log a one-time warning when `speak_offline` is `None` so the user knows voice is unavailable.
 
 ---
 
-## PROACTIVE INTELLIGENCE TIER 3 — Anticipation Engine
-
-### Predictive Goal Synthesizer
-
-- **Trigger**: `BehaviorModel.predict_next_activity()` returns a prediction with confidence >= 0.7 AND the predicted activity has a corresponding entry in a new `GoalTemplateLibrary` (see Tier 5). Also triggered when `IntentGraph.predict_next_intent()` returns a multi-step sequence that maps to a known template.
-- **Mechanism**: Add `core/goals/proactive_goal_engine.py` with class `ProactiveGoalEngine`. It holds a `GoalTemplateLibrary` (simple JSON file at `.jarvis/goal_templates.json`) mapping activity patterns to pre-validated step sequences. On trigger, `ProactiveGoalEngine.propose_goal(context: dict) -> dict | None` generates a candidate goal dict with `status = "proposed"` (a new status). In `NOVAApp._autonomy_loop()`, before the existing `for item in goals_snapshot` loop, check for proposed goals older than 5 minutes that the user hasn't interacted with — if `settings.AUTONOMY_ENABLED` and the proposed goal's risk score is `< 4` (low risk via `guardrails.check()`), auto-approve and set status to `"pending"`. High-risk proposed goals wait for explicit approval.
-- **Action**: NOVA autonomously queues goals like "Run test suite since you just committed to main" (triggered by git watcher from Tier 1) or "Fetch this week's sprint tasks from Jira" (triggered by Monday morning + `MasterMCP.connect_builtin("jira")` being active).
-- **Output**: Telegram message: "I queued a goal: [goal description]. It'll run in 5 minutes unless you cancel it (`/cancel_goal goal_id`)."
-- **Safeguard**: Proposed goals are only auto-approved if: `risk.score < 4`, `settings.AUTONOMY_ENABLED == True`, no `guardrails.is_emergency_stopped()`, and fewer than 3 goals are currently running. The 5-minute delay gives the user a cancellation window.
-- **Competitive Edge**: Friday/JARVIS assistants execute goals on command. This synthesizes goals from observed context — no command needed. The 5-minute grace period is a UX pattern not implemented anywhere in the open-source space.
+**Bug 8**
+- **What the user sees:** Autonomy loop executes a cancelled goal — steps run even after the user typed `/cancel_goal`.
+- **When it happens:** Between when the autonomy loop copies the goal snapshot (`copy.deepcopy`) and when it checks for cancellation inside `_is_goal_cancelled`, a cancel can arrive and be missed because the status check happens *after* the goal is already set to `"running"`.
+- **How bad:** Major
+- **File:** `main.py` → `_autonomy_loop()`, goal status transition block.
+- **Fix hint:** Re-check `item["status"] != "cancelled"` immediately before setting it to `"running"` inside the same lock block.
 
 ---
 
-### Context Pre-Loader with Speculative RAG
-
-- **Trigger**: `WorkContextTracker` (Tier 1) emits a context transition event — user moves from browser to terminal, or from terminal to IDE, or opens a new file type.
-- **Mechanism**: Add `_speculative_prefetch(transition: str)` to `NOVAApp`. This method calls `IntentGraph.predict_next_intent()` with the transition as context, generating up to 3 predicted queries. Then fires `MemoryRouter.search(predicted_query, session_id, top_k=5)` for each on `NOVAApp._memory_executor`. Results are stored in a new `NOVAApp._prefetch_cache: dict[str, list]` (keyed by predicted query, TTL 120 seconds). In `NOVAApp._context_messages()`, before calling `self.memory.search(user_text, ...)`, check `_prefetch_cache` for entries that semantically overlap with `user_text` using a Jaccard similarity check via `HybridRanker._jaccard()` (already exists in `web/hybrid_ranker.py`). If overlap > 0.3, inject cached results as *additional* memories without an extra DB call.
-- **Action**: When the user types their first question after switching context, the memory results are already in cache — RAG latency drops from 200-500ms to ~5ms for cache hits.
-- **Output**: Invisible. The user just notices NOVA answers faster and with better recall.
-- **Safeguard**: `_prefetch_cache` is capped at 20 entries. Cache is cleared on `reset_context()` and `switch_session()`. Only queries fired if `NetworkState.is_online()` OR ChromaDB is available locally.
-- **Competitive Edge**: Speculative RAG (pre-fetching before the query is formed) is a research-level technique. No open-source assistant project implements it in a production codebase.
-
----
-
-### Deadline and Commitment Tracker
-
-- **Trigger**: Every `_commit_memory_async()` call scans the new conversation turn for temporal commitments using a regex pass before storing to memory.
-- **Mechanism**: Add `utils/commitment_extractor.py` with `extract_commitments(text: str) -> list[Commitment]`. `Commitment` is a dataclass with `description: str`, `deadline: datetime | None`, `confidence: float`. Use a regex battery targeting patterns like: `"(by|before|on|until) (monday|friday|tomorrow|next week|\d+ (days?|hours?))"`, `"(need to|must|should|have to) .{5,60} (by|before|on)"`, `"(deadline|due|ship|deploy|release|submit) .{0,30} \d"`. Extracted commitments with `confidence > 0.6` are stored via `MemoryRouter.add()` with `metadata={"source": "commitment", "deadline_ts": ts}`. In `TaskScheduler`, register a daily 9am job that calls `MemoryRouter.search("commitment deadline", session_id, top_k=10)`, filters for items with `deadline_ts` within 48 hours, and fires `NOVAApp._notify_telegram()` with a structured reminder.
-- **Action**: NOVA notices "I need to deploy the auth service by Friday" said casually on Tuesday and autonomously schedules a reminder for Thursday 9am — without being told to.
-- **Output**: Thursday 9am Telegram: "Reminder: you mentioned deploying the auth service by Friday. Current status unknown — want me to check your git status or Jira?"
-- **Safeguard**: Only commitments from the *user's own messages* (role `"user"` in session history) are extracted. NOVA's own responses are excluded. Maximum 20 active commitments tracked at once.
-- **Competitive Edge**: Calendar integrations extract commitments from calendar events. This extracts them from *casual conversation* — where most real commitments actually happen.
-
----
-
-### Attention-Aware Interrupt Scheduler
-
-- **Trigger**: `NOVAApp._handle_proactive_alert()` currently fires immediately via `notify_background_event()`. New trigger: before firing, check `WorkContextTracker.current_attention_state()`.
-- **Mechanism**: Add `AttentionState` enum: `DEEP_FOCUS`, `BROWSING`, `IDLE`, `IN_MEETING`, `TRANSITIONING`. `WorkContextTracker` computes this from: OmniParser UI elements (is a text editor with many lines visible = DEEP_FOCUS), process monitor (zoom/teams = IN_MEETING), screen activity delta (no mouse movement for 5 min = IDLE). In `NOVAApp._handle_proactive_alert()`, wrap the existing `notify_background_event()` call in a check: if `attention_state == DEEP_FOCUS`, add the alert to a new `NOVAApp._queued_alerts: deque` (maxlen=20) instead of firing immediately. A background timer checks every 60 seconds if the state has shifted to `IDLE` or `BROWSING` and then drains `_queued_alerts` in batch, grouping related alerts with the LLM into a digest message.
-- **Action**: Instead of interrupting a developer mid-function with "I saw an error on screen", NOVA waits for a natural pause and delivers: "While you were focused, I noticed: 3 things worth your attention — [grouped digest]."
-- **Output**: Batched Telegram digest during natural break points. TTS plays during IDLE only.
-- **Safeguard**: `IN_MEETING` state suppresses TTS entirely (only Telegram). DEEP_FOCUS state queues but never drops alerts. Emergency/high-risk alerts bypass queueing regardless of attention state.
-- **Competitive Edge**: This is the most human-centered feature in this plan. The problem of "AI assistants interrupting at the worst possible moment" is universally complained about and universally unsolved.
-
----
-
-## PROACTIVE INTELLIGENCE TIER 4 — Autonomous Action Layer
-
-### Preventive Maintenance Orchestrator
-
-- **Trigger**: Daily 3am `TaskScheduler` job registered in `NOVAApp.__init__` alongside the existing `schedule_daily_backup()` call in `main.py`.
-- **Mechanism**: Add `tasks/maintenance.py` with `MaintenanceOrchestrator.run_daily_maintenance(app: NOVAApp) -> dict`. It executes a fixed sequence using existing tools through `NOVAApp.goal_runner.run()`:
-  1. `win32_api.disk_info` — check free space, fire alert if < 10GB
-  2. Check `exports/` directory size, delete exports older than 30 days (using `win32_api.delete`)
-  3. Compress `logs/jarvis.log` if > 50MB (using `win32_api.launch_process` with tar/gzip)
-  4. Call `MemoryRouter.sync_all_pending()` — already exists
-  5. Call `backup._backup_chromadb()` — already exists
-  6. Verify `OmniParserServer.is_running()` and restart if needed — already exists in `HealthMonitor`
-  All steps are run as a `GoalRunner` plan so each step goes through `guardrails.check()` — none of these should exceed risk score 4. Results are stored in a maintenance log at `.jarvis/maintenance_log.jsonl`.
-- **Action**: Every morning NOVA has already cleaned up, backed up, and verified itself. The developer starts the day with a healthy system.
-- **Output**: Silent if everything is healthy. Telegram message only if an anomaly was found (e.g., "Disk at 87% — I deleted 2.3GB of old exports").
-- **Safeguard**: Maintenance runs only between 2-4am (check `datetime.now().hour`). All deletions go through `guardrails.check()`. The `dry_run=True` flag is used for a pre-flight pass before actual execution.
-- **Competitive Edge**: Self-maintaining AI systems exist in DevOps tooling (Ansible, etc.) but not in personal AI assistants. NOVA is the first personal assistant that takes care of its own infrastructure.
-
----
-
-### Goal Outcome Learning and Re-planning
-
-- **Trigger**: `NOVAApp._autonomy_loop()` currently sets `item["status"] = "failed"` and stops. New trigger: on `status == "failed"` with `result.status == "stopped"` or `result.status == "failed"`.
-- **Mechanism**: Add `_handle_goal_failure(goal: dict, result: GoalResult)` to `NOVAApp`. When a goal fails, this method:
-  1. Extracts the failing step: `steps[result.next_index]`
-  2. Calls `LLMEngine.ask()` with prompt: `"This goal step failed: [step]. Error: [result.reason]. Suggest ONE alternative approach using available tools: [dispatcher.get_tool_schema_prompt()]"` — the alternative is parsed as a new step dict
-  3. If alternative step passes `guardrails.check()` with score <= 6, insert it into `goal["steps"]` at `result.next_index` and set `goal["status"] = "pending"` for one automatic retry
-  4. Second consecutive failure on the same goal → mark as `"requires_human"`, notify via Telegram with a specific question: "Goal X is stuck on step Y. I tried Z. Want me to try [alternative] instead?"
-- **Action**: Goals become self-healing. A web scrape that fails because a site blocked the request automatically retries with a different URL strategy.
-- **Output**: Silent on first auto-retry. Explicit Telegram consultation on second failure.
-- **Safeguard**: Maximum 2 automatic replanning attempts per goal (tracked in `goal["replan_count"]`). Re-planned steps still run through the full `guardrails.check()` + `authorize()` pipeline.
-- **Competitive Edge**: AutoGen has retry mechanisms but they are fixed-strategy (same approach, different input). This generates *novel alternative approaches* using the full tool schema as context — genuine adaptive replanning.
-
----
-
-### Proactive Documentation and Knowledge Capture
-
-- **Trigger**: `GoalRunner.run()` returns `status == "completed"` for any goal with more than 3 steps. Also triggered when `FileSystemEventHandler` (Tier 1) detects a new `.py`, `.md`, or `.txt` file created in a project directory.
-- **Mechanism**: Add `_auto_document_goal_outcome(goal: dict, result: GoalResult)` to `NOVAApp`. After goal completion, call `LLMEngine.ask()` with: `"Summarize what was accomplished: [goal description]. Steps taken: [result.results]. Write a 2-sentence note that future-you would want to know."` Store the summary via `MemoryRouter.add()` with `metadata={"source": "goal_outcome", "goal_id": goal_id}`. Separately, for new code files detected by the file watcher, call `DocumentStore.ingest()` immediately (already exists) AND call `LLMEngine.ask()` with the file contents to generate a one-paragraph description, stored as a memory: "File `utils/auth.py` contains: JWT validation helpers, rate limiting decorator, and session invalidation logic."
-- **Action**: NOVA builds a living knowledge base of *what has been accomplished and where things live* — not just raw content.
-- **Output**: Silent memory storage. Surfaced when the user asks "what did I do last week?" or "where's the auth code?"
-- **Safeguard**: Auto-documentation only runs if total_tokens_today < `settings.DAILY_TOKEN_ALERT_THRESHOLD * 0.8` to preserve budget. New file documentation is capped at files under 500 lines.
-- **Competitive Edge**: This is institutional memory for a solo developer. The knowledge base becomes genuinely more valuable over time in ways that no RAG-only system achieves because it stores *meaning*, not just text.
-
----
-
-### Multi-Channel Presence Manager
-
-- **Trigger**: `MasterMCP` connections — currently NOVA only notifies via Telegram and TTS. When `MasterMCP.is_connected("slack")` or `MasterMCP.is_connected("github")` is True.
-- **Mechanism**: Add `utils/presence_manager.py` with `PresenceManager`. It maintains a `notification_channels: list[str]` derived from `MasterMCP.list_services()`. `PresenceManager.broadcast(message: str, urgency: str)` routes notifications: `urgency == "high"` → all channels; `urgency == "medium"` → Telegram only; `urgency == "low"` → logged to events only. For Slack, use `MasterMCP.call_tool("slack", "post_message", channel="nova-alerts", text=message)`. For GitHub, when a goal involves code changes, auto-create a summary comment on the relevant PR via `MasterMCP.call_tool("github", ...)` — requires a new `add_pr_comment` tool in `mcp/master_mcp.py`'s `_github_connector`. Replace all direct `_notify_telegram()` calls in `NOVAApp` with `presence_manager.broadcast()`.
-- **Action**: NOVA's alerts reach the developer wherever they are — Slack DM if they're on mobile, Telegram if they prefer it, GitHub PR comment if the action was code-related.
-- **Output**: Context-appropriate notifications across all connected channels.
-- **Safeguard**: `PresenceManager` respects `NOVAApp._muted`. Each channel has its own rate limiter using the `deque`-based pattern already in `interfaces/telegram_bot.py`.
-- **Competitive Edge**: No personal assistant routes notifications based on context and channel availability. This transforms NOVA from "a Telegram bot" into a presence that follows the developer across their entire digital workspace.
-
----
-
-## PROACTIVE INTELLIGENCE TIER 5 — Self-Evolution Layer
-
-### Tool Performance Profiler and Optimizer
-
-- **Trigger**: Every `guardrails.log()` call in `safety/guardrails.py` — currently writes a JSONL line with `tool`, `status`, `risk_score`. This is the perfect existing hook.
-- **Mechanism**: Add `utils/tool_profiler.py` with `ToolProfiler`. It reads `logs/guardrails_actions.jsonl` on startup and builds a `dict[str, ToolStats]` where `ToolStats` has `success_rate: float`, `avg_latency_ms: float`, `failure_reasons: Counter`. `ToolProfiler.get_reliability_ranking() -> list[tuple[str, float]]` returns tools sorted by success rate. In `Dispatcher.get_tool_schema_prompt()`, add an optional `reliability_hints: dict` parameter — when provided, append to each tool's schema description: `"(reliability: 94%, avg 120ms)"`. Call this from `build_system_prompt()` in `core/think/reasoning.py`. Additionally, in `_plan_goal()` in `NOVAApp`, inject the top-3 least reliable tools as a warning into the planner system prompt: "These tools have had recent failures: [list]. Prefer alternatives when possible."
-- **Action**: The LLM planner learns to avoid flaky tools and prefer reliable ones. Goal plans become more robust over time without any explicit retraining.
-- **Output**: Exposed via a new `tool.stats` registered tool in `NOVAApp._register_builtin_tools()`.
-- **Safeguard**: `ToolProfiler` only reads from the JSONL log — never modifies `Dispatcher` registrations. Reliability hints are purely advisory to the LLM.
-- **Competitive Edge**: No open-source agent framework feeds tool reliability statistics back into the planning prompt. This closes the feedback loop that every agentic system currently leaves open.
-
----
-
-### Goal Template Library Builder
-
-- **Trigger**: `NOVAApp._autonomy_loop()` when `status == "completed"` for goals that took more than 3 steps and completed without replanning.
-- **Mechanism**: Add `core/goals/template_library.py` with `GoalTemplateLibrary`. On successful goal completion, extract a generalized template from the goal's step sequence: replace specific values (URLs, filenames, dates) with typed placeholders using a regex pass (`https://[^\s]+` → `{url}`, `/home/user/[^\s]+` → `{filepath}`). Store the template as: `{"name": inferred_name, "trigger_keywords": extracted_nouns, "steps": generalized_steps, "success_count": 1, "avg_completion_time": t}` in `.jarvis/goal_templates.json`. `GoalTemplateLibrary.find_matching_template(goal: str) -> Template | None` uses `HybridRanker` (already exists in `web/hybrid_ranker.py`) to find the closest template by `trigger_keywords` similarity. In `NOVAApp._plan_goal()`, before calling `LLMEngine.ask()` for planning, call `template_library.find_matching_template(goal)` — if match score > 0.7, use the template directly, skipping the LLM planning call entirely.
-- **Action**: The second time NOVA is asked to "fetch and summarize today's GitHub PRs and post to Slack", it uses the template from the first time — instant planning, no LLM call, lower cost, higher reliability.
-- **Output**: Silent. Optionally surfaced: "I used a template from a previous goal — planning took 0ms."
-- **Safeguard**: Templates are only used if the new goal's dispatcher tool registry still contains all required tools. A stale template with a removed tool is automatically invalidated.
-- **Competitive Edge**: AutoGen has no persistent goal template learning. LangGraph has workflow definitions but they're hand-coded. This is emergent workflow discovery from successful execution history.
-
----
-
-### Automatic Plugin Synthesis from Repeated Patterns
-
-- **Trigger**: `ToolProfiler` (new, above) detects that the same sequence of 3+ tools has been called in the same order at least 8 times across different goals (tracked in a new `call_sequence_counter: Counter` on `ToolProfiler`).
-- **Mechanism**: `ToolProfiler.detect_combinable_sequences() -> list[ToolSequence]` runs after every 50 tool calls (a counter on `Dispatcher`). When a sequence is found, it calls `PluginGenerator.generate_and_propose()` (already exists in `core/plugin_generator.py`) with a description constructed from the sequence: `"A tool that combines web.search, web.scrape, and doc.ingest into a single operation: search for [topic], scrape the top result, and add it to the knowledge base."` The existing human approval gate in `PluginGenerator._cli_confirm()` applies — NOVA proposes, human approves.
-- **Action**: NOVA notices "every time I do research, I search → scrape → ingest" and proposes a single `research.add_to_knowledge_base` tool that does all three with one call.
-- **Output**: Telegram message: "I noticed you've done [search→scrape→ingest] 9 times. I wrote a plugin that combines these — want me to install it? [view code link]"
-- **Safeguard**: The existing dual-gate in `PluginGenerator` (AST check + human approval) is never bypassed. Proposed plugins are written to `.jarvis/pending_plugins/` and require explicit `/approve_plugin` command.
-- **Competitive Edge**: This is the only open-source system where the assistant observes its own tool usage patterns and proposes architectural improvements to itself. It's genuine meta-cognitive behavior.
-
----
-
-### Feedback-Driven System Prompt Evolution
-
-- **Trigger**: Weekly cross-session insight extraction (Tier 2) completes AND at least 10 goals have been executed since the last evolution cycle.
-- **Mechanism**: Add `core/think/prompt_evolver.py` with `PromptEvolver`. It maintains a `prompt_variants.json` file with A/B test records: `{variant_id: {prompt_suffix: str, goals_run: int, success_rate: float, avg_steps: float}}`. When a new weekly insight is generated, `PromptEvolver.propose_variant(insight: str)` calls `LLMEngine.ask()` with: `"Based on this user insight: [insight], suggest ONE short addition (< 50 words) to this system prompt that would make NOVA more proactively helpful: [current_system_prompt]."` The proposed addition is stored as `variant["candidate"]`. In `NOVAApp.ask_stream()`, 20% of calls use the candidate variant (selected via `hash(session_id + str(date.today())) % 5 == 0`). `PromptEvolver.evaluate_variant()` runs after 20 goals to compare success rates. If the variant improves success rate by > 5%, it graduates to become the new `SOUL.md` tail section.
-- **Action**: NOVA's personality and working style subtly improve based on what has actually worked — not what was hardcoded at install time.
-- **Output**: After a variant graduates: Telegram message: "I've updated my working style based on what's been working best. You can review the change in SOUL.md."
-- **Safeguard**: A/B testing is strictly session-local (determined by session ID hash, not random, so it's reproducible). Variants that decrease success rate by > 10% are immediately retired. Maximum one A/B test active at any time.
-- **Competitive Edge**: No personal AI assistant performs self-directed prompt engineering based on its own outcome data. This makes NOVA a genuinely self-improving system within strict, auditable bounds.
-
----
-
-## NORTH STAR ARCHITECTURE
-
-### A Day in the Life — November 2025, 9:00am–11:00pm
-
----
-
-**9:02am.** The developer's laptop connects to the office WiFi. `NetworkContextDetector` in `core/llm/fallback.py` identifies the corporate DNS suffix. `NOVAApp.switch_session("nova_work")` fires automatically. The `BehaviorModel` registers Monday morning, hour 9, confirming this matches the established work rhythm with 94% confidence.
-
-NOVA sends one Telegram message: *"Good morning. Switched to work session. Weekly insight ready: last week you spent 6 hours on auth token expiration issues — 4 separate sessions. I pre-fetched 12 relevant memories and the JWT docs. Also: you mentioned deploying the payments service by end of week. I've set a Thursday reminder."*
-
-No command was typed.
-
----
-
-**9:15am.** The developer opens VS Code. `WorkContextTracker` detects the transition from Slack (browsing) to VS Code (deep focus). `AttentionState` shifts to `DEEP_FOCUS`. All non-urgent alerts are queued. `SpeculativePrefetchEngine` fires 3 predicted RAG queries based on `IntentGraph`'s prediction that "code → auth → JWT → debugging" is the likely next sequence. By the time the developer types their first question about the auth bug, the answers are already in `_prefetch_cache`.
-
-The developer types: *"Why is my JWT token expiring early?"*
-
-NOVA's response arrives in 1.2 seconds with 3 cached memory results, the pre-loaded JWT docs chunk, and the exact stack trace from two weeks ago that showed the same issue — from `InsightExtractor`'s cross-session memory. No search needed.
-
----
-
-**10:45am.** The `FileSystemEventHandler` detects that `auth/token.py` was saved. `DocumentStore.update("auth/token.py")` runs silently on `_memory_executor`. A one-paragraph description is generated and stored: *"auth/token.py handles JWT creation, validation, and refresh logic. Updated expiry buffer to 30 seconds on Nov 4."*
-
-Simultaneously, `CommitmentExtractor` notices the developer just said in Slack (via MasterMCP Slack connector): *"I'll have the token fix PR up by noon."* A commitment is stored with a 11:45am reminder.
-
----
-
-**11:44am.** NOVA fires a Telegram message: *"You mentioned a PR by noon — 16 minutes left. Git status shows 2 modified files, not yet committed. Want me to draft the commit message and PR description?"*
-
-The developer says yes. NOVA calls `win32_api.launch_process("git diff")`, captures the output, and drafts both. The PR is opened via `MasterMCP.call_tool("github", "create_pr", ...)`. Total time: 40 seconds.
-
----
-
-**1:00pm.** `ProcessMonitor` detects `zoom` launching. `AttentionState` shifts to `IN_MEETING`. TTS is immediately silenced. The alert queue is paused. NOVA sends nothing.
-
----
-
-**2:15pm.** Zoom exits. `AttentionState` shifts to `TRANSITIONING`, then `IDLE`. NOVA drains the queue: *"While you were in your meeting: (1) The payments service tests passed in CI — all 47 green. (2) Your PR got a review comment from @alex about error handling. (3) Disk usage hit 81% — I cleared 1.4GB of old exports."* Three items, one message, delivered at the right moment.
-
----
-
-**3:30pm.** `ToolProfiler` runs its 50-call check and flags that `web.search → web.scrape → doc.ingest` has been called 11 times this week. `PluginGenerator` drafts `research.quick_add` — a single tool combining all three. A Telegram message arrives: *"I wrote a plugin that saves you 3 tool calls whenever you research something. Here's the code — want me to install it?"* The developer reviews the 30-line file, approves it. The plugin is live in 5 seconds.
-
----
-
-**5:00pm.** `BehaviorModel` notes that context transitions are slowing — the developer is still in VS Code but screen activity is dropping. `EmotionEngine.predict_from_context(hour=17, session_length_minutes=420)` returns `"empathetic"`. NOVA's next response is noticeably warmer in tone, shorter, and ends with: *"That's been a solid session. The auth fix is solid — anything else before you close out?"*
-
----
-
-**8:45pm.** The developer is home, on the personal network. `NetworkContextDetector` switches to `nova_personal`. The work session's `GoalTemplateLibrary` records a new template from today's 7-step deploy prep workflow. `InsightExtractor` schedules Sunday's cross-session analysis.
-
----
-
-**10:50pm.** The developer is browsing, laptop mostly idle. `EmotionEngine` fires `"empathetic"` — it's late, this is the third hour of non-work activity. `PromptEvolver`'s candidate variant (proposed from last week's insight that the developer responds better to concise answers late at night) is active for this session. NOVA's responses are 40% shorter than usual.
-
-The developer asks one last question about tomorrow's standup. NOVA answers in two sentences, then adds — not because it was asked, but because `CommitmentTracker` has a flagged item: *"Reminder: tomorrow is the payments service deployment. I'll pre-load the deploy runbook at 9am."*
-
----
-
-**11:00pm.** The developer closes the laptop. NOVA's `MaintenanceOrchestrator` is already scheduled for 3am: backup, compress logs, verify ChromaDB health, sync pending memories, draft tomorrow morning's briefing.
-
-By 9:02am Tuesday, the cycle begins again — and NOVA knows Tuesday slightly better than it knew Monday.
-
----
-
-This is not a chatbot that waits. This is an intelligence that *lives alongside* the developer — watching, learning, preparing, acting quietly, and speaking only when it genuinely matters. Every behavior described above is technically grounded in the existing codebase, requires no new external dependencies beyond `watchdog`, and is bounded by the safety architecture already present in `safety/guardrails.py`. The system gets *better every day it runs* — not because it was designed to, but because the feedback loops are closed.
+**Bug 9**
+- **What the user sees:** Memory sync fails silently and offline memories are lost when reconnecting to the internet.
+- **When it happens:** `sync_pending()` in `memory_router.py` only syncs `mem0.add()` results where `result.get("status") == "ok"` — but `Mem0Client.add()` returns `{"status": "ok", "result": ...}` wrapping the SDK result, so the inner status is never `"ok"` at the top level; the comparison always fails, leaving all pending items in the queue forever.
+- **How bad:** Critical
+- **File:** `core/memory/memory_router.py` → `sync_pending()`, status check.
+- **Fix hint:** Change the status check to `result.get("status") in {"ok", "duplicate"}` or check if the call didn't raise an exception as success criterion.
