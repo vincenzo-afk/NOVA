@@ -41,7 +41,7 @@ class SessionManager:
             self._current.history.append({"role": role, "content": content})
             if len(self._current.history) > self._max_history_turns:
                 self._current.history = self._current.history[-self._max_history_turns :]
-        self._persist_session(self._current)
+            self._persist_session(self._current)
 
     def _persist_session(self, session: SessionState) -> None:
         """Serialize session history to a JSON file for crash recovery (fix 2.6)."""
@@ -62,52 +62,52 @@ class SessionManager:
                 history_snapshot = list(session.history)
                 session_name = session.name
                 session_id = session.session_id
-            data = {"name": session_name, "session_id": session_id, "history": history_snapshot}
-            data["schema_version"] = self._SCHEMA_VERSION
-            payload = json.dumps(data, ensure_ascii=False, indent=2)
-            if path.exists():
+                data = {"name": session_name, "session_id": session_id, "history": history_snapshot}
+                data["schema_version"] = self._SCHEMA_VERSION
+                payload = json.dumps(data, ensure_ascii=False, indent=2)
+                if path.exists():
+                    try:
+                        shutil.copy2(path, backup_path)
+                    except Exception:
+                        pass
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=str(sessions_dir),
+                    delete=False,
+                    suffix=".tmp",
+                ) as tmp:
+                    tmp.write(payload)
+                    tmp.flush()
+                    tmp_path = Path(tmp.name)
                 try:
-                    shutil.copy2(path, backup_path)
+                    tmp_dev = tmp_path.stat().st_dev
+                    dst_dev = sessions_dir.stat().st_dev
+                except OSError:
+                    tmp_dev = dst_dev = None
+                if tmp_dev is not None and dst_dev is not None and tmp_dev != dst_dev:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Session persist cross-device mismatch for %s (%s -> %s).",
+                        session.name,
+                        tmp_dev,
+                        dst_dev,
+                    )
+                    try:
+                        shutil.copy2(tmp_path, path)
+                        tmp_path.unlink(missing_ok=True)
+                    except Exception:
+                        raise OSError("cross-device fallback copy failed")
+                else:
+                    tmp_path.replace(path)
+                try:
+                    # Bug 4 fix: only remove the backup AFTER confirming the new file was
+                    # written successfully. If the write failed (disk full, permissions, etc.)
+                    # the .bak is our only copy — never delete it unconditionally.
+                    if path.exists() and path.stat().st_size > 0:
+                        backup_path.unlink(missing_ok=True)
                 except Exception:
                     pass
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=str(sessions_dir),
-                delete=False,
-                suffix=".tmp",
-            ) as tmp:
-                tmp.write(payload)
-                tmp.flush()
-                tmp_path = Path(tmp.name)
-            try:
-                tmp_dev = tmp_path.stat().st_dev
-                dst_dev = sessions_dir.stat().st_dev
-            except OSError:
-                tmp_dev = dst_dev = None
-            if tmp_dev is not None and dst_dev is not None and tmp_dev != dst_dev:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "Session persist cross-device mismatch for %s (%s -> %s).",
-                    session.name,
-                    tmp_dev,
-                    dst_dev,
-                )
-                try:
-                    shutil.copy2(tmp_path, path)
-                    tmp_path.unlink(missing_ok=True)
-                except Exception:
-                    raise OSError("cross-device fallback copy failed")
-            else:
-                tmp_path.replace(path)
-            try:
-                # Bug 4 fix: only remove the backup AFTER confirming the new file was
-                # written successfully. If the write failed (disk full, permissions, etc.)
-                # the .bak is our only copy — never delete it unconditionally.
-                if path.exists() and path.stat().st_size > 0:
-                    backup_path.unlink(missing_ok=True)
-            except Exception:
-                pass
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning(

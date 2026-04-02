@@ -71,10 +71,12 @@ def speak(text: str, stop_event: threading.Event | None = None) -> None:
         return
     
     _ensure_worker()
-    if _QUEUE is None or _WORKER_THREAD is None or not _WORKER_THREAD.is_alive():
+    q = _QUEUE
+    worker = _WORKER_THREAD
+    if q is None or worker is None or not worker.is_alive():
         return
     done_event = threading.Event()
-    _QUEUE.put((text, done_event))
+    q.put((text, done_event))
     started = time.monotonic()
     while not done_event.is_set():
         if stop_event is not None and stop_event.is_set():

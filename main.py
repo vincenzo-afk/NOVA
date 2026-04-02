@@ -2579,10 +2579,12 @@ class NOVAApp:
                     self._summary_cache.popitem(last=False)
             with self._summary_submit_lock:
                 current_epoch = self._session_context_epoch.get(session_id, 0)
-            if current_epoch != session_epoch:
-                return
-            with self.trimmer._lock:
-                self.trimmer.summaries[session_id] = summary
+                if current_epoch != session_epoch:
+                    return
+                with self.trimmer._lock:
+                    # Keep epoch check + summary write in one critical section
+                    # with the same lock order used elsewhere (_summary_submit_lock -> trimmer._lock).
+                    self.trimmer.summaries[session_id] = summary
             with self._summary_submit_lock:
                 # Cool down re-summarization churn after a successful summary.
                 self._summary_retry_after[session_id] = time.time() + 30.0
@@ -2769,8 +2771,7 @@ class NOVAApp:
                         self._track_usage(system_prompt, history, user_text, partial, day_anchor=today)
                 except Exception:
                     pass
-                if not assistant_text:
-                    self.session.add_turn("assistant", partial)
+                self.session.add_turn("assistant", partial)
                 self._commit_memory_async(user_text, partial)
 
     def _commit_memory_async(self, user_text: str, assistant_text: str) -> None:

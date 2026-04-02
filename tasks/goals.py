@@ -170,6 +170,13 @@ class GoalRunner:
                     results=results,
                     next_index=idx,
                 )
+            if guardrails.is_emergency_stopped():
+                return GoalResult(
+                    status="blocked",
+                    reason="emergency_stop_active",
+                    results=results,
+                    next_index=idx,
+                )
             try:
                 future = self._executor.submit(self.dispatcher.execute, call, None, None, dry_run, True)
             except RuntimeError:
