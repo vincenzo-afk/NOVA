@@ -26,6 +26,7 @@ class PresenceManager:
         self,
         telegram_fn: Callable[[str], None] | None = None,
         mcp_call_fn: Callable[[str, str, dict], Any] | None = None,
+        connected_services_fn: Callable[[], list[str]] | None = None,
         record_event_fn: Callable[[str, str], None] | None = None,
         muted_fn: Callable[[], bool] | None = None,
     ):
@@ -38,6 +39,7 @@ class PresenceManager:
         """
         self._telegram = telegram_fn
         self._mcp_call = mcp_call_fn
+        self._connected_services_fn = connected_services_fn
         self._record_event = record_event_fn
         self._muted_fn = muted_fn or (lambda: False)
 
@@ -48,8 +50,13 @@ class PresenceManager:
 
     @property
     def _connected_services(self) -> list[str]:
-        """Override or inject at runtime via NOVAApp."""
-        return []
+        """Connected MCP service names."""
+        if not self._connected_services_fn:
+            return []
+        try:
+            return list(self._connected_services_fn())
+        except Exception:
+            return []
 
     def _rate_ok(self, channel: str) -> bool:
         now = time.monotonic()
@@ -104,7 +111,7 @@ class PresenceManager:
             return sent
 
         # High urgency: also broadcast to Slack if connected
-        available = services or []
+        available = services or self._connected_services
         if "slack" in available and self._mcp_call and self._rate_ok("slack"):
             try:
                 self._mcp_call("slack", "post_message", {"channel": slack_channel, "text": message})

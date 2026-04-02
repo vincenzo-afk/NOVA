@@ -565,6 +565,7 @@ class NOVAApp:
             interval_seconds=settings.PROACTIVE_WATCHER_INTERVAL,
             cooldown_seconds=settings.PROACTIVE_WATCHER_COOLDOWN,
             on_alert=self._handle_proactive_alert,
+            on_screen_state=lambda active_app, scene_type: self._behavior_model.record_screen_state(active_app, scene_type),
             omniparser_url=settings.OMNIPARSER_SERVER_URL,
         )
         self.phone_watcher = None
@@ -622,6 +623,8 @@ class NOVAApp:
 
         self._presence_manager = PresenceManager(
             telegram_fn=self._notify_telegram,
+            mcp_call_fn=lambda service, tool_name, args: self.master_mcp.call_tool(service, tool_name, **(args or {})),
+            connected_services_fn=lambda: self.master_mcp.list_services(),
             record_event_fn=self.record_event,
             muted_fn=lambda: self._muted,
         )
@@ -629,13 +632,12 @@ class NOVAApp:
         def _on_network_change(old_ctx: str, new_ctx: str) -> None:
             import logging
             logging.getLogger(__name__).info("[proactive] Network context: %s → %s", old_ctx, new_ctx)
-            if settings.AUTONOMY_ENABLED:
-                target = "nova_work" if new_ctx == "work" else "nova_personal"
-                try:
-                    self.switch_session(target)
-                    self._notify_telegram(f"🌐 Network context changed to *{new_ctx}* — switched to {target} session.")
-                except Exception:
-                    pass
+            target = "nova_work" if new_ctx == "work" else "nova_personal"
+            try:
+                self.switch_session(target)
+                self._notify_telegram(f"🌐 Network context changed to *{new_ctx}* — switched to {target} session.")
+            except Exception:
+                pass
 
         self._network_ctx_detector = NetworkContextDetector(on_change=_on_network_change)
 
@@ -679,6 +681,8 @@ class NOVAApp:
             notify_fn=self._notify_telegram,
             get_baseline_success_rate_fn=_get_baseline_success,
         )
+        self._monday_insight_checked_on: date | None = None
+        self._last_behavior_goal_proposal_at = 0.0
 
         def _propose_proactive_goal(goal_dict: dict) -> None:
             """Add a proposed goal to the goals list and notify."""
@@ -837,8 +841,10 @@ class NOVAApp:
             with session._lock:
                 history_snapshot = list(session.history)
             self.export_session("md", history=history_snapshot)
-        except Exception:
-            pass
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).error("Session backup failed before reset: %s", exc)
+            raise RuntimeError("Session backup failed; reset aborted.") from exc
         self.session.reset_context()
         # fix 1.6: clear stale summary and invalidate in-flight summarizer writes.
         self._clear_session_context_state(session_id, clear_summary=True)
@@ -1655,7 +1661,14 @@ class NOVAApp:
         def _restart_llm_engine() -> None:
             import subprocess as _sp
             try:
-                _sp.Popen(["ollama", "serve"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                # Avoid spawning duplicate `ollama serve` processes.
+                already_running = _sp.run(
+                    ["pgrep", "-f", "ollama serve"],
+                    stdout=_sp.DEVNULL,
+                    stderr=_sp.DEVNULL,
+                ).returncode == 0
+                if not already_running:
+                    _sp.Popen(["ollama", "serve"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
             except Exception:
                 pass
 
@@ -1761,7 +1774,7 @@ class NOVAApp:
             try:
                 from datetime import datetime as _dti, timezone as _tz
                 if _dti.now(_tz.utc).weekday() == 6:  # Sunday
-                    self._insight_extractor.run_weekly_extraction()
+                    self._run_weekly_extraction_and_evolve()
             except Exception:
                 pass
         try:
@@ -1958,6 +1971,13 @@ class NOVAApp:
                             item["started_at"] = time.time()
                             break
             if not goal:
+                try:
+                    now = time.monotonic()
+                    if now - self._last_behavior_goal_proposal_at >= 300.0:
+                        self._proactive_engine.propose_from_behavior()
+                        self._last_behavior_goal_proposal_at = now
+                except Exception:
+                    pass
                 self._autonomy_stop.wait(min(1.0, poll))
                 continue
 
@@ -2300,6 +2320,48 @@ class NOVAApp:
         _ = self._notify_telegram(text)
         _ = self._notify_tts(text)
 
+    def _register_adb_tools(self) -> bool:
+        if not getattr(self, "adb", None):
+            return False
+        self.dispatcher.register("adb.connect", self.adb.connect, ADBConnectArgs)
+        self.dispatcher.register("adb.devices", self.adb.devices, EmptyArgs)
+        self.dispatcher.register("adb.tap", self.adb.tap, ADBTapArgs)
+        self.dispatcher.register("adb.swipe", self.adb.swipe, ADBSwipeArgs)
+        self.dispatcher.register("adb.type_text", self.adb.type_text, ADBTextArgs)
+        self.dispatcher.register("adb.launch_app", self.adb.launch_app, ADBLaunchArgs)
+        self.dispatcher.register("adb.keyevent", self.adb.keyevent, ADBKeyEventArgs)
+        self.dispatcher.register("adb.pull", self.adb.pull, ADBPullArgs)
+        self.dispatcher.register("adb.push", self.adb.push, ADBPushArgs)
+        self.dispatcher.register("adb.send_sms", self._adb_send_sms, ADBSmsArgs)
+        self.dispatcher.register(
+            "adb.notifications_dump",
+            self.adb.notifications_dump,
+            EmptyArgs,
+            description="Dump recent Android notifications as text.",
+        )
+        self.dispatcher.register(
+            "adb.sms_dump",
+            self.adb.sms_dump,
+            EmptyArgs,
+            description="Dump recent Android SMS messages as text.",
+        )
+        self.dispatcher.register("adb.screenshot_to_local", self.adb.screenshot_to_local, EmptyArgs)
+        self.dispatcher.register("adb.qr_generate", self.qr.generate, QRGenerateArgs)
+        self.dispatcher.register("adb.qr_terminal", self.qr.print_terminal_qr, QRTerminalArgs)
+        return True
+
+    def _reload_adb_tools(self) -> dict:
+        import shutil
+        if getattr(self, "adb", None) is None:
+            if not shutil.which("adb"):
+                return {"status": "error", "reason": "adb_binary_not_found"}
+            try:
+                self.adb = ADBClient()
+            except Exception as exc:
+                return {"status": "error", "reason": f"adb_init_failed:{exc}"}
+        registered = self._register_adb_tools()
+        return {"status": "ok" if registered else "error", "registered": bool(registered)}
+
     def _register_builtin_tools(self) -> None:
         self.dispatcher.register("web.search", search, WebSearchArgs)
         self.dispatcher.register("web.scrape", scrape_text, WebScrapeArgs)
@@ -2353,31 +2415,13 @@ class NOVAApp:
         self.dispatcher.register("browser.screenshot", self._browser_screenshot, BrowserScreenshotArgs)
         self.dispatcher.register("browser.close", self._browser_close, EmptyArgs)
         if getattr(self, "adb", None):
-            self.dispatcher.register("adb.connect", self.adb.connect, ADBConnectArgs)
-            self.dispatcher.register("adb.devices", self.adb.devices, EmptyArgs)
-            self.dispatcher.register("adb.tap", self.adb.tap, ADBTapArgs)
-            self.dispatcher.register("adb.swipe", self.adb.swipe, ADBSwipeArgs)
-            self.dispatcher.register("adb.type_text", self.adb.type_text, ADBTextArgs)
-            self.dispatcher.register("adb.launch_app", self.adb.launch_app, ADBLaunchArgs)
-            self.dispatcher.register("adb.keyevent", self.adb.keyevent, ADBKeyEventArgs)
-            self.dispatcher.register("adb.pull", self.adb.pull, ADBPullArgs)
-            self.dispatcher.register("adb.push", self.adb.push, ADBPushArgs)
-            self.dispatcher.register("adb.send_sms", self._adb_send_sms, ADBSmsArgs)
-            self.dispatcher.register(
-                "adb.notifications_dump",
-                self.adb.notifications_dump,
-                EmptyArgs,
-                description="Dump recent Android notifications as text.",
-            )
-            self.dispatcher.register(
-                "adb.sms_dump",
-                self.adb.sms_dump,
-                EmptyArgs,
-                description="Dump recent Android SMS messages as text.",
-            )
-            self.dispatcher.register("adb.screenshot_to_local", self.adb.screenshot_to_local, EmptyArgs)
-            self.dispatcher.register("adb.qr_generate", self.qr.generate, QRGenerateArgs)
-            self.dispatcher.register("adb.qr_terminal", self.qr.print_terminal_qr, QRTerminalArgs)
+            self._register_adb_tools()
+        self.dispatcher.register(
+            "adb.reload_tools",
+            self._reload_adb_tools,
+            EmptyArgs,
+            description="Re-detect ADB and (re)register adb.* tools if available.",
+        )
         self.dispatcher.register("task.schedule", self._schedule_prompt, TaskScheduleArgs)
         self.dispatcher.register("task.list", self._list_jobs, EmptyArgs)
         self.dispatcher.register("task.cancel", self._cancel_job, TaskCancelArgs)
@@ -2486,13 +2530,20 @@ class NOVAApp:
         )
         self.dispatcher.register(
             "insight.weekly",
-            lambda: self._insight_extractor.run_weekly_extraction() or {"status": "extraction_queued"},
+            lambda: self._run_weekly_extraction_and_evolve() or {"status": "extraction_queued"},
             EmptyArgs,
             description=(
                 "Manually trigger a cross-session weekly insight extraction "
                 "and surface the results."
             ),
         )
+
+    def _run_weekly_extraction_and_evolve(self) -> dict | None:
+        insight = self._insight_extractor.run_weekly_extraction()
+        if insight:
+            self._prompt_evolver.propose_variant(insight, self.base_system_prompt)
+            return {"status": "ok", "insight_generated": True}
+        return None
 
     def _context_messages(
         self,
@@ -2572,6 +2623,12 @@ class NOVAApp:
             emotion=self.emotion.state,
             capability_summary=self._capability_summary or None,
         )
+        try:
+            prompt_suffix = self._prompt_evolver.get_active_suffix(session_id)
+            if prompt_suffix:
+                system_prompt = f"{system_prompt}\n\n{prompt_suffix}"
+        except Exception:
+            pass
 
         # Fix 2.9: Check total token count and trim if needed
         all_messages = [context_message, *recent]
@@ -2747,6 +2804,10 @@ class NOVAApp:
 
         self.emotion.update_from_signal(user_text)
         try:
+            today_key = date.today()
+            if self._monday_insight_checked_on != today_key:
+                self._insight_extractor.maybe_surface_monday_insight()
+                self._monday_insight_checked_on = today_key
             now_dt = datetime.now()
             session_mins = (time.monotonic() - self._session_start_time) / 60.0
             self.emotion.proactive_update(

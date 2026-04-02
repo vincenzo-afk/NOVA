@@ -1,0 +1,8 @@
+| #  | Issue                                                  | Fix                                               |
+| -- | ------------------------------------------------------ | ------------------------------------------------- |
+| 8  | PresenceManager._connected_services always []          | Wire NOVAApp._mcp service list into it            |
+| 9  | ProactiveGoalEngine.propose_from_behavior never called | Call from autonomy loop                           |
+| 10 | _ENVIRONMENT_CACHE_TTL clipboard privacy bug           | Make cache key include include_clipboard flag     |
+| 11 | ADB tools not re-registerable after startup            | Add adb.reload_tools command or lazy registration |
+| 12 | Ollama restart checks if already running               | Add `ps aux                                       |
+| 13 | NetworkContextDetector gated on AUTONOMY_ENABLED       | Decouple session switching from autonomy flag     |

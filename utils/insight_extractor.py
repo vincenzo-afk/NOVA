@@ -43,20 +43,20 @@ class InsightExtractor:
 
     # ── weekly job (runs Sunday ~2:30am via scheduler) ─────────────────────────
 
-    def run_weekly_extraction(self) -> None:
+    def run_weekly_extraction(self) -> str | None:
         """Called by TaskScheduler on Sunday at 2:30am."""
         now = datetime.now(timezone.utc)
         week_num = now.isocalendar()[1]
 
         with self._lock:
             if self._last_insight_week == week_num:
-                return  # already ran this week
+                return None  # already ran this week
             self._last_insight_week = week_num
 
         try:
             sessions = self._list_sessions()
             if not sessions:
-                return
+                return None
 
             all_texts: list[str] = []
             for sid in sessions[:10]:  # cap sessions
@@ -70,7 +70,7 @@ class InsightExtractor:
                     continue
 
             if not all_texts:
-                return
+                return None
 
             # Token-cap the corpus
             combined = "\n".join(all_texts)
@@ -91,7 +91,7 @@ class InsightExtractor:
             ).strip()
 
             if not insight:
-                return
+                return None
 
             today_str = date.today().isoformat()
             self._add(
@@ -104,9 +104,11 @@ class InsightExtractor:
                 self._pending_insight = insight
 
             log.info("[insight_extractor] weekly insight stored for week %d", week_num)
+            return insight
 
         except Exception as exc:
             log.warning("[insight_extractor] extraction failed: %s", exc)
+            return None
 
     # ── Monday morning surface (called on first activity) ──────────────────────
 
