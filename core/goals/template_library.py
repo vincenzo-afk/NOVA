@@ -114,7 +114,8 @@ class GoalTemplateLibrary:
     def _save(self) -> None:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            payload = [t.to_dict() for t in self._templates[:_MAX_TEMPLATES]]
+            with self._lock:
+                payload = [t.to_dict() for t in self._templates[:_MAX_TEMPLATES]]
             self._path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception:
             pass
@@ -142,6 +143,7 @@ class GoalTemplateLibrary:
 
         with self._lock:
             # Find existing template with high overlap
+            found = False
             for t in self._templates:
                 if _jaccard(set(t.trigger_keywords), set(kws)) >= 0.70:
                     t.success_count += 1
@@ -152,25 +154,26 @@ class GoalTemplateLibrary:
                     # Refresh steps with latest successful sequence
                     t.steps = generalised
                     t.required_tools = required
-                    self._save()
-                    return
+                    found = True
+                    break
 
-            # New template
-            self._templates.append(
-                GoalTemplate(
-                    name=name,
-                    trigger_keywords=kws[:20],
-                    steps=generalised,
-                    success_count=1,
-                    avg_completion_time=completion_time,
-                    required_tools=required,
+            if not found:
+                # New template
+                self._templates.append(
+                    GoalTemplate(
+                        name=name,
+                        trigger_keywords=kws[:20],
+                        steps=generalised,
+                        success_count=1,
+                        avg_completion_time=completion_time,
+                        required_tools=required,
+                    )
                 )
-            )
-            # Prune oldest if over cap
-            if len(self._templates) > _MAX_TEMPLATES:
-                self._templates.sort(key=lambda x: x.success_count, reverse=True)
-                self._templates = self._templates[:_MAX_TEMPLATES]
-            self._save()
+                # Prune oldest if over cap
+                if len(self._templates) > _MAX_TEMPLATES:
+                    self._templates.sort(key=lambda x: x.success_count, reverse=True)
+                    self._templates = self._templates[:_MAX_TEMPLATES]
+        self._save()
 
     # ── matching ──────────────────────────────────────────────────────────────
 
@@ -212,8 +215,8 @@ class GoalTemplateLibrary:
                 if all(tool in available_tools for tool in t.required_tools)
             ]
             removed = before - len(self._templates)
-            if removed:
-                self._save()
+        if removed:
+            self._save()
         return removed
 
     def all_templates(self) -> list[dict]:

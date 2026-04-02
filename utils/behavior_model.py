@@ -81,7 +81,7 @@ class BehaviorModel:
             self._data[wd][hr][f"session_{session_id[:16]}"] = (
                 self._data[wd][hr].get(f"session_{session_id[:16]}", 0) + 1
             )
-            self._save()
+        self._save()
 
     def record_screen_state(
         self,
@@ -102,7 +102,7 @@ class BehaviorModel:
             if scene_type:
                 key = f"scene_{scene_type[:32]}"
                 self._data[wd][hr][key] = self._data[wd][hr].get(key, 0) + 1
-            self._save()
+        self._save()
 
     # ── prediction ────────────────────────────────────────────────────────────
 

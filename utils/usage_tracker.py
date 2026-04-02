@@ -72,18 +72,19 @@ class UsageTracker:
     def _schedule_persist(self) -> None:
         if self._persist_path is None:
             return
-        if self._persist_timer and self._persist_timer.is_alive():
-            return
-
-        def _flush() -> None:
-            with self._lock:
-                self._persist_timer = None
-                self._persist()
-
-        timer = threading.Timer(self._persist_interval_seconds, _flush)
-        timer.daemon = True
-        self._persist_timer = timer
-        timer.start()
+        with self._lock:
+            if self._persist_timer and self._persist_timer.is_alive():
+                return
+    
+            def _flush() -> None:
+                with self._lock:
+                    self._persist_timer = None
+                    self._persist()
+    
+            timer = threading.Timer(self._persist_interval_seconds, _flush)
+            timer.daemon = True
+            self._persist_timer = timer
+            timer.start()
 
     def add(
         self,

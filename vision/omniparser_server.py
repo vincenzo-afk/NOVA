@@ -151,6 +151,7 @@ class OmniParserServer:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+            self.proc = None
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:

@@ -32,13 +32,7 @@ class RoundRobinPool:
 
         # fix 2.1: warn if pool has no usable keys
         if not self._keys:
-            try:
-                from utils.logger import get_logger
-                get_logger(__name__).warning(
-                    "RoundRobinPool initialized with zero active keys — all LLM calls will use Ollama"
-                )
-            except Exception:
-                print("[WARNING] RoundRobinPool: no active cloud API keys configured")
+            print("[WARNING] RoundRobinPool: no active cloud API keys configured")
 
     def _recover_due_keys(self) -> None:
         now = self._now_fn()

@@ -86,6 +86,7 @@ class PhoneWatcher:
         self._poll_sms()
 
         tmp_path = None
+        image_bytes = b""
         try:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 tmp_path = tmp.name
@@ -99,6 +100,9 @@ class PhoneWatcher:
                     _os.unlink(tmp_path)
                 except Exception:
                     pass
+
+        if not image_bytes:
+            return
 
         analysis = analyze_image(image_bytes)
         message = self._detect_issue(analysis)

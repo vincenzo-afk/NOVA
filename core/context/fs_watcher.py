@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
@@ -156,7 +156,3 @@ class NOVAFSWatcher:
                     self._on_git_commit(msg)
         except Exception:
             pass
-
-
-# Type alias so the module doesn't hard-depend on watchdog at import time
-Any = object

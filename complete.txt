@@ -1,91 +1,79 @@
-## User-Facing Bugs Found
+1. **Bug 1** — Hard cap blocks first message of new day. `main.py` → `ask_stream()`. Move date-reset before the cap check.
 
----
+2. **Bug 2** — Goals with no steps stuck in "planning" survive restart as "pending" and never execute. `main.py` → `__init__` goal loading. Change "planning" → "failed" on startup.
 
-**Bug 1**
-- **What the user sees:** The app blocks all responses for the rest of the day, even after midnight.
-- **When it happens:** `_hard_cap_hit` is checked in `ask_stream()` before the date-reset logic inside `_track_usage()` runs, so the first message of a new day is still blocked.
-- **How bad:** Major
-- **File:** `main.py` → `ask_stream()`, hard cap check block
-- **Fix hint:** Move the `_hard_cap_hit_date != today` reset logic to before the `hard_cap_active` read in `ask_stream`, not inside `_track_usage`.
+3. **Bug 3** — Cancel arrives between deepcopy and "running" write; cancelled goal still executes. `main.py` → `_autonomy_loop()`. Re-check cancel status inside the lock before setting "running".
 
----
+4. **Bug 4** — Voice silently stops working if pyttsx3 not installed; no warning ever shown. `main.py` → `_tts_worker()`. Print one-time warning when `speak_offline is None`.
 
-**Bug 2**
-- **What the user sees:** Goals stay stuck in "pending" forever after a restart and can never execute.
-- **When it happens:** On startup, goals with `status == "planning"` are set to `"pending"` but have no steps, so the autonomy loop skips them and the planner is never re-triggered.
-- **How bad:** Major
-- **File:** `main.py` → `NOVAApp.__init__`, goal loading block
-- **Fix hint:** Set goals with `status == "planning"` to `"failed"` on restart so users can explicitly resume them.
+5. **Bug 5** — `_on_done` double-decrements `_goal_plan_jobs_inflight` in `_resume_goal` when background_plan ran successfully. `main.py` → `_resume_goal()`. Only decrement in `_on_done` if future raised.
 
----
+6. **Bug 6** — Browser keeps operating on old session's page after session switch due to race with running goal. `main.py` → `switch_session()`. Cancel running goals before closing browser.
 
-**Bug 3**
-- **What the user sees:** A cancelled goal still executes its steps — `/cancel_goal` doesn't actually stop it.
-- **When it happens:** Between copying the goal snapshot with `deepcopy` and setting status to `"running"`, a cancel can arrive and be missed because the check happens outside the lock block.
-- **How bad:** Major
-- **File:** `main.py` → `_autonomy_loop()`, goal status transition block
-- **Fix hint:** Re-check `item["status"] != "cancelled"` immediately before setting it to `"running"` inside the same `_goal_lock` block.
+7. **Bug 7** — CLI lockout message says "Access Denied" with no indication of how long the wait is. `interfaces/cli.py` → failed PIN block. Print remaining lockout seconds in the message.
 
----
+8. **Bug 8** — Offline memories returned as `"duplicate"` by mem0 are removed from pending queue without ever being synced. `core/memory/memory_router.py` → `sync_pending()`. Only pop items when status is `"ok"`.
 
-**Bug 4**
-- **What the user sees:** Voice output silently stops working mid-session with no warning.
-- **When it happens:** If `pyttsx3` isn't installed, `speak_offline` is `None` and the TTS worker loop silently skips every queued item forever.
-- **How bad:** Minor
-- **File:** `main.py` → `_tts_worker()`
-- **Fix hint:** Print a one-time warning when `speak_offline is None` so the user knows voice is unavailable.
+9. **Bug 9** — ADB SMS raises `ValueError` when allowlist empty, surfaces as cryptic `tool_signature_error` to user. `control/adb/adb_client.py` → `send_sms()`. Return error string instead of raising.
 
----
+10. **Bug 10** — Context trimmer can deadlock if summarizer lambda re-enters the RLock from same thread. `core/memory/context_trimmer.py`. Never call LLM synchronously inside `trim()`; use async path only.
 
-**Bug 5**
-- **What the user sees:** After typing `/cancel_goal`, then `/resume_goal`, goals with no steps get stuck in `"planning"` again and never resolve.
-- **When it happens:** `_resume_goal()` submits a background plan future but the `_on_done` callback double-decrements `_goal_plan_jobs_inflight` when `background_plan` already ran successfully.
-- **How bad:** Minor
-- **File:** `main.py` → `_resume_goal()`, `_on_done` callback
-- **Fix hint:** Only decrement the counter in `_on_done` if the future itself raised — same pattern as the fix already applied in `_add_goal`.
+11. **Bug 11** — `_summary_cache` is an `OrderedDict` accessed from multiple threads without lock in `_summarize_history`. `main.py` → `_summarize_history()`. Wrap read with `_summary_cache_lock`.
 
----
+12. **Bug 12** — `scheduler.add_daily()` is called in `_start_health_monitoring()` but `TaskScheduler` has no `add_daily` method; app crashes on startup. `main.py` → `_start_health_monitoring()`. Replace with `add_from_text`.
 
-**Bug 6**
-- **What the user sees:** After switching sessions mid-conversation, the browser keeps operating on the previous session's page.
-- **When it happens:** `switch_session()` calls `_browser_close()` but a background goal running `_browser_open` can race against the close.
-- **How bad:** Major
-- **File:** `main.py` → `switch_session()`
-- **Fix hint:** Cancel all running goals before closing the browser on session switch.
+13. **Bug 13** — `health._subsystems` is accessed in `_maintenance` lambda but `HealthMonitor` stores them in `_state`/`_checks`, causing AttributeError. `main.py` → maintenance init. Use `health.status_table()` instead.
 
----
+14. **Bug 14** — `dispatcher._tools` is accessed in `_plan_goal` and `_register_builtin_tools` but the attribute is named `registry`. `main.py`. Replace `_tools` with `registry`.
 
-**Bug 7**
-- **What the user sees:** The CLI is locked out for 5 minutes after 5 wrong PINs with no message about how long to wait.
-- **When it happens:** After 5 failed PIN attempts, the lockout file is written but the printed message just says "Access Denied" with no timeout hint.
-- **How bad:** Minor
-- **File:** `interfaces/cli.py` → failed PIN block
-- **Fix hint:** Print the remaining lockout duration (300 seconds) in the "Access Denied" message.
+15. **Bug 15** — `scheduler.add_interval()` in `_start_health_monitoring` is called without `job_id` but the signature requires it. `main.py`. Pass unique `job_id` strings.
 
----
+16. **Bug 16** — `guardrails.check()` in `_handle_goal_failure` is called with two positional args `(tool_str, args_dict)` but it only accepts a `ToolCall` object. `main.py`. Wrap in `ToolCall(tool=..., args=...)`.
 
-**Bug 8**
-- **What the user sees:** Offline memories written without internet are permanently lost and never synced after reconnecting.
-- **When it happens:** `sync_pending()` calls `mem0.add()` and treats any non-exception as success, but if `Mem0Client.add()` returns `{"status": "duplicate"}`, the item is removed from the pending queue even though it was never actually synced to remote.
-- **How bad:** Critical
-- **File:** `core/memory/memory_router.py` → `sync_pending()`
-- **Fix hint:** Only remove items from `_pending_sync` when `mem0.add()` returns `status == "ok"`, not `"duplicate"`.
+17. **Bug 17** — `Guardrails` `_init_rotating_log` silently swallows loguru import failure, then `_loguru_logger` stays `None` and direct file appends happen without the lock on every write. `safety/guardrails.py`. Acquire `_lock` in `_log_line` plain-file fallback.
 
----
+18. **Bug 18** — `RoundRobinPool` logs a warning at init time using `get_logger` which may itself call `setup_logger`, causing recursive init at import time. `core/llm/roundrobin.py`. Guard with try/except already present but logger init could deadlock with `_logger_init_lock`.
 
-**Bug 9**
-- **What the user sees:** Sending an SMS via ADB always fails silently even when the phone number is in the allowlist.
-- **When it happens:** `send_sms()` raises `ValueError` when `ALLOWED_PHONE_NUMBERS` is empty, but the dispatcher catches it as a `tool_signature_error` and returns a cryptic JSON error with no user-readable explanation.
-- **How bad:** Major
-- **File:** `control/adb/adb_client.py` → `send_sms()`
-- **Fix hint:** Return a plain error string instead of raising `ValueError` so the dispatcher surfaces a readable message to the user.
+19. **Bug 19** — `ContextTrimmer` `trim()` holds `_lock` while calling the external `summarizer` callable, blocking any concurrent trim call for the full LLM round-trip. `core/memory/context_trimmer.py`. Release lock before calling summarizer.
 
----
+20. **Bug 20** — `GoalRunner` executor is shared across all goal runs; calling `close()` on session switch shuts it permanently and subsequent goals fail with `RuntimeError: cannot schedule new futures`. `tasks/goals.py`. Re-create executor after close.
 
-**Bug 10**
-- **What the user sees:** The context trimmer deadlocks and the app freezes when history gets long.
-- **When it happens:** `_context_messages()` calls `trim()` which tries to acquire `trimmer._lock`; if the background summarizer is mid-execution holding the same lock on the same thread (RLock re-entry), the second acquire blocks forever.
-- **How bad:** Critical
-- **File:** `main.py` → `_context_messages()` / `core/memory/context_trimmer.py`
-- **Fix hint:** Never pass a `summarizer` lambda that calls back into the LLM engine from within `trim()`; always use the async background path only. 
+21. **Bug 21** — `_browser_close()` is called inside `with self._browser_lock` in `switch_session`, but `_browser_open` etc. also acquire the same lock, causing deadlock if a goal is mid-execution. `main.py`. Use a non-reentrant approach or timeout.
+
+22. **Bug 22** — `web/scraper.py` `_validate_url` returns a tuple but the `crawl` function in `web/crawler.py` calls it and discards the return, which is fine, but `scrape_text` uses the returned `(scheme, hostname, ip)` tuple in URL rewriting — if DNS returns multiple IPs the first one may be IPv6 but the rewrite assumes IPv4 dotted notation. Minor display/connection issue.
+
+23. **Bug 23** — `PhoneWatcher._tick()` opens a tempfile, takes a screenshot, then reads it, but the `finally` block deletes it before `analyze_image` returns if an exception fires mid-read; the image bytes may be empty. `control/adb/watcher.py`. Read bytes before entering finally.
+
+24. **Bug 24** — `OmniParserServer.ensure_running()` prints a warning but doesn't set `self.proc = None` after killing a timed-out process, so a subsequent `is_running()` call tries to poll a dead proc object. `vision/omniparser_server.py`. Set `self.proc = None` after kill.
+
+25. **Bug 25** — `LocalMemoryStore._dedup_exists()` calls `time.time()` inside a non-locked path but `_use_chroma` and `_chroma_retry_time` are mutated by multiple threads; could flip back to `True` mid-check. `core/memory/local_store.py`. Hold `_chroma_init_lock` for the retry check.
+
+26. **Bug 26** — `UsageTracker._schedule_persist()` checks `self._persist_timer.is_alive()` without a lock; two threads can both see it as dead and schedule two concurrent flushes, writing the file twice simultaneously. `utils/usage_tracker.py`. Add lock around timer check and creation.
+
+27. **Bug 27** — `EmotionEngine.update_from_signal()` returns the state but callers in `main.py` discard it; the real bug is `predict_from_context` is never wired to actually update `self.state` unless `proactive_update` is called explicitly, so emotion never changes proactively in the main loop. `main.py`. Call `proactive_update` periodically.
+
+28. **Bug 28** — `ScreenWatcher._detect_issue()` returns `""` for injection-detected text in `watcher.py`, but `vision/watcher.py` returns a non-empty message — the two files conflict and `on_alert` may be called with the injection text itself. `vision/watcher.py`. Confirm sanitized path is taken before calling `on_alert`.
+
+29. **Bug 29** — `MasterMCP._request_with_retry` catches `requests.HTTPError` and checks `status_code` via `exc.response`, but `exc.response` can be `None` if the error came from a connection-level issue, causing `AttributeError`. `mcp/master_mcp.py`. Guard with `getattr(exc.response, 'status_code', None)`.
+
+30. **Bug 30** — `GoalTemplateLibrary.record_success()` acquires `_lock` and calls `_save()` inside it; `_save()` does file I/O which can block for hundreds of milliseconds, stalling all concurrent template lookups. `core/goals/template_library.py`. Release lock before saving.
+
+31. **Bug 31** — `IntentGraph._save()` is called inside `_lock` in `ingest_turn()`; slow file I/O blocks all `ingest_turn` and `related_topics` calls. `core/memory/intent_graph.py`. Save outside the lock.
+
+32. **Bug 32** — `BackgroundScheduler` from APScheduler raises `JobLookupError` in `remove_job` when the job doesn't exist, but `TaskScheduler.remove_job` catches generic `Exception` — fine. However `list_jobs_detailed` calls `job.next_run_time.isoformat()` and `next_run_time` can be `None` for paused jobs; already guarded. Actually `list_jobs_detailed` is fine.
+
+33. **Bug 33** — `NOVAFSWatcher` imports `Any = object` at the bottom of the file and uses it as a type annotation for `self._observer`; this shadows the `typing.Any` and will cause `isinstance` checks to silently pass for everything. `core/context/fs_watcher.py`. Remove `Any = object` line.
+
+34. **Bug 34** — `_autonomy_loop` deep-copies goals then iterates the copy to find a candidate, but then re-enters `_goal_lock` to fetch the live object — if another thread inserts a goal between the two lock acquisitions the indices can misalign. `main.py`. Search by `id` not index (already done, but the `goals_snapshot` deepcopy is wasteful and the double-lock pattern still has a TOCTOU window).
+
+35. **Bug 35** — `PromptEvolver._evaluate_variant()` is called from `record_goal_outcome()` which is called from the autonomy thread while holding no lock; `_graduate_variant` writes to `SOUL.md` from a background thread that can race with `build_system_prompt` reading `SOUL.md`. Minor race on file read.
+
+36. **Bug 36** — `InsightExtractor.run_weekly_extraction()` calls `self._get_all(sid)` which may return mem0 items with key `"memory"` not `"text"`, so `text = m.get("text", "")` silently drops all remote memories from the analysis. `utils/insight_extractor.py`. Also check `m.get("memory")`.
+
+37. **Bug 37** — `CommitmentExtractor` patterns match NOVA's own assistant responses because `extract_commitments` is called with `role="user"` hardcoded in `_commit_memory_async`, but the actual role check inside `extract_commitments` correctly guards — however the call passes `role="user"` unconditionally regardless of whether the text is user or assistant. Fine as-is actually.
+
+38. **Bug 38** — `BehaviorModel.record_activity()` calls `_save()` inside `_lock`; heavy I/O blocks every LLM call since `_track_usage` calls `record_activity` synchronously on the main response path. `utils/behavior_model.py`. Save asynchronously outside the lock.
+
+39. **Bug 39** — `_start_probe_server` binds to `settings.NOVA_HEALTH_BIND_HOST` which defaults to `"127.0.0.1"`; in Docker the health check hits `localhost` which resolves to `127.0.0.1` inside the container — fine. But the `Dockerfile` `HEALTHCHECK` uses `localhost` which in some Docker networking modes doesn't resolve to `127.0.0.1`. Minor deployment issue.
+
+40. **Bug 40** — `NOVAApp.shutdown()` calls `self.goal_runner.close()` which shuts down the executor, but if `ask_stream` is mid-execution dispatching a tool call via `goal_runner`, the `future.result()` call inside `GoalRunner.run()` will raise `CancelledError` which is caught and returned as `status="failed"` — the session turn is already partially written. Minor data inconsistency on shutdown.

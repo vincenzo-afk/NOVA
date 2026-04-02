@@ -15,6 +15,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from core.think.reasoning import _SOUL_FILE_LOCK
+
 log = logging.getLogger(__name__)
 
 _VARIANTS_PATH    = Path(".jarvis/prompt_variants.json")
@@ -203,10 +205,11 @@ class PromptEvolver:
     def _graduate_variant(self, v: PromptVariant) -> None:
         """Append the suffix to SOUL.md and notify."""
         try:
-            soul_content = self._soul_path.read_text(encoding="utf-8") if self._soul_path.exists() else ""
-            if v.prompt_suffix not in soul_content:
-                with self._soul_path.open("a", encoding="utf-8") as f:
-                    f.write(f"\n\n<!-- Auto-evolved {date.today().isoformat()} -->\n{v.prompt_suffix}\n")
+            with _SOUL_FILE_LOCK:
+                soul_content = self._soul_path.read_text(encoding="utf-8") if self._soul_path.exists() else ""
+                if v.prompt_suffix not in soul_content:
+                    with self._soul_path.open("a", encoding="utf-8") as f:
+                        f.write(f"\n\n<!-- Auto-evolved {date.today().isoformat()} -->\n{v.prompt_suffix}\n")
             v.graduated = True
             with self._lock:
                 self._active_variant = None
