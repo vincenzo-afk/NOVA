@@ -161,9 +161,10 @@ def run_tray(agent: Any) -> None:
     icon = pystray.Icon("jarvis", icon_image, build_tray_title(agent), menu)
 
     def _keep_title_fresh():
+        sleeper = threading.Event()
         while running["value"]:
             icon.title = build_tray_title(agent)
-            threading.Event().wait(10)
+            sleeper.wait(10)
 
     threading.Thread(target=_keep_title_fresh, daemon=True).start()
     icon.run()

@@ -488,9 +488,6 @@ class NOVAApp:
         self._summary_inflight: set[str] = set()
         self._session_context_epoch: dict[str, int] = {}
 
-        # Add single thread for TTS execution (fix 5.1)
-        self._tts_thread.start()
-
         # Separate executors so goal planning and memory sync cannot block summarization.
         self._max_background_summary_jobs = 100
         self._max_background_memory_jobs = 200
@@ -720,6 +717,11 @@ class NOVAApp:
                 import logging
                 logging.getLogger(__name__).warning("Plugin loader failed: %s", exc)
         try:
+            self.scheduler.start()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Scheduler startup failed: %s", exc)
+        try:
             self._start_health_monitoring()
         except Exception as exc:
             import logging
@@ -744,16 +746,13 @@ class NOVAApp:
         except Exception as exc:
             import logging
             logging.getLogger(__name__).error("Health probe startup failed: %s", exc)
-        try:
-            self.scheduler.start()
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("Scheduler startup failed: %s", exc)
         # Missing feature fix: schedule daily ChromaDB backup to prevent data loss on corruption
         try:
             if self.scheduler.scheduler.running:
-                from core.memory.backup import schedule_daily_backup
+                from core.memory.backup import schedule_daily_backup, _backup_chromadb
                 schedule_daily_backup(self.scheduler)
+                if getattr(self, "_maintenance", None) is not None:
+                    self._maintenance._backup = lambda: _backup_chromadb()
             else:
                 import logging
                 logging.getLogger(__name__).warning("Skipping backup registration because scheduler is not running.")
@@ -767,6 +766,8 @@ class NOVAApp:
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Proactive system startup failed: %s", exc)
+        # Start TTS worker after core subsystems are initialized.
+        self._tts_thread.start()
 
     def last_provider_label(self) -> str:
         return self.engine.last_provider
@@ -793,11 +794,14 @@ class NOVAApp:
             try:
                 if self._browser is not None:
                     self._browser.close()
-                    self._browser = None
             except Exception:
                 pass
             finally:
+                self._browser = None
                 self._browser_lock.release()
+        else:
+            # Best-effort isolation on lock contention during session switch.
+            self._browser = None
         self._mouse_keyboard = None
         # Bug 7 fix: reset omniparser client so it is not shared across sessions.
         self._omniparser_client = None
@@ -1160,6 +1164,9 @@ class NOVAApp:
         raw = ""
         steps = []
         for attempt in range(3):
+            with self._usage_lock:
+                if self._hard_cap_hit and self._hard_cap_hit_date == date.today():
+                    return {"goal": goal, "status": "failed", "reason": "daily_hard_cap_reached"}
             raw = self.engine.ask(prompt=f"Goal: {goal}", system=system_prompt, history=[])
             self._track_usage(system_prompt, [], f"[goal_plan] {goal}", raw)
             steps = _extract_steps(raw)
@@ -1209,10 +1216,9 @@ class NOVAApp:
                             self._persist_goals()
                             break
                 return {"status": "error", "reason": "goal_planning_queue_full", "id": goal_id}
+            self._goal_plan_jobs_inflight += 1
 
         def background_plan():
-            with self._goal_plan_submit_lock:
-                self._goal_plan_jobs_inflight += 1
             if self._shutting_down.is_set():
                 with self._goal_plan_submit_lock:
                     self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
@@ -1239,7 +1245,19 @@ class NOVAApp:
             with self._goal_plan_submit_lock:
                 self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
 
-        future = self._goal_plan_executor.submit(background_plan)
+        try:
+            future = self._goal_plan_executor.submit(background_plan)
+        except Exception as exc:
+            with self._goal_plan_submit_lock:
+                self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
+            with self._goal_lock:
+                for item in self._goals:
+                    if item.get("id") == goal_id and item.get("status") == "planning":
+                        item["status"] = "failed"
+                        item["last_result"] = {"status": "failed", "reason": f"planning_submit_exception:{exc}"}
+                        self._persist_goals()
+                        break
+            return {"status": "error", "reason": f"planning_submit_exception:{exc}", "id": goal_id}
         def _on_done(fut):
             # Bug 6 fix: background_plan already decrements _goal_plan_jobs_inflight
             # in its own finally path. _on_done is only invoked when the *future itself*
@@ -1278,7 +1296,7 @@ class NOVAApp:
         raw = filepath.strip()
         if ".." in raw.replace("\\", "/").split("/"):
             return {"status": "error", "reason": "path_traversal_blocked"}
-        target = Path(raw).expanduser().resolve()
+        target = Path(raw).expanduser().resolve(strict=False)
         protected_prefixes = [Path("/etc"), Path("/proc"), Path("/sys"), Path("/dev")]
         if any(str(target).startswith(str(p)) for p in protected_prefixes):
             return {"status": "error", "reason": "path_not_allowed"}
@@ -1287,7 +1305,15 @@ class NOVAApp:
             Path.home().resolve(),
             Path(Path(os.getenv("TMPDIR", "/tmp")).resolve()),
         ]
-        if not any(str(target).startswith(str(root)) for root in allowed_roots):
+        inside_allowed = False
+        for root in allowed_roots:
+            try:
+                target.relative_to(root)
+                inside_allowed = True
+                break
+            except Exception:
+                continue
+        if not inside_allowed:
             return {
                 "status": "error",
                 "reason": "path_outside_allowed_roots",
@@ -1355,10 +1381,15 @@ class NOVAApp:
                         if not item.get("steps"):
                             item["status"] = "planning"
                             self._persist_goals()
+                            with self._goal_plan_submit_lock:
+                                if self._goal_plan_jobs_inflight >= self._max_goal_plan_jobs:
+                                    item["status"] = "failed"
+                                    item["last_result"] = {"status": "failed", "reason": "goal_planning_queue_full"}
+                                    self._persist_goals()
+                                    return {"goal_id": goal_id, "status": "failed", "reason": "goal_planning_queue_full"}
+                                self._goal_plan_jobs_inflight += 1
                             
                             def background_plan():
-                                with self._goal_plan_submit_lock:
-                                    self._goal_plan_jobs_inflight += 1
                                 if self._shutting_down.is_set():
                                     with self._goal_plan_submit_lock:
                                         self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
@@ -1385,7 +1416,15 @@ class NOVAApp:
                                 with self._goal_plan_submit_lock:
                                     self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
                             
-                            future = self._goal_plan_executor.submit(background_plan)
+                            try:
+                                future = self._goal_plan_executor.submit(background_plan)
+                            except Exception as exc:
+                                with self._goal_plan_submit_lock:
+                                    self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
+                                item["status"] = "failed"
+                                item["last_result"] = {"status": "failed", "reason": f"planning_submit_exception:{exc}"}
+                                self._persist_goals()
+                                return {"goal_id": goal_id, "status": "failed"}
                             def _on_done(fut):
                                 exc = fut.exception()
                                 if exc is not None:
@@ -1429,25 +1468,19 @@ class NOVAApp:
         discover: bool = True,
     ) -> dict:
         def _resolve_host_with_timeout(hostname: str, timeout_seconds: float = 5.0) -> list[str]:
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+            from concurrent.futures import TimeoutError as FuturesTimeout
             import socket as _socket
 
             def _run() -> list[str]:
                 rows = _socket.getaddrinfo(hostname, None)
                 return [r[4][0] for r in rows]
 
-            pool = ThreadPoolExecutor(max_workers=1)
-            fut = pool.submit(_run)
+            fut = self._sync_executor.submit(_run)
             try:
                 return fut.result(timeout=timeout_seconds)
             except FuturesTimeout:
                 fut.cancel()
                 return []
-            finally:
-                try:
-                    pool.shutdown(wait=False, cancel_futures=True)
-                except TypeError:
-                    pool.shutdown(wait=False)
 
         svc = service.strip().lower()
         if not svc:
@@ -1912,7 +1945,7 @@ class NOVAApp:
                             break
                         if item.get("status") in {"pending", "approved_for_step"} and item.get("steps"):
                             # If it was specifically approved, we will pass a flag down
-                            goal = copy.deepcopy(item)
+                            goal = dict(item)
                             item["status"] = "running"
                             item["started_at"] = time.time()
                             break
@@ -1925,33 +1958,36 @@ class NOVAApp:
             start_index = int(goal.get("cursor") or 0)
             
             approved_for_step = goal.get("status") == "approved_for_step"
-            with self._autonomy_execution_lock:
-                with self._goal_lock:
-                    current = next((g for g in self._goals if g.get("id") == goal.get("id")), None)
-                    if current and current.get("status") == "cancelled":
-                        continue
-                if approved_for_step:
-                    if start_index >= len(steps):
-                        result = GoalResult(status="completed", reason="no_remaining_steps", results=[], next_index=len(steps))
+            try:
+                with self._autonomy_execution_lock:
+                    with self._goal_lock:
+                        current = next((g for g in self._goals if g.get("id") == goal.get("id")), None)
+                        if current and current.get("status") == "cancelled":
+                            continue
+                    if approved_for_step:
+                        if start_index >= len(steps):
+                            result = GoalResult(status="completed", reason="no_remaining_steps", results=[], next_index=len(steps))
+                        else:
+                            result = self.autonomy_runner.run(
+                                steps[start_index : start_index + 1],
+                                max_steps=1,
+                                start_index=0,
+                                on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
+                                confirm_callback=lambda _p: True,
+                                should_continue=lambda gid=str(goal.get("id")): not self._is_goal_cancelled(gid),
+                            )
+                            result.next_index = min(len(steps), start_index + (1 if result.status == "completed" else 0))
                     else:
                         result = self.autonomy_runner.run(
-                            steps[start_index : start_index + 1],
-                            max_steps=1,
-                            start_index=0,
+                            steps,
+                            max_steps=max_steps,
+                            start_index=start_index,
                             on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
-                            confirm_callback=lambda _p: True,
+                            confirm_callback=self._autonomy_confirm_callback,
                             should_continue=lambda gid=str(goal.get("id")): not self._is_goal_cancelled(gid),
                         )
-                        result.next_index = min(len(steps), start_index + (1 if result.status == "completed" else 0))
-                else:
-                    result = self.autonomy_runner.run(
-                        steps,
-                        max_steps=max_steps,
-                        start_index=start_index,
-                        on_step=lambda i, r, gid=goal.get("id"): self._on_goal_step_completed(str(gid), i, r),
-                        confirm_callback=self._autonomy_confirm_callback,
-                        should_continue=lambda gid=str(goal.get("id")): not self._is_goal_cancelled(gid),
-                    )
+            except Exception as exc:
+                result = GoalResult(status="failed", reason=f"autonomy_runner_exception:{exc}", results=[], next_index=start_index)
 
             if approved_for_step and result.status == "completed":
                 status = "pending" if result.next_index < len(steps) else "completed"
@@ -2943,17 +2979,6 @@ class NOVAApp:
             session_id = session_id or self.session.current.session_id
             provider = self.engine.last_provider
             self.usage.add(provider, input_tokens, output_tokens, session_id=session_id, when=today)
-
-        # ── Tier 2: Behavior model recording ─────────────────────────────────
-        if hasattr(self, '_behavior_model') and self._behavior_model:
-            try:
-                self._behavior_model.record_activity(
-                    provider=provider,
-                    session_id=session_id,
-                )
-            except Exception:
-                pass
-        # ─────────────────────────────────────────────────────────────────────
             total = self.usage.total_tokens_today(session_id=session_id)
             if self._hard_cap_warning_day != today:
                 self._hard_cap_warning_day = None
@@ -2981,11 +3006,21 @@ class NOVAApp:
                     self._notify_telegram(msg)
                 except Exception:
                     pass
-            # ↓ THIS BLOCK MUST ALSO BE INSIDE THE WITH:
             if self._usage_alerted_day != today:
                 if total >= settings.DAILY_TOKEN_ALERT_THRESHOLD:
                     print(f"\n[usage] Warning: daily token usage {total} exceeded threshold {settings.DAILY_TOKEN_ALERT_THRESHOLD}.")
                     self._usage_alerted_day = today
+
+        # ── Tier 2: Behavior model recording ─────────────────────────────────
+        if hasattr(self, '_behavior_model') and self._behavior_model:
+            try:
+                self._behavior_model.record_activity(
+                    provider=provider,
+                    session_id=session_id,
+                )
+            except Exception:
+                pass
+        # ─────────────────────────────────────────────────────────────────────
 
     def _schedule_sync_all_pending(self) -> None:
         now = time.monotonic()

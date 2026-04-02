@@ -46,16 +46,16 @@ _SENSITIVE_ARG_KEYS = {
     "private_key", "auth_token", "bearer_token", "api_secret",
 }
 
-def _emergency_stop_paths() -> tuple[Path, Path]:
+def _emergency_stop_paths(cwd: Path | None = None) -> tuple[Path, Path]:
     configured = (settings.EMERGENCY_STOP_FILE or ".jarvis/emergency_stop").strip()
     primary = Path(configured).expanduser()
+    base_cwd = (cwd or Path.cwd()).resolve()
     if not primary.is_absolute():
-        primary = (Path.cwd() / primary).resolve()
+        primary = (base_cwd / primary).resolve()
     home = Path.home().resolve()
-    cwd = Path.cwd().resolve()
-    if not str(primary).startswith(str(home)) and not str(primary).startswith(str(cwd)):
-        primary = (cwd / ".jarvis" / "emergency_stop").resolve()
-    fallback = (Path.cwd() / ".jarvis" / "emergency_stop").resolve()
+    if not str(primary).startswith(str(home)) and not str(primary).startswith(str(base_cwd)):
+        primary = (base_cwd / ".jarvis" / "emergency_stop").resolve()
+    fallback = (base_cwd / ".jarvis" / "emergency_stop").resolve()
     return primary, fallback
 
 
@@ -141,12 +141,14 @@ class Guardrails:
         self._log_path = Path(log_path)
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._cwd_at_init = Path.cwd().resolve()
+        self._loguru_sink_id: int | None = None
 
         # Fix 1.9: load persisted emergency stop on startup
         self._emergency_stop = threading.Event()
         global _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK
         if _EMERGENCY_STOP_FILE is None or _EMERGENCY_STOP_FILE_FALLBACK is None:
-            _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths()
+            _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths(self._cwd_at_init)
         primary, fallback = self._resolve_emergency_stop_files()
         if primary.exists() or fallback.exists():
             self._emergency_stop.set()
@@ -155,15 +157,14 @@ class Guardrails:
         self._init_rotating_log()
 
     def _init_rotating_log(self) -> None:
-        global _GUARDRAILS_LOGURU_SINK_ID
         try:
             from loguru import logger as _lg
-            if _GUARDRAILS_LOGURU_SINK_ID is not None:
+            if self._loguru_sink_id is not None:
                 try:
-                    _lg.remove(_GUARDRAILS_LOGURU_SINK_ID)
+                    _lg.remove(self._loguru_sink_id)
                 except Exception:
                     pass
-            _GUARDRAILS_LOGURU_SINK_ID = _lg.add(
+            self._loguru_sink_id = _lg.add(
                 str(self._log_path),
                 rotation="10 MB",
                 retention="7 days",
@@ -180,7 +181,7 @@ class Guardrails:
         primary = _EMERGENCY_STOP_FILE
         fallback = _EMERGENCY_STOP_FILE_FALLBACK
         if primary is None or fallback is None:
-            primary, fallback = _emergency_stop_paths()
+            primary, fallback = _emergency_stop_paths(self._cwd_at_init)
         return primary, fallback
 
     def _log_line(self, line: str) -> None:

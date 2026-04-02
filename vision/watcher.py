@@ -72,6 +72,8 @@ class ScreenWatcher:
 
     def _tick(self) -> None:
         image_bytes = capture_screen_png()
+        if not image_bytes:
+            return
         analysis = {}
         ocr_text = ""
 
