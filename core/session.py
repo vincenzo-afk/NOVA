@@ -38,11 +38,12 @@ class SessionManager:
         self._persist_session(self._current)
 
     def add_turn(self, role: str, content: str) -> None:
-        with self._current._lock:
-            self._current.history.append({"role": role, "content": content})
-            if len(self._current.history) > self._max_history_turns:
-                self._current.history = self._current.history[-self._max_history_turns :]
-        self._persist_session(self._current)
+        session = self._current
+        with session._lock:
+            session.history.append({"role": role, "content": content})
+            if len(session.history) > self._max_history_turns:
+                session.history = session.history[-self._max_history_turns :]
+        self._persist_session(session)
 
     def _persist_session(self, session: SessionState) -> None:
         """Serialize session history to a JSON file for crash recovery (fix 2.6)."""

@@ -6,6 +6,7 @@ import json
 import signal
 import time
 import hashlib
+import uuid
 import ipaddress
 import os
 import socket
@@ -800,8 +801,8 @@ class NOVAApp:
                 self._browser = None
                 self._browser_lock.release()
         else:
-            # Best-effort isolation on lock contention during session switch.
-            self._browser = None
+            import logging
+            logging.getLogger(__name__).warning("Browser lock timeout during session switch; keeping existing browser instance.")
         self._mouse_keyboard = None
         # Bug 7 fix: reset omniparser client so it is not shared across sessions.
         self._omniparser_client = None
@@ -891,6 +892,7 @@ class NOVAApp:
     def export_session(self, fmt: str = "md", history: list[dict] | None = None) -> str:
         session = self.session.current
         timestamp = int(time.time())
+        nonce = uuid.uuid4().hex[:6]
         base_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", session.name).strip("_") or "session"
         safe_name = f"{base_name}_{session.session_id[:8]}"
         if history is None:
@@ -899,9 +901,9 @@ class NOVAApp:
         else:
             payload = list(history)
         if fmt.lower() == "json":
-            path = f"exports/{safe_name}_{timestamp}.json"
+            path = f"exports/{safe_name}_{timestamp}_{nonce}.json"
             return export_json(payload, path)
-        path = f"exports/{safe_name}_{timestamp}.md"
+        path = f"exports/{safe_name}_{timestamp}_{nonce}.md"
         return export_markdown(payload, path)
 
     def status_text(self) -> str:
@@ -1203,6 +1205,7 @@ class NOVAApp:
             "created_at": time.time(),
             "max_steps": max_steps,
             "cursor": 0,
+            "session_id": self.session.current.session_id,
         }
         with self._goal_lock:
             self._goals.append(record)
@@ -2036,7 +2039,8 @@ class NOVAApp:
 
             # ── Tier 4: Goal outcome learning + auto-doc ──────────────────────
             if status == "completed":
-                self._memory_executor.submit(self._auto_document_goal_outcome, goal, result)
+                goal_session_id = str(goal.get("session_id") or self.session.current.session_id)
+                self._memory_executor.submit(self._auto_document_goal_outcome, goal, result, goal_session_id)
                 # Tier 5: Record success to template library and prompt evolver
                 try:
                     elapsed = time.time() - float(goal.get("started_at") or time.time())
@@ -2046,14 +2050,15 @@ class NOVAApp:
                         completion_time=elapsed,
                         available_tools=set(self.dispatcher.registry.keys()) if hasattr(self.dispatcher, 'registry') else set(),
                     )
-                    self._prompt_evolver.record_goal_outcome(self.session.current.session_id, succeeded=True)
+                    self._prompt_evolver.record_goal_outcome(goal_session_id, succeeded=True)
                 except Exception:
                     pass
             elif status == "failed":
                 # Tier 4: Goal outcome learning — attempt replanning
                 self._memory_executor.submit(self._handle_goal_failure, goal, result)
                 try:
-                    self._prompt_evolver.record_goal_outcome(self.session.current.session_id, succeeded=False)
+                    goal_session_id = str(goal.get("session_id") or self.session.current.session_id)
+                    self._prompt_evolver.record_goal_outcome(goal_session_id, succeeded=False)
                 except Exception:
                     pass
             # ── Tier 3: Drain proposed goals that have waited their grace period
@@ -2489,11 +2494,18 @@ class NOVAApp:
             ),
         )
 
-    def _context_messages(self, user_text: str) -> tuple[str, list[dict], list[dict]]:
-        current_session = self.session.current
-        session_id = current_session.session_id
-        with current_session._lock:
-            history = list(current_session.history)
+    def _context_messages(
+        self,
+        user_text: str,
+        *,
+        session_id: str | None = None,
+        history: list[dict] | None = None,
+    ) -> tuple[str, list[dict], list[dict]]:
+        if session_id is None or history is None:
+            current_session = self.session.current
+            session_id = current_session.session_id
+            with current_session._lock:
+                history = list(current_session.history)
 
         # Check if we need to trigger background summarization
         if len(history) > self.trimmer.max_raw_turns:
@@ -2706,6 +2718,8 @@ class NOVAApp:
     ) -> Generator[str, None, None]:
         current_session = self.session.current
         current_session_id = current_session.session_id
+        with current_session._lock:
+            current_history = list(current_session.history)
 
         def _append_turn(role: str, content: str) -> None:
             with current_session._lock:
@@ -2754,7 +2768,11 @@ class NOVAApp:
             yield question
             return
 
-        system_prompt, history, _ = self._context_messages(user_text)
+        system_prompt, history, _ = self._context_messages(
+            user_text,
+            session_id=current_session_id,
+            history=current_history,
+        )
 
         output_chunks: list[str] = []
         stream = self.engine.ask_stream(prompt=user_text, system=system_prompt, history=history)
@@ -2777,16 +2795,19 @@ class NOVAApp:
                 if not user_added:
                     _append_turn("user", user_text)
                     user_added = True
+                assistant_text = "(no response)"
             except RuntimeError as exc:
                 # PEP 479: inner StopIteration may surface as RuntimeError.
                 if "StopIteration" in str(exc):
                     if not user_added:
                         _append_turn("user", user_text)
                         user_added = True
+                    assistant_text = "(no response)"
                 else:
                     raise
 
-            assistant_text = "".join(output_chunks).strip()
+            if not assistant_text:
+                assistant_text = "".join(output_chunks).strip()
             tool_call = self.dispatcher.try_parse_tool_call(assistant_text) if allow_tools else None
             if tool_call:
                 result = self.dispatcher.execute(
@@ -2960,7 +2981,7 @@ class NOVAApp:
             import logging
             logging.getLogger(__name__).warning("[goal_failure] replanning failed: %s", exc)
 
-    def _auto_document_goal_outcome(self, goal: dict, result: Any) -> None:
+    def _auto_document_goal_outcome(self, goal: dict, result: Any, session_id: str | None = None) -> None:
         """Tier 4: Proactive Documentation — store a 2-sentence completion note."""
         try:
             steps = goal.get("steps") or []
@@ -2984,7 +3005,7 @@ class NOVAApp:
             if note:
                 self.memory.add(
                     note,
-                    self.session.current.session_id,
+                    str(session_id or goal.get("session_id") or self.session.current.session_id),
                     {"source": "goal_outcome", "goal_id": str(goal.get("id", ""))},
                 )
         except Exception as exc:

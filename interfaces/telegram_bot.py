@@ -11,6 +11,7 @@ from io import BytesIO
 from collections import OrderedDict, deque
 import asyncio
 import contextlib
+import inspect
 import json
 import queue
 import threading
@@ -32,6 +33,12 @@ _TELEGRAM_RATE_WINDOW_SECONDS = 60
 _TELEGRAM_RATE_LIMIT = 12
 _TELEGRAM_HEAVY_RATE_LIMIT = 2
 _RATE_LIMIT_MSG = "Too many commands too quickly. Please slow down for a minute."
+
+
+def _run_sync_or_async(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return asyncio.run(value)
+    return value
 
 
 def is_whitelisted(user_id: str | int, allowed_chat_id: str | None = None) -> bool:
@@ -420,8 +427,12 @@ def run_telegram_bot(
         return
 
     # Graceful shutdown path for embedding in a managed app lifecycle.
-    app.initialize()
-    app.start()
+    try:
+        _run_sync_or_async(app.initialize())
+        _run_sync_or_async(app.start())
+    except Exception as exc:
+        _log.exception("Telegram app startup failed: %s", exc)
+        return
     updater = getattr(app, "updater", None)
     polling_thread: threading.Thread | None = None
     if updater is not None:
@@ -451,6 +462,6 @@ def run_telegram_bot(
             if polling_thread is not None and polling_thread.is_alive():
                 polling_thread.join(timeout=2.0)
         with contextlib.suppress(Exception):
-            app.stop()
+            _run_sync_or_async(app.stop())
         with contextlib.suppress(Exception):
-            app.shutdown()
+            _run_sync_or_async(app.shutdown())
