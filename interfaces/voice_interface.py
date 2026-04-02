@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 
+from config.constants import AGENT_NAME
 from config.settings import settings
 from core.llm.fallback import NetworkState
 from voice.stt import transcribe as stt_online
@@ -177,7 +178,7 @@ def run_voice_loop(
 
             print(f"You (voice) > {text}")
             response = "".join(agent.ask_stream(text))
-            print(f"JARVIS > {response}")
+            print(f"{AGENT_NAME} > {response}")
             if wakeword:
                 wakeword.set_muted(True)
             try:

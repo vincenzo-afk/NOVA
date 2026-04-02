@@ -1,25 +1,17 @@
-Critical (2)
+[CRITICAL] | main.py:~515 | All LLM calls blocked with "Daily token hard cap reached" on first message | Set `DAILY_TOKEN_HARD_CAP=0` (documented disable value) in .env; startup check `total_today >= 0` is always True, setting `_hard_cap_hit=True`; `ask_stream` never resets it because `_hard_cap_hit_date == today` | Guard with `settings.DAILY_TOKEN_HARD_CAP > 0 and` before the comparison in `__init__`
 
-#1 — Hard cap re-triggers on day 2 if startup total_tokens_today(session_id=None) crosses midnight — add date.today() gate before setting _hard_cap_hit in __init__
+[CRITICAL] | core/memory/memory_router.py:sync_pending | Offline memories silently lost when `sync_pending` and concurrent `add()` race | `sync_pending` snapshots `_pending_sync[session_id]`, releases lock, syncs, re-acquires lock, writes back only `failed`; any `add()` that appended to `_pending_sync[session_id]` between the two locks is overwritten and dropped permanently | Hold lock for the final write as a diff: only remove items that were in the original snapshot
 
-#2 — Network drop mid-stream causes add_turn("user") twice — finally block not gated on not committed and not user_added
+[MAJOR] | interfaces/telegram_bot.py:_poll | Telegram bot silently stops responding after first managed lifecycle restart | `app.run_polling(stop_signals=None, close_loop=False)` raises `TypeError` in python-telegram-bot ≥v21 where `close_loop` was removed; `except Exception: pass` in `_poll` swallows it; polling thread exits immediately with no log | Use `app.run_polling()` with only `stop_signals=None` and test against installed PTB version
 
-Major (5)
+[MAJOR] | main.py:_start_probe_server | Docker/K8s healthchecks fail permanently after probe thread death, triggering container restart loop | Health monitor calls `restart_fn=_start_probe_server`; the guard `if self._health_http_server is not None: return` short-circuits because the dead-thread server object is still non-None; restart never happens; status reaches `restart_failed` and stays there | Clear `_health_http_server = None` before returning when `_health_http_thread.is_alive()` is False
 
-#5 — _sync_all_inflight not reset when executor rejects submission — sync permanently blocked
+[MAJOR] | main.py:ask_stream | User message and assistant response written to wrong session, corrupting both histories | `NetworkContextDetector._on_network_change` calls `self.switch_session()` from its background thread (runs every 5 min); if this races with an active `ask_stream`, `self.session.add_turn("user", ...)` and `add_turn("assistant", ...)` write to `self._current` which now points to the newly switched session | Capture `current_session = self.session.current` once at start of `ask_stream` and call `current_session.history.append()` directly
 
-#10 — _summary_submit_lock → trimmer._lock order can invert under session switch — enforce consistent global lock order
+[MAJOR] | control/browser.py:_cleanup_on_error | After any browser error, users who launched a visible browser silently get a headless replacement | `_cleanup_on_error` hardcodes `self.browser = self._pw.chromium.launch(headless=True)` ignoring the `headless` parameter from `__init__` | Replace with `headless=self._headless` after storing the constructor param as `self._headless`
 
-#14 — Semaphore.acquire(timeout=5) returning False + unconditional release() → ValueError during shutdown — track acquire success before releasing
+[MINOR] | interfaces/voice_interface.py:199 | Voice loop prints `"JARVIS > {response}"` instead of `"NOVA > {response}"` for every voice interaction | The `run_voice_loop` function has a hardcoded string literal instead of `AGENT_NAME` from `config.constants` | Replace with `f"{AGENT_NAME} > {response}"`
 
-#15 — assistant_text still "" in finally when output_chunks non-empty — set assistant_text = "".join(output_chunks) before committed check
+[MINOR] | main.py:ask_stream | Empty assistant turn `""` written to session history when LLM yields no tokens | If Ollama returns an empty stream (all NDJSON chunks have empty `content`), `_ollama_stream` completes without yielding; `next(stream)` raises `StopIteration` caught by inner except; code falls through; `assistant_text = "".join([]) = ""`; `add_turn("assistant", "")` executes with `committed=True` | Skip `add_turn` when `assistant_text` is empty
 
-#24 — DNS resolution in _connect_mcp blocks main thread up to 5s — run in executor thread
-
-Minor (3)
-
-#3 — Session name sanitizing to "_" silently overwrites previous export — append timestamp when sanitized name is empty/underscore-only
-
-#6 — run_polling() blocks forever with newer python-telegram-bot when updater is None
-
-#7 — "SWITCH SESSION MySession" creates "mysession" — slice from user_text.strip() not text
+[MINOR] | main.py:export_session | Second export overwrites first when two sessions whose names sanitize identically are exported within the same clock-second | `safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", session.name).strip("_") or "session"` collapses e.g. `"a!b"` and `"a?b"` to the same `"a_b"`, then `f"exports/{safe_name}_{int(time.time())}.md"` produces identical paths if both exports fall in the same second | Append `session_id[:8]` to `safe_name` to guarantee uniqueness

@@ -431,9 +431,9 @@ def run_telegram_bot(
         # Run polling in a background thread so stop_event can still be honored.
         def _poll() -> None:
             try:
-                app.run_polling(stop_signals=None, close_loop=False)
-            except Exception:
-                pass
+                app.run_polling(stop_signals=None)
+            except Exception as exc:
+                _log.exception("Telegram polling thread crashed: %s", exc)
         polling_thread = threading.Thread(target=_poll, daemon=True)
         polling_thread.start()
     try:
