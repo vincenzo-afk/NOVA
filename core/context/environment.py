@@ -182,6 +182,19 @@ def _refresh_background(include_clipboard: bool) -> None:
 
 def snapshot_environment(include_clipboard: bool = True) -> dict:
     global _ENVIRONMENT_CACHE, _ENVIRONMENT_CACHE_TIME, _REFRESH_INFLIGHT
+    # Backward-compat: tests or external code may still patch legacy scalar values.
+    if not isinstance(_ENVIRONMENT_CACHE_TIME, dict):
+        _ENVIRONMENT_CACHE_TIME = {True: float(_ENVIRONMENT_CACHE_TIME or 0.0), False: float(_ENVIRONMENT_CACHE_TIME or 0.0)}
+    if not isinstance(_REFRESH_INFLIGHT, dict):
+        flag = bool(_REFRESH_INFLIGHT)
+        _REFRESH_INFLIGHT = {True: flag, False: flag}
+    if not isinstance(_ENVIRONMENT_CACHE, dict):
+        _ENVIRONMENT_CACHE = {True: {}, False: {}}
+    elif "time" in _ENVIRONMENT_CACHE and "network" in _ENVIRONMENT_CACHE:
+        # Legacy single-cache payload promoted to both keys.
+        legacy = dict(_ENVIRONMENT_CACHE)
+        _ENVIRONMENT_CACHE = {True: dict(legacy), False: dict(legacy)}
+
     now = time.monotonic()
     with _ENVIRONMENT_LOCK:
         cache_time = _ENVIRONMENT_CACHE_TIME.get(include_clipboard, 0.0)

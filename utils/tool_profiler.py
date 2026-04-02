@@ -16,6 +16,7 @@ from typing import Any
 _LOG_PATH = Path("logs/guardrails_actions.jsonl")
 _SEQUENCE_THRESHOLD = 8   # occurrences before a sequence is considered combinable
 _RELOAD_EVERY_N = 50      # tool calls before re-scanning the log
+_tool_profiler_instance: "ToolProfiler | None" = None
 
 
 class ToolStats:
@@ -178,3 +179,8 @@ class ToolProfiler:
             return {
                 tool: stats.to_dict() for tool, stats in self._stats.items()
             }
+
+
+def set_tool_profiler_instance(instance: ToolProfiler | None) -> None:
+    global _tool_profiler_instance
+    _tool_profiler_instance = instance

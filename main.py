@@ -509,6 +509,7 @@ class NOVAApp:
         )
         self.docs = DocumentStore()
         self._browser: Browser | None = None
+        self._browser_needs_reset = False
         self._browser_lock = threading.RLock()
         self._mouse_keyboard: Any | None = None
         self._omniparser_client: Any | None = None
@@ -614,10 +615,16 @@ class NOVAApp:
         self._behavior_model   = BehaviorModel(privacy_mode=False)
         self._intent_graph     = IntentGraph(privacy_mode=False)
         self._tool_profiler    = ToolProfiler()
+        try:
+            from utils.tool_profiler import set_tool_profiler_instance
+            set_tool_profiler_instance(self._tool_profiler)
+        except Exception:
+            pass
         self._template_library = GoalTemplateLibrary()
         self._prefetch_cache: dict[str, list] = {}      # Tier 3 speculative RAG
         self._queued_alerts: deque = deque(maxlen=20)   # Tier 3 attention-aware queue
         self._error_detections_this_hour: int = 0       # Tier 2 emotion predictor input
+        self._error_counter_hour: tuple[int, int] | None = None
         self._last_process_set: set[str] = set()        # Tier 1 process monitor
         self._session_start_time = time.monotonic()     # Tier 2 session length tracking
 
@@ -803,10 +810,12 @@ class NOVAApp:
                 pass
             finally:
                 self._browser = None
+                self._browser_needs_reset = False
                 self._browser_lock.release()
         else:
             import logging
             logging.getLogger(__name__).warning("Browser lock timeout during session switch; keeping existing browser instance.")
+            self._browser_needs_reset = True
         self._mouse_keyboard = None
         # Bug 7 fix: reset omniparser client so it is not shared across sessions.
         self._omniparser_client = None
@@ -942,6 +951,13 @@ class NOVAApp:
         )
 
     def _get_browser(self) -> Browser:
+        if self._browser_needs_reset and self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+            self._browser_needs_reset = False
         if self._browser is None:
             self._browser = Browser(headless=True)
         return self._browser
@@ -1330,7 +1346,14 @@ class NOVAApp:
                 "path": str(target),
                 "allowed_roots": [str(root) for root in allowed_roots],
             }
-        return self.docs.ingest(str(target))
+        result = self.docs.ingest(str(target))
+        try:
+            if getattr(self, "_fs_watcher", None) is not None and isinstance(result, dict):
+                ingested_path = result.get("filepath") or str(target)
+                self._fs_watcher.add_path(str(ingested_path))
+        except Exception:
+            pass
+        return result
 
     def _persist_goals(self) -> None:
         try:
@@ -1353,6 +1376,10 @@ class NOVAApp:
             logging.getLogger(__name__).warning("Failed to persist goals: %s", e)
 
     def _persist_goals_debounced(self) -> None:
+        if not hasattr(self, "_goal_persist_lock"):
+            self._goal_persist_lock = threading.Lock()
+        if not hasattr(self, "_goal_persist_timer"):
+            self._goal_persist_timer = None
         with self._goal_persist_lock:
             if self._goal_persist_timer and self._goal_persist_timer.is_alive():
                 return
@@ -1715,6 +1742,10 @@ class NOVAApp:
         def _emotion_trajectory_job() -> None:
             try:
                 now = _dt.now()
+                current_hour_key = (now.year, now.timetuple().tm_yday * 24 + now.hour)
+                if self._error_counter_hour != current_hour_key:
+                    self._error_counter_hour = current_hour_key
+                    self._error_detections_this_hour = 0
                 session_mins = (time.monotonic() - self._session_start_time) / 60.0
                 self.emotion.proactive_update(
                     hour=now.hour,
@@ -2219,6 +2250,11 @@ class NOVAApp:
         if "potentially malicious on-screen text" in message.lower():
             self.record_event("security", message)
         if "error" in message.lower() or "crash" in message.lower():
+            now = datetime.now()
+            hour_key = (now.year, now.timetuple().tm_yday * 24 + now.hour)
+            if self._error_counter_hour != hour_key:
+                self._error_counter_hour = hour_key
+                self._error_detections_this_hour = 0
             self._error_detections_this_hour = getattr(self, '_error_detections_this_hour', 0) + 1
         self.record_event("proactive", message)
         if self._muted:
@@ -2315,10 +2351,12 @@ class NOVAApp:
 
     def _notify_autonomy_event(self, text: str) -> None:
         self.record_event("autonomy", text)
-        if self._muted:
+        is_critical = any(k in text.lower() for k in ("failed", "blocked", "error", "stopped", "cancelled"))
+        if self._muted and not is_critical:
             return
         _ = self._notify_telegram(text)
-        _ = self._notify_tts(text)
+        if not self._muted:
+            _ = self._notify_tts(text)
 
     def _register_adb_tools(self) -> bool:
         if not getattr(self, "adb", None):
@@ -2958,6 +2996,13 @@ class NOVAApp:
                     metadata={"source": "conversation"},
                 )
                 self.memory.sync_pending(session_id)
+            except Exception as exc:
+                self.record_event("health", f"memory_write_failed:{exc}")
+                try:
+                    import logging
+                    logging.getLogger(__name__).warning("Memory write failed for session %s: %s", session_id, exc)
+                except Exception:
+                    pass
             finally:
                 with self._memory_submit_lock:
                     self._memory_jobs_inflight = max(0, self._memory_jobs_inflight - 1)

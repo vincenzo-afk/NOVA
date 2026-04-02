@@ -179,6 +179,15 @@ class Dispatcher:
                 },
             }
 
+        # Safety fix: dry_run must never execute real tool functions, even when
+        # callers bypass guardrails (_skip_guardrails=True).
+        if dry_run:
+            return {
+                "status": "dry_run",
+                "tool": tool_call.tool,
+                "args": validated.model_dump(),
+            }
+
         # Default auth for bypass scenarios
         from safety.guardrails import RiskResult
         auth = RiskResult(blocked=False, reason="guard_bypass", score=0, level="low", plan="")

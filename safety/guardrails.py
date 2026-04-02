@@ -405,6 +405,16 @@ class Guardrails:
             reason=risk.reason,
         )
         self._log_line(json.dumps(asdict(entry), ensure_ascii=False))
+        try:
+            from utils.tool_profiler import _tool_profiler_instance
+            if _tool_profiler_instance is not None:
+                _tool_profiler_instance.record_call(
+                    tool_call.tool,
+                    success=(status == "ok"),
+                    reason=risk.reason or "",
+                )
+        except Exception:
+            pass
 
 
 guardrails = Guardrails(threshold_high=settings.RISK_CONFIRM_THRESHOLD)

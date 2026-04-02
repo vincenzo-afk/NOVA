@@ -256,6 +256,13 @@ def ensure_omniparser_repo(env_path: Path, env_values: dict[str, str]) -> Path |
     else:
         print("⚠️ OmniParser requirements.txt not found; skipping dependency install.")
 
+    # Docker/dev fix: ensure OmniParser package itself is installed in editable mode.
+    try:
+        run([sys.executable, "-m", "pip", "install", "-e", str(repo_path)])
+        print("✓ OmniParser installed in editable mode (pip install -e)")
+    except Exception as exc:
+        print(f"⚠️ OmniParser editable install failed: {exc}")
+
     return repo_path
 
 
@@ -414,6 +421,20 @@ def verify_wakeword_asset(env_values: dict[str, str]) -> None:
     print("2. Create custom 'Hey NOVA' keyword")
     print(f"3. Put the .ppn file at: {resolved}")
     print("4. Confirm PORCUPINE_KEYWORD_PATH in .env")
+    try:
+        if sys.stdin and sys.stdin.isatty():
+            candidate = input("Optional: paste full path to your .ppn now (or press Enter to skip): ").strip()
+            if candidate:
+                source = Path(candidate).expanduser().resolve()
+                if source.exists() and source.suffix.lower() == ".ppn":
+                    resolved.parent.mkdir(parents=True, exist_ok=True)
+                    if source != resolved:
+                        shutil.copy2(source, resolved)
+                    print(f"✓ Wake word asset installed: {resolved}")
+                else:
+                    print("⚠️ Provided path is invalid or not a .ppn file.")
+    except Exception as exc:
+        print(f"⚠️ Wake word wizard skipped: {exc}")
 
 
 def maybe_install_ollama_model(env_values: dict[str, str]) -> None:
