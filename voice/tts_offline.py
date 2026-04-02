@@ -20,7 +20,9 @@ def _tts_worker() -> None:
         
     while True:
         try:
-            item = _QUEUE.get()
+            item = _QUEUE.get(timeout=1.0)
+        except queue.Empty:
+            continue
         except Exception:
             continue
             

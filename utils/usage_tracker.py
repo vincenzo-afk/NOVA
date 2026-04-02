@@ -83,8 +83,8 @@ class UsageTracker:
     
             timer = threading.Timer(self._persist_interval_seconds, _flush)
             timer.daemon = True
-            self._persist_timer = timer
             timer.start()
+            self._persist_timer = timer
 
     def add(
         self,

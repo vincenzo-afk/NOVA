@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import subprocess
 import threading
+import time
 
 from config.settings import settings
 from core.llm.fallback import NetworkState
@@ -143,7 +144,26 @@ def run_voice_loop(
             barge_in_event.clear()
             _wait_for_wakeword(use_wakeword, wakeword_event)
 
-            audio = recorder.capture_until_silence()
+            audio: bytes = b""
+            capture_done = threading.Event()
+            capture_result: dict[str, bytes] = {"audio": b""}
+
+            def _capture_job() -> None:
+                try:
+                    capture_result["audio"] = recorder.capture_until_silence() or b""
+                except Exception:
+                    capture_result["audio"] = b""
+                finally:
+                    capture_done.set()
+
+            capture_thread = threading.Thread(target=_capture_job, daemon=True)
+            capture_thread.start()
+            max_capture_seconds = max(5.0, float(getattr(settings, "VOICE_MAX_CAPTURE_SECONDS", 30.0)))
+            capture_done.wait(timeout=max_capture_seconds)
+            if not capture_done.is_set():
+                print(f"[voice] capture timeout after {max_capture_seconds:.0f}s; retrying.")
+                continue
+            audio = capture_result.get("audio", b"")
             text = _transcribe_audio(audio, whisper) if audio else ""
 
             if not text and interactive_text_fallback:

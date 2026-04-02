@@ -10,6 +10,7 @@ from __future__ import annotations
 from io import BytesIO
 from collections import OrderedDict, deque
 import asyncio
+import contextlib
 import json
 import queue
 import threading
@@ -422,16 +423,34 @@ def run_telegram_bot(
     app.initialize()
     app.start()
     updater = getattr(app, "updater", None)
+    polling_thread: threading.Thread | None = None
     if updater is not None:
         updater.start_polling()
     else:
-        app.run_polling(stop_signals=None, close_loop=False)
-        return
+        # Newer python-telegram-bot versions may not expose updater.
+        # Run polling in a background thread so stop_event can still be honored.
+        def _poll() -> None:
+            try:
+                app.run_polling(stop_signals=None, close_loop=False)
+            except Exception:
+                pass
+        polling_thread = threading.Thread(target=_poll, daemon=True)
+        polling_thread.start()
     try:
         while not stop_event.is_set():
             time.sleep(0.2)
     finally:
         if updater is not None:
-            updater.stop()
-        app.stop()
-        app.shutdown()
+            with contextlib.suppress(Exception):
+                updater.stop()
+        else:
+            stop_running = getattr(app, "stop_running", None)
+            if callable(stop_running):
+                with contextlib.suppress(Exception):
+                    stop_running()
+            if polling_thread is not None and polling_thread.is_alive():
+                polling_thread.join(timeout=2.0)
+        with contextlib.suppress(Exception):
+            app.stop()
+        with contextlib.suppress(Exception):
+            app.shutdown()

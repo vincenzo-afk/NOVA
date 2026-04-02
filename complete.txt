@@ -1,0 +1,25 @@
+Critical (2)
+
+#1 — Hard cap re-triggers on day 2 if startup total_tokens_today(session_id=None) crosses midnight — add date.today() gate before setting _hard_cap_hit in __init__
+
+#2 — Network drop mid-stream causes add_turn("user") twice — finally block not gated on not committed and not user_added
+
+Major (5)
+
+#5 — _sync_all_inflight not reset when executor rejects submission — sync permanently blocked
+
+#10 — _summary_submit_lock → trimmer._lock order can invert under session switch — enforce consistent global lock order
+
+#14 — Semaphore.acquire(timeout=5) returning False + unconditional release() → ValueError during shutdown — track acquire success before releasing
+
+#15 — assistant_text still "" in finally when output_chunks non-empty — set assistant_text = "".join(output_chunks) before committed check
+
+#24 — DNS resolution in _connect_mcp blocks main thread up to 5s — run in executor thread
+
+Minor (3)
+
+#3 — Session name sanitizing to "_" silently overwrites previous export — append timestamp when sanitized name is empty/underscore-only
+
+#6 — run_polling() blocks forever with newer python-telegram-bot when updater is None
+
+#7 — "SWITCH SESSION MySession" creates "mysession" — slice from user_text.strip() not text

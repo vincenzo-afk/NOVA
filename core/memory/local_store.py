@@ -27,6 +27,7 @@ class LocalMemoryStore:
         self._collection = None
         self._embedder: EmbeddingBackend | None = None
         self._chroma_init_lock = threading.Lock()
+        self._insert_lock = threading.Lock()
         self._use_chroma = self._init_chroma()
         self._chroma_retry_time = 0.0
 
@@ -91,8 +92,6 @@ class LocalMemoryStore:
                     self._use_chroma = self._init_chroma()
 
         hash_id = hashlib.sha256(f"{session_id}:{text}".encode("utf-8")).hexdigest()
-        if self._dedup_exists(hash_id):
-            return {"status": "duplicate", "id": hash_id}
 
         # Fix 1.8: Check disk space before writing
         if self._use_chroma:
@@ -111,32 +110,35 @@ class LocalMemoryStore:
             except Exception:
                 pass
 
-        payload = metadata or {}
-        if self._use_chroma and self._collection and self._embedder:
-            try:
-                embedding = self._embedder.encode([text])[0]
-                self._collection.add(
-                    ids=[hash_id],
-                    documents=[text],
-                    metadatas=[{"session_id": session_id, **payload}],
-                    embeddings=[embedding],
-                )
-                return {"status": "ok", "id": hash_id}
-            except Exception:
-                import time
-                self._use_chroma = False
-                self._chroma_retry_time = time.time() + 60.0
+        with self._insert_lock:
+            if self._dedup_exists(hash_id):
+                return {"status": "duplicate", "id": hash_id}
+            payload = metadata or {}
+            if self._use_chroma and self._collection and self._embedder:
+                try:
+                    embedding = self._embedder.encode([text])[0]
+                    self._collection.add(
+                        ids=[hash_id],
+                        documents=[text],
+                        metadatas=[{"session_id": session_id, **payload}],
+                        embeddings=[embedding],
+                    )
+                    return {"status": "ok", "id": hash_id}
+                except Exception:
+                    import time
+                    self._use_chroma = False
+                    self._chroma_retry_time = time.time() + 60.0
 
-        self._items.append(
-            {
-                "id": hash_id,
-                "text": text,
-                "session_id": session_id,
-                "metadata": payload,
-            }
-        )
-        self._item_hashes.add(hash_id)
-        return {"status": "ok", "id": hash_id}
+            self._items.append(
+                {
+                    "id": hash_id,
+                    "text": text,
+                    "session_id": session_id,
+                    "metadata": payload,
+                }
+            )
+            self._item_hashes.add(hash_id)
+            return {"status": "ok", "id": hash_id}
 
     def search(self, query: str, session_id: str, top_k: int = 20) -> list[dict]:
         if self._use_chroma and self._collection and self._embedder:

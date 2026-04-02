@@ -9,6 +9,7 @@ Fixes applied:
 from __future__ import annotations
 
 import json
+import threading
 import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
@@ -79,15 +80,17 @@ class GoalRunner:
         self._sleep_fn = sleep_fn
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._closed = False
+        self._executor_lock = threading.Lock()
 
     def close(self) -> None:
-        self._closed = True
-        try:
-            self._executor.shutdown(wait=True, cancel_futures=True)
-        except TypeError:
-            self._executor.shutdown(wait=True)
-        self._executor = ThreadPoolExecutor(max_workers=1)
-        self._closed = False
+        with self._executor_lock:
+            self._closed = True
+            try:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                self._executor.shutdown(wait=True)
+            self._executor = ThreadPoolExecutor(max_workers=1)
+            self._closed = False
 
     def run(
         self,
@@ -163,29 +166,30 @@ class GoalRunner:
                 )
 
             guard.record(tool, args)
-            if self._closed:
-                return GoalResult(
-                    status="failed",
-                    reason="runner_closed",
-                    results=results,
-                    next_index=idx,
-                )
-            if guardrails.is_emergency_stopped():
-                return GoalResult(
-                    status="blocked",
-                    reason="emergency_stop_active",
-                    results=results,
-                    next_index=idx,
-                )
-            try:
-                future = self._executor.submit(self.dispatcher.execute, call, None, None, dry_run, True)
-            except RuntimeError:
-                return GoalResult(
-                    status="failed",
-                    reason="runner_closed",
-                    results=results,
-                    next_index=idx,
-                )
+            with self._executor_lock:
+                if self._closed:
+                    return GoalResult(
+                        status="failed",
+                        reason="runner_closed",
+                        results=results,
+                        next_index=idx,
+                    )
+                if guardrails.is_emergency_stopped():
+                    return GoalResult(
+                        status="blocked",
+                        reason="emergency_stop_active",
+                        results=results,
+                        next_index=idx,
+                    )
+                try:
+                    future = self._executor.submit(self.dispatcher.execute, call, None, None, dry_run, True)
+                except RuntimeError:
+                    return GoalResult(
+                        status="failed",
+                        reason="runner_closed",
+                        results=results,
+                        next_index=idx,
+                    )
             try:
                 result = future.result(timeout=self.step_timeout_seconds)
             except CancelledError:
