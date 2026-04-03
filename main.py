@@ -612,7 +612,9 @@ class NOVAApp:
         self._sync_all_lock = threading.Lock()
         self._network_online_cache: bool | None = None
         self._network_online_cache_at = 0.0
-        self._network_online_ttl_seconds = 5.0
+        self._network_online_ttl_seconds = 30.0
+        self._network_online_lock = threading.Lock()
+        self._network_online_refresh_inflight = False
 
         # ── Proactive Intelligence — Tier 1-5 components ──────────────────────
         self._behavior_model   = BehaviorModel(privacy_mode=False)
@@ -856,7 +858,6 @@ class NOVAApp:
         except Exception as exc:
             import logging
             logging.getLogger(__name__).error("Session backup failed before reset: %s", exc)
-            raise RuntimeError("Session backup failed; reset aborted.") from exc
         self.session.reset_context()
         # fix 1.6: clear stale summary and invalidate in-flight summarizer writes.
         self._clear_session_context_state(session_id, clear_summary=True)
@@ -1252,33 +1253,31 @@ class NOVAApp:
             self._goal_plan_jobs_inflight += 1
 
         def background_plan():
-            if self._shutting_down.is_set():
-                with self._goal_plan_submit_lock:
-                    self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
-                return
             try:
+                if self._shutting_down.is_set():
+                    return
                 plan = self._plan_goal(goal, max_steps=min(max_steps, 30))
             except Exception as exc:
                 plan = {"status": "failed", "reason": f"planning_exception:{exc}"}
-            if self._shutting_down.is_set():
+            try:
+                if self._shutting_down.is_set():
+                    return
+                with self._goal_lock:
+                    for item in self._goals:
+                        if item.get("id") == goal_id:
+                            if item.get("status") == "cancelled":
+                                break
+                            if plan.get("status") == "ok":
+                                item["steps"] = plan["steps"]
+                                item["status"] = "pending"
+                            else:
+                                item["status"] = "failed"
+                                item["last_result"] = plan
+                            self._persist_goals()
+                            break
+            finally:
                 with self._goal_plan_submit_lock:
                     self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
-                return
-            with self._goal_lock:
-                for item in self._goals:
-                    if item.get("id") == goal_id:
-                        if item.get("status") == "cancelled":
-                            break
-                        if plan.get("status") == "ok":
-                            item["steps"] = plan["steps"]
-                            item["status"] = "pending"
-                        else:
-                            item["status"] = "failed"
-                            item["last_result"] = plan
-                        self._persist_goals()
-                        break
-            with self._goal_plan_submit_lock:
-                self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
 
         try:
             future = self._goal_plan_executor.submit(background_plan)
@@ -1294,11 +1293,6 @@ class NOVAApp:
                         break
             return {"status": "error", "reason": f"planning_submit_exception:{exc}", "id": goal_id}
         def _on_done(fut):
-            # Bug 6 fix: background_plan already decrements _goal_plan_jobs_inflight
-            # in its own finally path. _on_done is only invoked when the *future itself*
-            # raises (e.g. the executor aborted the callable), which means background_plan
-            # never ran and therefore never decremented. Only decrement here if the future
-            # raised — otherwise we'd double-decrement and the counter would go negative.
             try:
                 fut.result()
             except Exception as exc:
@@ -1309,10 +1303,6 @@ class NOVAApp:
                             item["last_result"] = {"status": "failed", "reason": f"planning_future_exception:{exc}"}
                             self._persist_goals()
                             break
-                # Only decrement here because background_plan did NOT run (future-level
-                # exception), so the counter was never incremented inside background_plan.
-                with self._goal_plan_submit_lock:
-                    self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
         future.add_done_callback(_on_done)
         return record
 
@@ -2223,7 +2213,10 @@ class NOVAApp:
             lock_acquired = False
         try:
             close_thread = threading.Thread(
-                target=lambda: (self.goal_runner.close(), self.autonomy_runner.close()),
+                target=lambda: (
+                    self.goal_runner.close(cancel_futures=True),
+                    self.autonomy_runner.close(cancel_futures=True),
+                ),
                 daemon=True,
             )
             close_thread.start()
@@ -2847,13 +2840,7 @@ class NOVAApp:
             return
 
         today = date.today()
-        hard_cap_active = False
-        with self._usage_lock:
-            if self._hard_cap_hit_date != today:
-                self._hard_cap_hit = False
-                self._hard_cap_hit_date = None
-            hard_cap_active = self._hard_cap_hit
-        if hard_cap_active:
+        if self._is_hard_cap_active_today(today):
             yield f"Daily token hard cap of {settings.DAILY_TOKEN_HARD_CAP} reached. Further calls blocked."
             return
 
@@ -2979,8 +2966,9 @@ class NOVAApp:
                         )
                 except Exception:
                     pass
-                _append_turn("assistant", partial)
-                self._commit_memory_async(user_text, partial, session_id=current_session_id)
+                if user_added:
+                    _append_turn("assistant", partial)
+                    self._commit_memory_async(user_text, partial, session_id=current_session_id)
 
     def _commit_memory_async(self, user_text: str, assistant_text: str, session_id: str | None = None) -> None:
         if self._shutting_down.is_set():
@@ -3240,14 +3228,43 @@ class NOVAApp:
         except Exception:
             return False
 
+    def _is_hard_cap_active_today(self, today: date) -> bool:
+        with self._usage_lock:
+            if self._hard_cap_hit_date != today:
+                self._hard_cap_hit = False
+                self._hard_cap_hit_date = None
+            return bool(self._hard_cap_hit and self._hard_cap_hit_date == today)
+
     def _network_online_cached(self) -> bool:
         now = time.monotonic()
-        if self._network_online_cache is not None and (now - self._network_online_cache_at) < self._network_online_ttl_seconds:
-            return self._network_online_cache
-        state = NetworkState.is_online()
-        self._network_online_cache = state
-        self._network_online_cache_at = now
+        with self._network_online_lock:
+            cached = self._network_online_cache
+            cache_age = now - self._network_online_cache_at
+            if cached is not None and cache_age < self._network_online_ttl_seconds:
+                return cached
+            if cached is not None and self._network_online_refresh_inflight:
+                return cached
+            if cached is not None:
+                self._network_online_refresh_inflight = True
+                threading.Thread(target=self._refresh_network_online_state, daemon=True).start()
+                return cached
+
+        # Cold-start path only: one synchronous probe with a shorter timeout to avoid long stalls.
+        state = NetworkState.is_online(timeout=0.25)
+        with self._network_online_lock:
+            self._network_online_cache = state
+            self._network_online_cache_at = time.monotonic()
         return state
+
+    def _refresh_network_online_state(self) -> None:
+        try:
+            state = NetworkState.is_online(timeout=0.25)
+            with self._network_online_lock:
+                self._network_online_cache = state
+                self._network_online_cache_at = time.monotonic()
+        finally:
+            with self._network_online_lock:
+                self._network_online_refresh_inflight = False
 
 
 def main() -> int:

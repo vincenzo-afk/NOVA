@@ -82,15 +82,13 @@ class GoalRunner:
         self._closed = False
         self._executor_lock = threading.Lock()
 
-    def close(self) -> None:
+    def close(self, *, cancel_futures: bool = False) -> None:
         with self._executor_lock:
             self._closed = True
             try:
-                self._executor.shutdown(wait=False, cancel_futures=True)
+                self._executor.shutdown(wait=False, cancel_futures=cancel_futures)
             except TypeError:
                 self._executor.shutdown(wait=False)
-            self._executor = ThreadPoolExecutor(max_workers=1)
-            self._closed = False
 
     def run(
         self,

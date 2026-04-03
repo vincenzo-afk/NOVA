@@ -7,7 +7,7 @@
 
 # LLM
 openai==1.3.5
-# ollama         # installed separately — use official installer
+ollama         # installed separately — use official installer
 google-generativeai==0.3.0  # pin loosely — changes with Gemini API
 
 # Voice
@@ -27,7 +27,7 @@ numpy==1.26.4
 
 # Control
 pyautogui==0.9.54
-# pywin32                    # Windows only — install with: pip install pywin32
+pywin32                    # Windows only — install with: pip install pywin32
 playwright==1.40.0
 
 # Web & Search
@@ -47,13 +47,13 @@ python-docx==1.1.2
 
 # ADB & Networking
 pure-python-adb==0.3.0.dev0
-# adb-wifi-py               # optional; install manually if ADB-WiFi required
+adb-wifi-py               # optional; install manually if ADB-WiFi required
 qrcode[pil]==7.4.2
 
 # Interfaces
 rich==14.3.3
-# pyqt6                      # optional GUI — not activated; install manually
-# python-telegram-bot        # install separately for full async Telegram support
+pyqt6                      # optional GUI — not activated; install manually
+python-telegram-bot        # install separately for full async Telegram support
 pystray==0.19.5
 
 # Tasks
