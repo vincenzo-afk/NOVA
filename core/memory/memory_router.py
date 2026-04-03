@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import hashlib
+import json
 import re
 import threading
 
@@ -100,8 +101,15 @@ class MemoryRouter:
             # Remove only items from the original snapshot that synced successfully.
             # Any items appended concurrently after snapshotting must be preserved.
             current_items = list(self._pending_sync.get(session_id, []))
-            synced_ids = {id(item) for item in synced}
-            retained = [item for item in current_items if id(item) not in synced_ids]
+            def _item_key(item: dict) -> str:
+                text = str(item.get("text", ""))
+                meta = item.get("metadata", {}) or {}
+                return hashlib.sha256(
+                    f"{session_id}:{text}:{json.dumps(meta, sort_keys=True, ensure_ascii=False)}".encode("utf-8")
+                ).hexdigest()
+
+            synced_keys = {_item_key(item) for item in synced}
+            retained = [item for item in current_items if _item_key(item) not in synced_keys]
             self._pending_sync[session_id] = retained
 
         return len(synced)

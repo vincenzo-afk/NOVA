@@ -29,6 +29,7 @@ _PRIVATE_NETWORKS = [
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
 ]
+_DNS_RESOLVER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dns_resolver")
 
 
 def _is_private_ip(ip: str) -> bool:
@@ -59,18 +60,12 @@ def _resolve_host(hostname: str, timeout_seconds: float = 5.0) -> list[str]:
         finally:
             socket.setdefaulttimeout(previous_timeout)
 
-    pool = ThreadPoolExecutor(max_workers=1)
-    fut = pool.submit(_run)
+    fut = _DNS_RESOLVER_POOL.submit(_run)
     try:
         return fut.result(timeout=timeout_seconds)
     except FuturesTimeout as exc:
         fut.cancel()
         raise ValueError(f"DNS resolution timed out for {hostname!r}") from exc
-    finally:
-        try:
-            pool.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            pool.shutdown(wait=False)
 
 
 def _validate_url(url: str) -> tuple[str, str, str]:

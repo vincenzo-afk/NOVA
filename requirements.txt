@@ -46,7 +46,7 @@ pypdf==4.0.0
 python-docx==1.1.2
 
 # ADB & Networking
-pure-python-adb==0.3.0
+pure-python-adb==0.3.0.dev0
 # adb-wifi-py               # optional; install manually if ADB-WiFi required
 qrcode[pil]==7.4.2
 

@@ -610,6 +610,9 @@ class NOVAApp:
         self._last_sync_all_pending = 0.0
         self._sync_all_inflight = False
         self._sync_all_lock = threading.Lock()
+        self._network_online_cache: bool | None = None
+        self._network_online_cache_at = 0.0
+        self._network_online_ttl_seconds = 5.0
 
         # ── Proactive Intelligence — Tier 1-5 components ──────────────────────
         self._behavior_model   = BehaviorModel(privacy_mode=False)
@@ -1108,7 +1111,8 @@ class NOVAApp:
 
     def _run_goal(self, goal: str, steps: list[GoalStepArgs], max_steps: int = 20, dry_run: bool = False) -> dict:
         step_dicts = [{"tool": step.tool, "args": step.args} for step in steps]
-        result = self.goal_runner.run(step_dicts, max_steps=max_steps, dry_run=dry_run)
+        with self._goal_execution_lock:
+            result = self.goal_runner.run(step_dicts, max_steps=max_steps, dry_run=dry_run)
         
         return {
             "goal": goal,
@@ -1194,6 +1198,9 @@ class NOVAApp:
                     return {"goal": goal, "status": "failed", "reason": "daily_hard_cap_reached"}
             raw = self.engine.ask(prompt=f"Goal: {goal}", system=system_prompt, history=[])
             self._track_usage(system_prompt, [], f"[goal_plan] {goal}", raw)
+            with self._usage_lock:
+                if self._hard_cap_hit and self._hard_cap_hit_date == date.today():
+                    return {"goal": goal, "status": "failed", "reason": "daily_hard_cap_reached"}
             steps = _extract_steps(raw)
             if steps:
                 break
@@ -1260,6 +1267,8 @@ class NOVAApp:
             with self._goal_lock:
                 for item in self._goals:
                     if item.get("id") == goal_id:
+                        if item.get("status") == "cancelled":
+                            break
                         if plan.get("status") == "ok":
                             item["steps"] = plan["steps"]
                             item["status"] = "pending"
@@ -1427,31 +1436,31 @@ class NOVAApp:
                                 self._goal_plan_jobs_inflight += 1
                             
                             def background_plan():
-                                if self._shutting_down.is_set():
-                                    with self._goal_plan_submit_lock:
-                                        self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
-                                    return
                                 try:
-                                    plan = self._plan_goal(item.get("goal", ""), max_steps=min(item.get("max_steps", 20), 30))
-                                except Exception as exc:
-                                    plan = {"status": "failed", "reason": f"planning_exception:{exc}"}
-                                if self._shutting_down.is_set():
+                                    if self._shutting_down.is_set():
+                                        return
+                                    try:
+                                        plan = self._plan_goal(item.get("goal", ""), max_steps=min(item.get("max_steps", 20), 30))
+                                    except Exception as exc:
+                                        plan = {"status": "failed", "reason": f"planning_exception:{exc}"}
+                                    if self._shutting_down.is_set():
+                                        return
+                                    with self._goal_lock:
+                                        for g in self._goals:
+                                            if g.get("id") == goal_id:
+                                                if g.get("status") == "cancelled":
+                                                    break
+                                                if plan.get("status") == "ok":
+                                                    g["steps"] = plan["steps"]
+                                                    g["status"] = "pending"
+                                                else:
+                                                    g["status"] = "failed"
+                                                    g["last_result"] = plan
+                                                self._persist_goals()
+                                                break
+                                finally:
                                     with self._goal_plan_submit_lock:
                                         self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
-                                    return
-                                with self._goal_lock:
-                                    for g in self._goals:
-                                        if g.get("id") == goal_id:
-                                            if plan.get("status") == "ok":
-                                                g["steps"] = plan["steps"]
-                                                g["status"] = "pending"
-                                            else:
-                                                g["status"] = "failed"
-                                                g["last_result"] = plan
-                                            self._persist_goals()
-                                            break
-                                with self._goal_plan_submit_lock:
-                                    self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
                             
                             try:
                                 future = self._goal_plan_executor.submit(background_plan)
@@ -1472,8 +1481,6 @@ class NOVAApp:
                                                 g["last_result"] = {"status": "failed", "reason": f"planning_future_exception:{exc}"}
                                                 self._persist_goals()
                                                 break
-                                    with self._goal_plan_submit_lock:
-                                        self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
                             future.add_done_callback(_on_done)
                             return {"goal_id": goal_id, "status": "planning"}
                         else:
@@ -1704,7 +1711,13 @@ class NOVAApp:
             check_fn=_check_llm_engine,
             restart_fn=_restart_llm_engine,
         )
-        if settings.PROACTIVE_WATCHER_ENABLED:
+        can_watch_screen = True
+        try:
+            if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+                can_watch_screen = False
+        except Exception:
+            can_watch_screen = True
+        if settings.PROACTIVE_WATCHER_ENABLED and can_watch_screen:
             self.health.register_subsystem(
                 "screen_watcher",
                 check_fn=self.screen_watcher.is_running,
@@ -2209,8 +2222,12 @@ class NOVAApp:
         except Exception:
             lock_acquired = False
         try:
-            self.goal_runner.close()
-            self.autonomy_runner.close()
+            close_thread = threading.Thread(
+                target=lambda: (self.goal_runner.close(), self.autonomy_runner.close()),
+                daemon=True,
+            )
+            close_thread.start()
+            close_thread.join(timeout=5.0)
         except Exception:
             pass
         finally:
@@ -2856,7 +2873,7 @@ class NOVAApp:
             )
         except Exception:
             pass
-        self.memory.set_online(NetworkState.is_online())
+        self.memory.set_online(self._network_online_cached())
         if self.memory.online:
             self._schedule_sync_all_pending()
 
@@ -2914,7 +2931,11 @@ class NOVAApp:
                     confirm_callback=self._interactive_confirm,
                     dry_run=dry_run_tools,
                 )
-                tool_result_text = f"[tool_result] {json.dumps(result, ensure_ascii=False)}"
+                try:
+                    serialized_result = json.dumps(result, ensure_ascii=False)
+                except TypeError:
+                    serialized_result = str(result)
+                tool_result_text = f"[tool_result] {serialized_result}"
                 if output_chunks:
                     yield "\n"
                 yield tool_result_text
@@ -3208,6 +3229,9 @@ class NOVAApp:
     def _interactive_confirm(self, prompt: str) -> bool:
         try:
             import sys
+            if threading.current_thread() is not threading.main_thread():
+                self._notify_telegram(f"High-risk confirmation required but request is non-interactive.\n{prompt}")
+                return False
             if not sys.stdin or not sys.stdin.isatty():
                 self._notify_telegram(f"High-risk confirmation required but no interactive stdin is available.\n{prompt}")
                 return False
@@ -3215,6 +3239,15 @@ class NOVAApp:
             return answer in {"y", "yes", "confirm"}
         except Exception:
             return False
+
+    def _network_online_cached(self) -> bool:
+        now = time.monotonic()
+        if self._network_online_cache is not None and (now - self._network_online_cache_at) < self._network_online_ttl_seconds:
+            return self._network_online_cache
+        state = NetworkState.is_online()
+        self._network_online_cache = state
+        self._network_online_cache_at = now
+        return state
 
 
 def main() -> int:
