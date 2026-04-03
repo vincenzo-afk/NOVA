@@ -2297,7 +2297,7 @@ class NOVAApp:
         if status in {"down", "restart_failed"}:
             self._notify_telegram(message)
 
-    def _notify_telegram(self, text: str) -> dict | None:
+    def _notify_telegram(self, text: str, timeout_seconds: int = 12) -> dict | None:
         if not settings.AUTONOMY_NOTIFY_TELEGRAM:
             return None
         try:
@@ -2305,6 +2305,7 @@ class NOVAApp:
                 bot_token=settings.TELEGRAM_BOT_TOKEN,
                 chat_id=settings.TELEGRAM_CHAT_ID,
                 text=text,
+                timeout_seconds=timeout_seconds,
             )
             # Fix 8: Telegram notifications have no error surface
             if not result.get("ok"):
@@ -3238,14 +3239,14 @@ class NOVAApp:
             if threading.current_thread() is not threading.main_thread():
                 threading.Thread(
                     target=self._notify_telegram,
-                    args=(f"High-risk confirmation required but request is non-interactive.\n{prompt}",),
+                    args=(f"High-risk confirmation required but request is non-interactive.\n{prompt}", 3),
                     daemon=True,
                 ).start()
                 return False
             if not sys.stdin or not sys.stdin.isatty():
                 threading.Thread(
                     target=self._notify_telegram,
-                    args=(f"High-risk confirmation required but no interactive stdin is available.\n{prompt}",),
+                    args=(f"High-risk confirmation required but no interactive stdin is available.\n{prompt}", 3),
                     daemon=True,
                 ).start()
                 return False
