@@ -81,6 +81,7 @@ def run_tray(agent: Any) -> None:
     draw.ellipse((12, 12, 52, 52), fill=(52, 211, 153))
 
     running = {"value": True}
+    stop_event = threading.Event()
     gui_thread = {"ref": None}
 
     def _notify(title: str, message: str) -> None:
@@ -147,6 +148,7 @@ def run_tray(agent: Any) -> None:
 
     def on_quit(icon, _item):
         running["value"] = False
+        stop_event.set()
         icon.stop()
 
     menu = pystray.Menu(
@@ -163,10 +165,10 @@ def run_tray(agent: Any) -> None:
     icon = pystray.Icon("jarvis", icon_image, build_tray_title(agent), menu)
 
     def _keep_title_fresh():
-        sleeper = threading.Event()
         while running["value"]:
             icon.title = build_tray_title(agent)
-            sleeper.wait(10)
+            if stop_event.wait(10):
+                break
 
     threading.Thread(target=_keep_title_fresh, daemon=True).start()
     icon.run()

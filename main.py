@@ -819,7 +819,8 @@ class NOVAApp:
                 self._browser_lock.release()
         else:
             import logging
-            logging.getLogger(__name__).warning("Browser lock timeout during session switch; keeping existing browser instance.")
+            logging.getLogger(__name__).warning("Browser lock timeout during session switch; force-dropping browser handle.")
+            self._browser = None
             self._browser_needs_reset = True
         self._mouse_keyboard = None
         # Bug 7 fix: reset omniparser client so it is not shared across sessions.
@@ -1194,14 +1195,12 @@ class NOVAApp:
         raw = ""
         steps = []
         for attempt in range(3):
-            with self._usage_lock:
-                if self._hard_cap_hit and self._hard_cap_hit_date == date.today():
-                    return {"goal": goal, "status": "failed", "reason": "daily_hard_cap_reached"}
+            if self._is_hard_cap_active_today(date.today()):
+                return {"goal": goal, "status": "failed", "reason": "daily_hard_cap_reached"}
             raw = self.engine.ask(prompt=f"Goal: {goal}", system=system_prompt, history=[])
             self._track_usage(system_prompt, [], f"[goal_plan] {goal}", raw)
-            with self._usage_lock:
-                if self._hard_cap_hit and self._hard_cap_hit_date == date.today():
-                    return {"goal": goal, "status": "failed", "reason": "daily_hard_cap_reached"}
+            if self._is_hard_cap_active_today(date.today()):
+                return {"goal": goal, "status": "failed", "reason": "daily_hard_cap_reached"}
             steps = _extract_steps(raw)
             if steps:
                 break
@@ -1293,6 +1292,8 @@ class NOVAApp:
                         break
             return {"status": "error", "reason": f"planning_submit_exception:{exc}", "id": goal_id}
         def _on_done(fut):
+            if self._shutting_down.is_set():
+                return
             try:
                 fut.result()
             except Exception as exc:
@@ -1503,18 +1504,20 @@ class NOVAApp:
     ) -> dict:
         def _resolve_host_with_timeout(hostname: str, timeout_seconds: float = 5.0) -> list[str]:
             from concurrent.futures import TimeoutError as FuturesTimeout
+            from concurrent.futures import ThreadPoolExecutor
             import socket as _socket
 
             def _run() -> list[str]:
                 rows = _socket.getaddrinfo(hostname, None)
                 return [r[4][0] for r in rows]
 
-            fut = self._sync_executor.submit(_run)
-            try:
-                return fut.result(timeout=timeout_seconds)
-            except FuturesTimeout:
-                fut.cancel()
-                return []
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                fut = executor.submit(_run)
+                try:
+                    return fut.result(timeout=timeout_seconds)
+                except FuturesTimeout:
+                    fut.cancel()
+                    return []
 
         svc = service.strip().lower()
         if not svc:
@@ -2808,8 +2811,10 @@ class NOVAApp:
             now_muted = self.toggle_mute()
             return "Muted." if now_muted else "Unmuted."
         if re.match(r"^switch session\s+.+$", text):
-            # Retain original casing by slicing from user_text
-            name = user_text.strip()[len("switch session "):].strip()
+            m = re.match(r"^\s*switch\s+session\s+(.+?)\s*$", user_text, flags=re.IGNORECASE)
+            name = (m.group(1) if m else "").strip()
+            if not name:
+                return "Session name is required."
             state = self.switch_session(name)
             return f"Switched to {state.name} ({state.session_id})."
         return None
@@ -2827,6 +2832,8 @@ class NOVAApp:
             current_history = list(current_session.history)
 
         def _append_turn(role: str, content: str) -> None:
+            if self.session.current.session_id != current_session_id:
+                return
             with current_session._lock:
                 current_session.history.append({"role": role, "content": content})
                 max_turns = getattr(self.session, "_max_history_turns", 500)
@@ -2999,19 +3006,28 @@ class NOVAApp:
 
         def _job() -> None:
             try:
-                self.memory.add(
-                    text=f"User: {user_text}\nAssistant: {assistant_text}",
-                    session_id=session_id,
-                    metadata={"source": "conversation"},
-                )
-                self.memory.sync_pending(session_id)
-            except Exception as exc:
-                self.record_event("health", f"memory_write_failed:{exc}")
-                try:
-                    import logging
-                    logging.getLogger(__name__).warning("Memory write failed for session %s: %s", session_id, exc)
-                except Exception:
-                    pass
+                last_exc: Exception | None = None
+                for attempt in range(2):
+                    try:
+                        self.memory.add(
+                            text=f"User: {user_text}\nAssistant: {assistant_text}",
+                            session_id=session_id,
+                            metadata={"source": "conversation"},
+                        )
+                        self.memory.sync_pending(session_id)
+                        last_exc = None
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        if attempt == 0:
+                            time.sleep(0.2)
+                if last_exc is not None:
+                    self.record_event("health", f"memory_write_failed:{last_exc}")
+                    try:
+                        import logging
+                        logging.getLogger(__name__).warning("Memory write failed for session %s: %s", session_id, last_exc)
+                    except Exception:
+                        pass
             finally:
                 with self._memory_submit_lock:
                     self._memory_jobs_inflight = max(0, self._memory_jobs_inflight - 1)
@@ -3149,6 +3165,8 @@ class NOVAApp:
             total = self.usage.total_tokens_today(session_id=session_id)
             if self._hard_cap_warning_day != today:
                 self._hard_cap_warning_day = None
+            if self._usage_alerted_day != today:
+                self._usage_alerted_day = None
             hardcap = settings.DAILY_TOKEN_HARD_CAP
             warning_pct = max(0, min(100, int(settings.DAILY_TOKEN_HARD_CAP_WARNING_PCT)))
             if hardcap > 0 and warning_pct > 0 and self._hard_cap_warning_day != today:
@@ -3218,10 +3236,18 @@ class NOVAApp:
         try:
             import sys
             if threading.current_thread() is not threading.main_thread():
-                self._notify_telegram(f"High-risk confirmation required but request is non-interactive.\n{prompt}")
+                threading.Thread(
+                    target=self._notify_telegram,
+                    args=(f"High-risk confirmation required but request is non-interactive.\n{prompt}",),
+                    daemon=True,
+                ).start()
                 return False
             if not sys.stdin or not sys.stdin.isatty():
-                self._notify_telegram(f"High-risk confirmation required but no interactive stdin is available.\n{prompt}")
+                threading.Thread(
+                    target=self._notify_telegram,
+                    args=(f"High-risk confirmation required but no interactive stdin is available.\n{prompt}",),
+                    daemon=True,
+                ).start()
                 return False
             answer = input(prompt).strip().lower()
             return answer in {"y", "yes", "confirm"}

@@ -62,7 +62,6 @@ def _emergency_stop_paths(cwd: Path | None = None) -> tuple[Path, Path]:
 # Backward-compatible module-level aliases for tests/patching.
 _EMERGENCY_STOP_FILE: Path | None = None
 _EMERGENCY_STOP_FILE_FALLBACK: Path | None = None
-_GUARDRAILS_LOGURU_SINK_ID: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -159,15 +158,9 @@ class Guardrails:
     def _init_rotating_log(self) -> None:
         try:
             from loguru import logger as _lg
-            global _GUARDRAILS_LOGURU_SINK_ID
             if self._loguru_sink_id is not None:
                 try:
                     _lg.remove(self._loguru_sink_id)
-                except Exception:
-                    pass
-            if _GUARDRAILS_LOGURU_SINK_ID is not None and _GUARDRAILS_LOGURU_SINK_ID != self._loguru_sink_id:
-                try:
-                    _lg.remove(_GUARDRAILS_LOGURU_SINK_ID)
                 except Exception:
                     pass
             self._loguru_sink_id = _lg.add(
@@ -179,7 +172,6 @@ class Guardrails:
                 filter=lambda record: record["extra"].get("guardrails") is True,
                 level="DEBUG",
             )
-            _GUARDRAILS_LOGURU_SINK_ID = self._loguru_sink_id
             self._loguru_logger = _lg.bind(guardrails=True)
         except Exception:
             self._loguru_logger = None
