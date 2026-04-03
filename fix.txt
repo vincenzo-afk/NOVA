@@ -1,89 +1,20 @@
-[CRITICAL] | main.py:_autonomy_loop | Goal stuck in "running" forever after any unhandled exception | `with self._autonomy_execution_lock:` is `threading.Semaphore(1)` used as context manager — works in Python but if `autonomy_runner.run()` raises uncaught exception, goal status never updated from "running", autonomy loop skips it forever on next iteration | Wrap runner call in try/finally to always update goal status
-
-[CRITICAL] | main.py:ask_stream | User history permanently doubles on every abandoned stream | `finally` block calls `_append_turn("user", user_text)` even when `user_added=True` already committed it earlier; any client disconnect mid-stream triggers double-append | Gate finally-block turn append on `not user_added`
-
-[CRITICAL] | main.py:_track_usage | Hard cap never resets on day 2 — user blocked all next day | `_hard_cap_hit` set to True but only reset inside `_is_hard_cap_active_today()` which is only called from `ask_stream`; if process restarts next day, `__init__` re-checks `total_tokens_today()` which returns 0 (new day) so `_hard_cap_hit=False` correctly — BUT `_hard_cap_hit_date` comparison in `ask_stream` calls `_is_hard_cap_active_today(today)` which resets it, so this is actually safe; REAL bug: `_usage_alerted_day` never reset between days without a restart, so alert fires only once ever per process lifetime | Reset `_usage_alerted_day` check to per-day comparison inside `_track_usage`
-
-[CRITICAL] | main.py:_add_goal | `_goal_plan_jobs_inflight` incremented inside submitted job body, not before submit — if executor is at capacity and job queues, counter not incremented yet, second submission also passes the `>= _max_goal_plan_jobs` check, both execute, counter double-decremented to negative | Move increment to before `executor.submit()` call, decrement in finally
-
-[CRITICAL] | core/session.py:add_turn | File I/O (tempfile create, write, fsync, replace) happens inside `session._lock` (RLock) on every single user message — main response thread holds lock while doing disk I/O; any other thread needing the lock (context_messages, history snapshot) blocks for disk latency | Move `_persist_session` call outside the lock
-
-[CRITICAL] | main.py:_context_messages | `trimmer._lock` acquired inside `_summary_submit_lock` in `_summarize_history_background`; main thread acquires `_summary_submit_lock` inside `trimmer.trim()` which acquires `trimmer._lock` first — classic lock-order inversion deadlock between summarizer thread and main ask_stream thread | Enforce consistent lock acquisition order: always trimmer._lock before _summary_submit_lock
-
-[CRITICAL] | main.py:NOVAApp.__init__ | `_tts_thread.start()` called before `self.session`, `self.health`, `self.engine` fully initialized — daemon thread wakes immediately and `_tts_worker` references `settings.TTS_OFFLINE_WATCHDOG_SECONDS` which is fine, but if any exception in `__init__` after thread start causes partial init, thread runs against half-constructed object | Move `_tts_thread.start()` to last line of `__init__`
-
-[CRITICAL] | vision/omniparser_server.py:ensure_running | Two concurrent calls (startup daemon thread + health monitor restart) both pass `if self.proc is None` check simultaneously, spawn two `Popen` subprocesses, `self.log_file` overwritten losing reference to first file handle — port conflict crashes second process silently | Acquire `_proc_lock` at entry of `ensure_running` before any `self.proc` read
-
-[CRITICAL] | main.py:shutdown | `self._autonomy_execution_lock.acquire(timeout=5)` returns False when timed out, then `release()` called unconditionally in finally — raises `ValueError: semaphore released too many times`, crash during shutdown losing unsaved state | Check return value of `acquire()` before calling `release()`
-
-[CRITICAL] | main.py:background_plan | Cancelled goal reactivated as pending | User cancels goal; `background_plan` completes planning, acquires `_goal_lock`, finds item, sets `status="pending"` without checking if status is already `"cancelled"` | Add `if item.get("status") == "cancelled": break` before status assignment
-
-[CRITICAL] | main.py:ask_stream | `json.dumps(result)` raises `TypeError` on non-serializable tool output (bytes, datetime, Path objects) — caught by outer `except Exception as exc` which yields `[ERROR] Generation failed: ...` and commits nothing, losing tool result entirely | Wrap `json.dumps(result)` in try/except with `str(result)` fallback
-
-[CRITICAL] | main.py:_plan_goal | Engine called up to 3 times after hard cap already hit | Hard cap checked only at `ask_stream` entry before `_plan_goal` is called; inside `_plan_goal` retry loop, `engine.ask()` called up to 3× with no cap recheck; each call goes through `_track_usage` incrementing tokens further past cap | Check `_is_hard_cap_active_today()` before each `engine.ask()` attempt in retry loop
-
-[CRITICAL] | core/memory/local_store.py:add | Duplicate check and insert not atomic — two concurrent `add()` calls with identical text both pass `_dedup_exists()` check before either inserts, both inserted | Hold `_insert_lock` across both `_dedup_exists()` and the subsequent insert operation
-
-[MAJOR] | main.py:_autonomy_loop | Goal status set to "running" then process killed — on restart, `__init__` resets "running" to "pending" correctly, but "planning" set to "failed" with no steps — user loses partially planned goal steps | Store partial steps before marking failed on restart
-
-[MAJOR] | main.py:switch_session | `_browser.close()` called with `_browser_lock` acquired with `timeout=1.0` — returns False on timeout, browser not closed, `_browser` not set to None, next session reuses stale browser from previous session pointing at wrong page | Use `try/finally` to always null `_browser` regardless of lock timeout
-
-[MAJOR] | interfaces/voice_interface.py:run_voice_loop | Hung capture thread accumulates without bound | On VAD timeout, `continue` restarts loop spawning new `_capture_job` thread without joining previous; each 30s timeout leaks one thread; 10 timeouts = 10 stuck threads holding audio device | Join or cancel previous capture thread before starting new one
-
-[MAJOR] | main.py:_interactive_confirm | Telegram bot async event loop frozen | `input(prompt)` called from tool execution inside `dispatcher.execute` — when triggered from Telegram handler's thread, blocks that thread; Telegram bot stops responding to all messages until user types in terminal | Return False immediately when `not sys.stdin.isatty()`, currently implemented but `threading.current_thread() is not threading.main_thread()` check runs first and calls `_notify_telegram` then returns False — actually correct; REAL bug: `_notify_telegram` inside `_interactive_confirm` can block if Telegram API is slow, still freezing executor thread | Add timeout to Telegram notify call inside confirm
-
-[MAJOR] | main.py:_schedule_sync_all_pending | `_sync_all_inflight` set True inside lock, lock released, then executor submit can raise RuntimeError on shutdown — `_sync_all_inflight` stays True forever, memory sync permanently disabled for session | Reset `_sync_all_inflight=False` in except block on submit failure
-
-[MAJOR] | core/context/environment.py:_refresh_background | Background thread hangs forever on `xclip` with no display | `_get_clipboard()` calls `subprocess.check_output(["xclip", ...])` with no timeout — on headless Linux `xclip` blocks indefinitely; `_REFRESH_INFLIGHT` stays True forever, no further environment refreshes ever happen | Add `timeout=2.0` to all `subprocess.check_output` calls in `_get_clipboard`
-
-[MAJOR] | main.py:_commit_memory_async | Memory write exceptions silently drop conversation history | `_job()` catches all exceptions with bare `except Exception` and logs warning — if ChromaDB disk full or mem0 network error, user's conversation permanently lost from memory without any user-visible indication | Retry failed memory writes or surface error to user
-
-[MAJOR] | tasks/goals.py:GoalRunner | `_executor.shutdown()` in `close()` races with `_executor.submit()` in `run()` — if `close()` called during `run()`, `submit()` raises `RuntimeError: cannot schedule new futures after shutdown`; caught nowhere in `run()`, propagates to `_autonomy_loop` as unhandled | Wrap `submit()` in try/except RuntimeError returning failed GoalResult
-
-[MAJOR] | main.py:_run_goal | `self._goal_execution_lock` semaphore acquired in `_run_goal` but `_run_goal` is called from `dispatcher.execute` → `goal.run` tool — semaphore never actually acquired because `_run_goal` doesn't call `acquire()` — concurrent goal.run tool calls execute fully in parallel, corrupting shared dispatcher state | Actually acquire the semaphore inside `_run_goal` or document it as intentionally unused
-
-[MAJOR] | core/llm/engine.py:_cloud_stream | TCP socket leaked on every mid-stream connection error | `response.iter_lines()` raises `requests.ConnectionError`; no `finally: response.close()` — socket held open until GC; under load with many retries, file descriptor exhaustion | Add `try/finally: response.close()` around `iter_lines` loop
-
-[MAJOR] | main.py:_autonomy_loop | `_on_goal_step_completed` called with `lambda i, r` but `on_step` callback signature in `GoalRunner.run` passes `(idx, result)` — lambda captures `gid=goal.get("id")` correctly but if goal dict mutated between lambda creation and callback invocation, wrong goal_id used | Capture goal_id as local variable before passing to lambda
-
-[MAJOR] | web/scraper.py | Module-level `_DNS_RESOLVER_POOL = ThreadPoolExecutor(max_workers=4)` created at import time — never shut down, threads live for process lifetime; on Windows, prevents clean process exit | Register `atexit` handler to shutdown executor
-
-[MAJOR] | main.py:_start_health_monitoring | `self.omniparser.ensure_running` launched in daemon thread at startup AND registered as `restart_fn` in health monitor — if health monitor fires before startup thread finishes, two concurrent `ensure_running` calls race on `self.proc` | Add startup thread join or check before health monitor registration
-
-[MAJOR] | main.py:NOVAApp.__init__ | `self._maintenance.backup_fn=None` set at construction with comment "wired after scheduler starts" — the wiring never happens; `_backup_chromadb` assigned only via `schedule_daily_backup` which creates scheduled jobs but `self._maintenance._backup` remains None | Actually assign `self._maintenance._backup = lambda: _backup_chromadb()` after scheduler starts
-
-[MAJOR] | safety/guardrails.py:Guardrails.__init__ | Two Guardrails instances (e.g., test + production) share `_GUARDRAILS_LOGURU_SINK_ID` global — second instance removes first's loguru sink, first instance's logs silently dropped | Use instance-level sink tracking only, remove global
-
-[MAJOR] | main.py:_add_goal | `future.add_done_callback(_on_done)` — `_on_done` accesses `self._goal_lock` and `self._goals` after future completes, but if `NOVAApp` partially destroyed during shutdown, `_on_done` fires against dead object raising `AttributeError` | Guard `_on_done` with `self._shutting_down.is_set()` check
-
-[MAJOR] | core/memory/context_trimmer.py:trim | If `summarizer` callable provided (network LLM call), it's invoked while `_lock` (RLock) is held — any other thread calling `trim` for same session blocks for full LLM round-trip duration | Release lock before calling summarizer, re-acquire to write result
-
-[MAJOR] | main.py:ask_stream | `_append_turn` called inside generator's `finally` block appends to `current_session.history` — if session was switched mid-stream (another thread), appends to old session object but `current_session` local variable still points to it, corrupting switched-to session's history | Verify session hasn't changed before appending in finally
-
-[MAJOR] | interfaces/voice_interface.py:_start_barge_in_listener | `keyboard.GlobalHotKeys` started but never stored in a way that survives `run_voice_loop` returning — hotkey listener thread becomes orphaned, continues intercepting keystrokes after voice loop exits | Store listener reference and call `stop()` in finally block — code does this correctly only when `hotkey_listener` returned non-None; but `hotkey_listener.stop()` in finally only runs if variable assigned, which it is — ACTUAL bug: if `GlobalHotKeys.start()` raises, variable still None, no cleanup needed; real issue is listener thread outlives function if exception bypasses finally | Confirmed safe, skip
-
-[MAJOR] | main.py:_autonomy_loop | Race between `item["status"] = "running"` inside `_goal_lock` and `_cancel_goal` setting `"cancelled"` — autonomy loop sets running, releases lock, cancel sets cancelled, loop checks cancelled AFTER execution completes, not before starting | Check cancelled status immediately after acquiring execution lock before calling runner
-
-[MAJOR] | core/memory/backup.py:_backup_chromadb | `existing = sorted(out_dir.glob("memory_backup_*.json"))` runs BEFORE new file written — retention keeps last 6 existing + new = 7 total; but `tmp_path.replace(out_path)` writes new file then `for old in existing[:-6]` deletes oldest, leaving up to 8 files when exactly 7 are present | Run glob after writing new file, keep last 7
-
-[MINOR] | main.py:_apply_text_commands | `re.match(r"^switch session\s+.+$", text)` matches on lowercased `text` but slices from `user_text.strip()` using `len("switch session ")` — if user types `"SWITCH SESSION MySession"`, `text` matches but original-case slice returns `"MySession"` correctly; ACTUAL bug: if user types extra spaces `"switch  session  name"`, regex matches but slice returns `" name"` with leading space creating session `" name"` | Strip the sliced name
-
-[MINOR] | main.py:export_session | `re.sub(r"[^a-zA-Z0-9_-]+", "_", session.name).strip("_")` — if session name is pure unicode/emoji result is `""`, `safe_name` becomes `"_8charID"`, file written correctly; but two exports of same empty-named session same second get identical filename, second overwrites first | Append nonce before extension always
-
-[MINOR] | interfaces/tray.py:_keep_title_fresh | `threading.Event().wait(10)` creates new throw-away Event on every loop iteration — functional but allocates/GCs object every 10s; `running["value"]` check after wait means shutdown takes up to 10s to notice | Replace with module-level stop event passed into thread
-
-[MINOR] | main.py:_start_health_monitoring | Screen watcher registered with `restart_fn=self.screen_watcher.restart` even on headless systems where `start()` always raises — health monitor attempts 3 restarts, marks `restart_failed`, then Telegram alert fires every poll cycle | Guard registration with same `can_watch_screen` check used for initial start
-
-[MINOR] | core/llm/roundrobin.py:mark_rate_limited | `failure_count = record.failures` captured after `record.failures += 1` — logged warning uses `failure_count` which is post-increment value; minor but log says "failure #2" on first rate limit | Capture before increment for accurate logging
-
-[MINOR] | main.py:_goal_plan_jobs_inflight | Counter decremented in `_on_done` only if `fut.exception() is not None` — if future completes normally (background_plan returns), counter never decremented because `_on_done` only calls decrement inside `if exc is not None` branch | Move decrement outside the if block to always decrement
-
-[MINOR] | utils/usage_tracker.py:_schedule_persist | `self._persist_timer = timer` assigned before `timer.start()` — if `start()` raises (thread limit), dead timer object stored; future `_schedule_persist` calls see `_persist_timer.is_alive() == False` and create new timer correctly — actually safe; REAL bug: `_flush` callback sets `_persist_timer = None` inside `_flush` without holding `_lock`, races with `_schedule_persist` check | Hold lock when clearing `_persist_timer` in `_flush`
-
-[MINOR] | main.py:_connect_mcp | `_resolve_host_with_timeout` uses `self._sync_executor` (single-worker ThreadPoolExecutor shared with memory sync) — DNS resolution blocks memory sync for up to 5s | Use separate executor for DNS or `concurrent.futures.ThreadPoolExecutor` local instance
-
-[MINOR] | vision/watcher.py:_tick | `capture_screen_png()` can return `b""` on some backends — passed directly to `analyze_image()` which sends empty base64 to Gemini API, wastes quota every `interval_seconds` | Guard with `if not image_bytes: return`
-
-[MINOR] | core/session.py:_persist_session | On Windows, `tmp_path.replace(path)` raises `PermissionError` if antivirus holds file — caught by outer `except Exception` logging warning, session history silently not persisted, data loss on crash | Add one retry with short sleep before logging failure
-
-[MINOR] | main.py:_resume_goal | `background_plan` closure in `_resume_goal` does not decrement `_goal_plan_jobs_inflight` in `finally` — only decremented inside `background_plan` body before exception path, and in `_on_done` only on exception; successful completion never decrements | Add `finally` block with decrement inside `background_plan` closure
+1. `ask_stream` finally block appends turn even if `user_added=True` → double history entries — gate on `not user_added`
+2. `_hard_cap_hit` never resets next day without restart → user blocked forever — fix in `_is_hard_cap_active_today`
+3. `_goal_plan_jobs_inflight` only decremented on exception, not success → counter grows forever — move decrement outside `if exc`
+4. `session._persist_session` called inside `session._lock` with disk I/O → main thread freezes — move persist call outside lock
+5. `_summarize_history_background` calls LLM while holding `trimmer._lock` → deadlock — release lock before LLM call
+6. Two concurrent `ensure_running` calls spawn duplicate OmniParser processes → port conflict crash — acquire `_proc_lock` at function entry
+7. `shutdown` calls `_autonomy_execution_lock.release()` unconditionally when `acquire` returned False → ValueError crash — check acquire return value first
+8. `background_plan` sets goal to `pending` without checking if already `cancelled` → cancelled goal reactivated — add cancelled status check
+9. `json.dumps(result)` in `ask_stream` crashes on non-serializable tool output (bytes/datetime) → `[ERROR]` response, tool result lost — wrap in try/except with `str()` fallback
+10. `_plan_goal` calls `engine.ask` up to 3 times after hard cap already hit — add cap check inside retry loop
+11. `LocalMemoryStore.add` dedup check and insert not atomic → duplicate memories inserted under concurrency — hold `_insert_lock` across both operations
+12. `switch_session` browser close holds lock with 1s timeout, on failure sets `_browser=None` anyway but skips `_browser_needs_reset` — stale browser reused next call
+13. `export_session` two exports same second get identical filename, second overwrites first → data loss — always append nonce (already there but `safe_name` missing session_id uniqueness)
+14. `_usage_alerted_day` never resets between days without restart → alert fires only once ever — compare against `date.today()` each call
+15. `GoalRunner.close` races with `run` submit → `RuntimeError` propagates uncaught to autonomy loop — wrap submit in try/except RuntimeError
+16. `_notify_telegram` inside `_interactive_confirm` can block executor thread if Telegram API is slow — add timeout to that notify call
+17. `capture_screen_png` can return empty bytes, passed to `analyze_image` wasting Gemini API quota every interval — guard with `if not image_bytes: return`
+18. `_sync_all_inflight` stays True forever if executor submit raises → memory sync permanently disabled — reset flag in except block
+19. `run_voice_loop` spawns new capture thread each VAD timeout without joining previous → audio device exhaustion/freeze — join previous thread before starting new
+20. `background_plan` in `_resume_goal` never decrements `_goal_plan_jobs_inflight` → counter grows forever — add finally block with decrement
