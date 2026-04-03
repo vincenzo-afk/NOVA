@@ -6,6 +6,7 @@ Fix 4.2: validate URLs against private IP ranges (RFC1918, link-local, loopback)
 
 from __future__ import annotations
 
+import atexit
 import ipaddress
 import socket
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
@@ -30,6 +31,7 @@ _PRIVATE_NETWORKS = [
     ipaddress.ip_network("fe80::/10"),
 ]
 _DNS_RESOLVER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dns_resolver")
+atexit.register(lambda: _DNS_RESOLVER_POOL.shutdown(wait=False, cancel_futures=True))
 
 
 def _is_private_ip(ip: str) -> bool:
