@@ -86,9 +86,9 @@ class GoalRunner:
         with self._executor_lock:
             self._closed = True
             try:
-                self._executor.shutdown(wait=True, cancel_futures=True)
+                self._executor.shutdown(wait=False, cancel_futures=True)
             except TypeError:
-                self._executor.shutdown(wait=True)
+                self._executor.shutdown(wait=False)
             self._executor = ThreadPoolExecutor(max_workers=1)
             self._closed = False
 

@@ -1,167 +1,29 @@
-new bugs
-Critical Bugs
-1. GoalRunner dry_run=True doesn't prevent execution
-File: tasks/goals.py + core/tools/dispatcher.py
-# GoalRunner.run() — guardrails.authorize with dry_run=True
-authorized = guardrails.authorize(call, risk, ..., dry_run=dry_run)
-if authorized.blocked:
-    return GoalResult(status="blocked", ...)  # ← never reached!
+[CRITICAL] | main.py:background_plan | Cancelled goal re-appears as pending | User cancels goal while planner completes; `background_plan` acquires `_goal_lock` and sets `item["status"] = "pending"` with no check for `"cancelled"` | Add `if item.get("status") == "cancelled": break` before setting pending
 
-In guardrails.authorize():
-if dry_run:
-    risk.reason = "dry_run"
-    return risk  # ← blocked is still False!
+[CRITICAL] | main.py:ask_stream | Every message adds up to 1.5s latency; offline users always blocked | `NetworkState.is_online()` opens TCP socket to `1.1.1.1:53` with 1.5s timeout on every single `ask_stream` call in the hot path | Cache network state with a short TTL instead of probing per message
 
-Since authorized.blocked stays False, GoalRunner submits the job to the executor:
-future = self._executor.submit(self.dispatcher.execute, call, None, None, dry_run, True)
-#                                                                         ^        ^
-#                                                               dry_run=True  _skip_guardrails=True
+[MAJOR] | main.py:_interactive_confirm | All concurrent requests freeze while waiting for terminal input | `input(prompt)` called from `dispatcher.execute` → called from `ask_stream` generator; blocks the iterating thread including Telegram bot's async loop | Move confirm to background thread or always return False when not `isatty()`
 
-Inside dispatcher.execute(), the dry_run guard is inside the if not _skip_guardrails: block — which is completely skipped. The actual tool function is called. Calling goal.run with dry_run=True from the CLI or a tool call silently executes everything.
-Fix: Check dry_run outside the guardrails block in dispatcher, or have GoalRunner return early when authorized.reason == "dry_run":
-if authorized.reason == "dry_run" or dry_run:
-    return GoalResult(status="dry_run", reason="dry_run", results=[], next_index=start_index)
+[MAJOR] | main.py:ask_stream | Tool result silently lost; user sees `[ERROR] Generation failed` | `json.dumps(result, ensure_ascii=False)` raises `TypeError` if any tool returns non-serializable data (bytes, datetime, custom objects); caught by outer `except Exception` which yields error instead | Wrap `json.dumps` in try/except with fallback `str(result)`
 
+[MAJOR] | interfaces/voice_interface.py:run_voice_loop | Audio device locked; process accumulates hung threads | On VAD capture timeout, `continue` restarts loop and spawns new `_capture_job` thread without joining or cancelling the previous hung thread; repeats each timeout | Set a stop flag on `capture_result` dict and join the previous thread before starting a new one
 
-2. test_environment.py broken by Fix #10
-File: tests/test_environment.py vs core/context/environment.py
-The test does:
-env._ENVIRONMENT_CACHE_TIME = 0.0   # assigns float
-env._REFRESH_INFLIGHT = False        # assigns bool
+[MAJOR] | vision/omniparser_server.py:ensure_running | OmniParser double-starts or proc reference corrupted | `ensure_running` (daemon thread at startup) and `restart` (health monitor thread) both modify `self.proc` and `self.log_file` with no lock; concurrent calls produce two `Popen` subprocesses | Add `threading.Lock()` to `OmniParserServer` guarding `self.proc` mutations
 
-But fix #10 changed these to:
-_ENVIRONMENT_CACHE_TIME: dict[bool, float] = {True: 0.0, False: 0.0}
-_REFRESH_INFLIGHT: dict[bool, bool] = {True: False, False: False}
+[MAJOR] | main.py:_plan_goal | Daily token cap blown 3× during goal planning | `engine.ask()` called up to 3 times in retry loop; `_hard_cap_hit` checked only at `ask_stream` entry, not inside `_plan_goal`; all 3 retry calls execute even if cap is hit after attempt 1 | Check `_hard_cap_hit` under `_usage_lock` before each `engine.ask()` attempt
 
-The test then calls env.snapshot_environment(include_clipboard=False) which does _ENVIRONMENT_CACHE_TIME.get(include_clipboard, 0.0) — calling .get() on a float raises AttributeError. Every run of test_environment.py crashes.
+[MAJOR] | web/scraper.py:_validate_url | Thread count grows unbounded on repeated scrape timeouts | `ThreadPoolExecutor(max_workers=1)` created per `scrape_text()` call; on DNS timeout, `fut.cancel()` + `pool.shutdown(wait=False)` leaves the DNS resolution thread running; each timeout leaks a thread | Reuse a module-level executor or use `socket.setdefaulttimeout` directly
 
-3. ToolProfiler.record_call() is never wired up
-File: utils/tool_profiler.py, safety/guardrails.py
-The profiler's docstring says record_call is "called from guardrails.log hook", but guardrails.log() only writes to a JSONL file and never calls profiler.record_call(). The NOVAApp creates a _tool_profiler but never connects it to the guardrails output.
-Consequences:
-_stats is only populated from the JSONL file at startup (and every 50 calls via reload)
-detect_combinable_sequences() always returns [] — no sequences ever recorded in-memory
-get_planner_warning() is always based on stale file data, never live data
-The planner reliability warning injected into every goal plan is always empty or stale
-Fix: In guardrails.log(), add:
-# After the log line write
-try:
-    from utils.tool_profiler import _tool_profiler_instance  # or inject via constructor
-    _tool_profiler_instance.record_call(tool_call.tool, status == "ok", reason=risk.reason)
-except Exception:
-    pass
+[MAJOR] | core/memory/memory_router.py:sync_pending | Memory items synced but still retried next time | `synced_ids = {id(item) for item in synced}` compares Python object identity; after `list(...)` snapshot and re-list of `current_items`, objects are the same refs so this works — but if `add()` appended new dicts between snapshot and re-list with same content, `id()` won't match new objects | Use content hash instead of `id()` for removal
 
-Or inject the profiler into Guardrails.__init__.
+[MAJOR] | main.py:shutdown | NOVA hangs indefinitely on exit if a tool is running | `goal_runner.close()` calls `executor.shutdown(wait=True)` with no timeout; if `dispatcher.execute` is blocked inside a hanging tool (browser, subprocess), shutdown never completes | Use `executor.shutdown(wait=True, cancel_futures=True)` with a watchdog timeout thread
 
-Major Bugs
-4. _error_detections_this_hour never resets
-File: main.py
-self._error_detections_this_hour: int = 0
+[MAJOR] | core/context/environment.py:_get_clipboard | Background refresh thread can hang indefinitely | `_get_clipboard()` calls `subprocess.check_output(["xclip", ...])` with no timeout; if `xclip` hangs (common on headless Linux), `_refresh_background` thread blocks forever holding `_ENVIRONMENT_LOCK` equivalent and no further refreshes occur | Add `timeout=2` to `subprocess.check_output`
 
-Incremented in _handle_proactive_alert whenever "error" or "crash" appears in a proactive message, but never reset. The EmotionEngine.predict_from_context() uses recent_errors >= 3 to switch to "urgent". After 3 screen errors (which happens fast in normal use), the system permanently leans toward urgent tone for the rest of the process lifetime.
-Fix: Reset hourly via the emotion trajectory scheduler job, or track with a timestamp deque.
+[MINOR] | main.py:NOVAApp.__init__ | Manual `goal.run` tool calls not serialized as intended | `self._goal_execution_lock = threading.Semaphore(1)` assigned but never `acquire()`d anywhere in the codebase; concurrent `goal.run` tool calls execute in parallel without the intended serialization | Either remove the unused semaphore or actually use it in the manual goal execution path
 
-5. Browser not cleaned up on lock timeout in switch_session
-File: main.py
-if self._browser_lock.acquire(timeout=1.0):
-    try:
-        if self._browser is not None:
-            self._browser.close()
-    except Exception:
-        pass
-    finally:
-        self._browser = None
-        self._browser_lock.release()
-else:
-    import logging
-    logging.getLogger(__name__).warning("Browser lock timeout...")
-    # _browser is NOT set to None!
+[MINOR] | main.py:_start_health_monitoring | Health monitor busily restarts screen_watcher on headless system | `screen_watcher.restart()` registered as `restart_fn`; on headless system `start()` raises each time → health monitor marks as down → retries every `HEALTH_MONITOR_INTERVAL` with `max_restart_attempts=3` then marks `restart_failed` permanently | Guard `screen_watcher.start()` with display availability check before registering subsystem
 
-If the lock times out, the old Browser instance (which may be in a broken state) remains in self._browser. The next call to _get_browser() returns the old stale instance instead of creating a new one. This causes Playwright errors on subsequent browser tool calls after a session switch under load.
+[MINOR] | main.py:_resume_goal | `_goal_plan_jobs_inflight` leaks on planning failure in resume path | In `_resume_goal`, `background_plan` defined inline increments counter inside body (not `finally`), but the `_on_done` callback only decrements on `fut.exception()` not on normal completion — causing asymmetry vs `_add_goal`'s pattern if any unhandled exception exits `background_plan` mid-run | Wrap counter decrement in `finally` block inside `background_plan`
 
-6. InsightExtractor._last_insight_week not persisted
-File: utils/insight_extractor.py
-_last_insight_week is only in-memory. After any restart, the weekly extraction runs again on the next Sunday job trigger, storing a duplicate insight in memory and sending a duplicate Telegram notification. If the app restarts multiple times on a Sunday night, users get spammed.
-
-7. Memory write failures silently swallowed in _commit_memory_async
-File: main.py
-def _job() -> None:
-    try:
-        self.memory.add(...)
-        self.memory.sync_pending(session_id)
-    finally:
-        with self._memory_submit_lock:
-            self._memory_jobs_inflight = max(0, self._memory_jobs_inflight - 1)
-
-If memory.add() or sync_pending() raises (mem0 API down, ChromaDB corruption, disk full), the exception is completely swallowed. The conversation turn is lost from memory with no indication to the user or health monitor.
-
-8. NOVAFSWatcher starts with empty watched paths
-File: main.py
-watched_paths = list(getattr(self.docs, "_doc_meta", {}).keys())
-self._fs_watcher = NOVAFSWatcher(watched_paths=watched_paths, ...)
-
-_doc_meta is empty at init — no documents have been ingested yet. The FSWatcher starts watching zero document directories (only _cwd for git commits). Documents ingested after startup via doc.ingest are added to _doc_meta but never registered with the watcher via add_path(). File change notifications never fire for any user-ingested document.
-Fix: Call self._fs_watcher.add_path(filepath) inside _doc_ingest() after a successful ingest.
-
-9. _notify_autonomy_event drops goal failure notifications when muted
-File: main.py
-def _notify_autonomy_event(self, text: str) -> None:
-    self.record_event("autonomy", text)
-    if self._muted:
-        return   # ← drops Telegram AND TTS silently
-    _ = self._notify_telegram(text)
-    _ = self._notify_tts(text)
-
-When the user mutes NOVA, critical goal failures are also silently dropped. If an autonomy goal fails or is blocked while the user is in a meeting (which triggers auto-mute via the process monitor), they never find out. The event is logged but no channel surfaces it.
-Fix: Separate mute from critical goal failure notifications, or use PresenceManager.broadcast() with urgency=HIGH for goal failures, which bypasses mute.
-
-10. _goal_persist_timer referenced before assignment in edge case
-File: main.py
-def __init__(self):
-    ...
-    self._goal_persist_timer: threading.Timer | None = None
-
-But _persist_goals_debounced is called from _add_goal via background_plan which runs in _goal_plan_executor. If background_plan starts running before __init__ completes (theoretically possible with the early executor submit), self._goal_persist_lock might not yet exist. This is extremely unlikely in practice but worth noting as a race window in the initialization sequence.
-
-Summary Table
-#SeverityBugAffected Feature
-1
-🔴 Critical
-dry_run=True executes tools anyway
-Goal dry-run safety
-2
-🔴 Critical
-test_environment.py crashes after fix #10
-CI/tests
-3
-🔴 Critical
-ToolProfiler.record_call never called
-Tool reliability planner
-4
-🟠 Major
-_error_detections_this_hour never resets
-Emotion engine
-5
-🟠 Major
-Browser leak on switch_session lock timeout
-Browser tools
-6
-🟠 Major
-_last_insight_week not persisted across restarts
-Weekly insights
-7
-🟠 Major
-Memory write failures silently swallowed
-Memory persistence
-8
-🟠 Major
-FSWatcher watches no doc paths after startup
-Auto doc re-ingest
-9
-🟠 Major
-Goal failure notifications dropped when muted
-Autonomy visibility
-10
-🟡 Minor
-Init race window with _goal_persist_lock
-Goal persistence
+[MINOR] | core/llm/engine.py:_cloud_stream | Streaming response connection never explicitly closed on mid-stream exception | `response.iter_lines()` raises `ConnectionError`; `response.close()` never called; TCP socket held open until GC finalizes the response object | Wrap `iter_lines` loop in `try/finally: response.close()`

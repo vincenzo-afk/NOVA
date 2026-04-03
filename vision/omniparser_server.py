@@ -12,6 +12,7 @@ import secrets
 import subprocess
 import sys
 import time
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -74,6 +75,7 @@ class OmniParserServer:
         self.repo_dir = repo_dir or os.getenv("OMNIPARSER_REPO_DIR", "")
         self.proc: subprocess.Popen | None = None
         self.log_file = None
+        self._proc_lock = threading.Lock()
         # Fix 7.3: Generate random auth token for API security
         self.auth_token = secrets.token_urlsafe(32)
         if not self.command:
@@ -96,41 +98,42 @@ class OmniParserServer:
         Fix 2.11: polls with exponential backoff for up to `startup_timeout` seconds.
         Fix 1.4: passes only a safe, secret-free environment to the subprocess.
         """
-        if self.proc is not None and self.proc.poll() is not None and not self.is_running():
-            try:
-                print(f"[omniparser] previous process exited with code {self.proc.returncode}; restarting")
-            except Exception:
-                pass
-            self.proc = None
-
-        if self.is_running():
-            return
-        if self.proc and self.proc.poll() is None:
-            # Process is alive but not responding yet — wait below
-            pass
-        else:
-            project_root = Path.cwd().resolve()
-            pythonpath = str(project_root)
-            if self.repo_dir:
-                pythonpath = str(Path(self.repo_dir).expanduser().resolve()) + os.pathsep + pythonpath
-
-            env = _safe_env(extra_pythonpath=pythonpath, auth_token=self.auth_token)
-            log_dir = Path("logs")
-            log_dir.mkdir(exist_ok=True)
-            log_path = log_dir / "omniparser_server.log"
-            if self.log_file:
+        with self._proc_lock:
+            if self.proc is not None and self.proc.poll() is not None and not self.is_running():
                 try:
-                    self.log_file.close()
+                    print(f"[omniparser] previous process exited with code {self.proc.returncode}; restarting")
                 except Exception:
                     pass
-            self.log_file = log_path.open("a", encoding="utf-8")
-            self.proc = subprocess.Popen(
-                self.command,
-                stdout=self.log_file,
-                stderr=self.log_file,
-                env=env,
-                cwd=str(project_root),
-            )
+                self.proc = None
+
+            if self.is_running():
+                return
+            if self.proc and self.proc.poll() is None:
+                # Process is alive but not responding yet — wait below
+                pass
+            else:
+                project_root = Path.cwd().resolve()
+                pythonpath = str(project_root)
+                if self.repo_dir:
+                    pythonpath = str(Path(self.repo_dir).expanduser().resolve()) + os.pathsep + pythonpath
+
+                env = _safe_env(extra_pythonpath=pythonpath, auth_token=self.auth_token)
+                log_dir = Path("logs")
+                log_dir.mkdir(exist_ok=True)
+                log_path = log_dir / "omniparser_server.log"
+                if self.log_file:
+                    try:
+                        self.log_file.close()
+                    except Exception:
+                        pass
+                self.log_file = log_path.open("a", encoding="utf-8")
+                self.proc = subprocess.Popen(
+                    self.command,
+                    stdout=self.log_file,
+                    stderr=self.log_file,
+                    env=env,
+                    cwd=str(project_root),
+                )
 
         # Poll with exponential backoff up to startup_timeout
         delay = 1.0
@@ -145,23 +148,25 @@ class OmniParserServer:
             time.sleep(wait)
 
         print("[omniparser] server did not become healthy within startup timeout — killing and continuing anyway")
-        if self.proc:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-            self.proc = None
+        with self._proc_lock:
+            if self.proc:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                self.proc = None
 
     def stop(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-        if self.log_file:
-            try:
-                self.log_file.close()
-            except Exception:
-                pass
-            self.log_file = None
+        with self._proc_lock:
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+            if self.log_file:
+                try:
+                    self.log_file.close()
+                except Exception:
+                    pass
+                self.log_file = None
 
     def restart(self) -> None:
         self.stop()

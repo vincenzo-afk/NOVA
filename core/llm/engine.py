@@ -127,19 +127,25 @@ class LLMEngine:
             raise RateLimitError(retry_after=retry_after)
         response.raise_for_status()
 
-        for raw_line in response.iter_lines(decode_unicode=True):
-            if not raw_line or not raw_line.startswith("data:"):
-                continue
-            payload = raw_line[5:].strip()
-            if payload == "[DONE]":
-                break
+        try:
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line or not raw_line.startswith("data:"):
+                    continue
+                payload = raw_line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    data = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                token = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                if token:
+                    yield token
+        finally:
             try:
-                data = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            token = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
-            if token:
-                yield token
+                response.close()
+            except Exception:
+                pass
 
     def _ollama_stream(self, messages: list[dict], system: str) -> Iterable[str]:
         """Use Ollama's /api/chat endpoint for better multi-turn support."""

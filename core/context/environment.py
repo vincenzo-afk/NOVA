@@ -21,11 +21,11 @@ def _run(cmd: list[str], timeout: float = 1.0) -> str:
 def _get_clipboard() -> str:
     system = platform.system().lower()
     if "darwin" in system:
-        return _run(["pbpaste"])
+        return _run(["pbpaste"], timeout=2.0)
     if "linux" in system:
-        return _run(["xclip", "-o", "-selection", "clipboard"])
+        return _run(["xclip", "-o", "-selection", "clipboard"], timeout=2.0)
     if "windows" in system:
-        return _run(["powershell", "Get-Clipboard"])
+        return _run(["powershell", "Get-Clipboard"], timeout=2.0)
     return ""
 
 
