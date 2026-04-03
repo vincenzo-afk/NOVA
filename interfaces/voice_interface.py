@@ -152,6 +152,12 @@ def run_voice_loop(
     capture_thread: threading.Thread | None = None
     try:
         while True:
+            if capture_thread is not None and capture_thread.is_alive():
+                capture_thread.join(timeout=0.5)
+                if capture_thread.is_alive():
+                    print("[voice] previous capture still busy; waiting before retry.")
+                    time.sleep(0.2)
+                    continue
             if stop_event is not None and stop_event.is_set():
                 print("Voice mode stopped.")
                 return
@@ -173,12 +179,6 @@ def run_voice_loop(
                 finally:
                     capture_done.set()
 
-            if capture_thread is not None and capture_thread.is_alive():
-                capture_thread.join(timeout=0.5)
-                if capture_thread.is_alive():
-                    print("[voice] previous capture still busy; waiting before retry.")
-                    time.sleep(0.2)
-                    continue
             capture_thread = threading.Thread(target=_capture_job, daemon=True)
             capture_thread.start()
             max_capture_seconds = max(5.0, float(getattr(settings, "VOICE_MAX_CAPTURE_SECONDS", 30.0)))
@@ -214,6 +214,9 @@ def run_voice_loop(
                 if wakeword:
                     wakeword.set_muted(False)
     finally:
+        with contextlib.suppress(Exception):
+            if capture_thread is not None and capture_thread.is_alive():
+                capture_thread.join(timeout=1.0)
         with contextlib.suppress(Exception):
             if hotkey_listener is not None:
                 hotkey_listener.stop()

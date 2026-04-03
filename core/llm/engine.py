@@ -122,12 +122,11 @@ class LLMEngine:
             stream=True,
         )
 
-        if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", "60"))
-            raise RateLimitError(retry_after=retry_after)
-        response.raise_for_status()
-
         try:
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("Retry-After", "60"))
+                raise RateLimitError(retry_after=retry_after)
+            response.raise_for_status()
             for raw_line in response.iter_lines(decode_unicode=True):
                 if not raw_line or not raw_line.startswith("data:"):
                     continue
