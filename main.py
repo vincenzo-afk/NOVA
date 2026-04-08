@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import threading
 import sys
+import shutil
 from collections import deque, OrderedDict
 from typing import Any, Generator
 from datetime import date, datetime
@@ -45,10 +46,13 @@ from control.adb.tailscale import ensure_tailscale_connected, tailscale_ip_v4, t
 from control.adb.watcher import PhoneWatcher
 from control.browser import Browser
 from interfaces.cli import run_cli
+from interfaces.key_manager import EncryptedKeyStore
+from interfaces.model_manager import list_ollama_models
 from mcp.master_api import MasterAPI
 from mcp.master_mcp import BUILTIN_SERVICES, MasterMCP
 from rag.doc_store import DocumentStore
 from safety.guardrails import guardrails
+from safety.virus_scanner import VirusScanner
 from tasks.scheduler import TaskScheduler
 from tasks.goals import GoalResult, GoalRunner
 from utils.exporter import export_json, export_markdown
@@ -83,7 +87,15 @@ from core.llm.network_context import NetworkContextDetector
 from core.goals.template_library import GoalTemplateLibrary
 from core.goals.proactive_goal_engine import ProactiveGoalEngine
 from core.think.prompt_evolver import PromptEvolver
+from core.think.self_evaluator import SelfEvaluator
+from core.think.nudge_engine import NudgeEngine
+from core.a2a.peer_registry import PeerRegistry
+from core.a2a.shared_memory_bus import SharedMemoryBus
+from core.a2a.role_manager import assign_role
+from core.a2a.conflict_resolver import ConflictResolver
 from tasks.maintenance import MaintenanceOrchestrator
+from tasks.missions import MissionManager
+from voice.ambient_listener import AmbientListener, AmbientEvent
 
 
 class WebSearchArgs(BaseModel):
@@ -174,6 +186,10 @@ class RegistryWriteArgs(BaseModel):
 class NotificationArgs(BaseModel):
     title: str
     message: str
+
+
+class SafetyScanFileArgs(BaseModel):
+    path: str
 
 
 class ProcessKillArgs(BaseModel):
@@ -333,6 +349,42 @@ class TaskCancelArgs(BaseModel):
     job_id: str
 
 
+class MissionAddArgs(BaseModel):
+    name: str = Field(..., min_length=1, max_length=64)
+    schedule: str = Field(..., min_length=3, max_length=120)
+    goal: str = Field(..., min_length=3, max_length=2000)
+    enabled: bool = True
+
+
+class MissionToggleArgs(BaseModel):
+    name: str
+
+
+class MissionRunArgs(BaseModel):
+    name: str
+
+
+class A2ASendArgs(BaseModel):
+    to_agent: str
+    msg_type: str = "status_update"
+    payload: dict = Field(default_factory=dict)
+
+
+class A2AClaimArgs(BaseModel):
+    path: str
+
+
+class A2AInboxArgs(BaseModel):
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+class A2ADelegateArgs(BaseModel):
+    to_agent: str
+    tool_name: str
+    args: dict = Field(default_factory=dict)
+    service: str | None = None
+
+
 class GoalStepArgs(BaseModel):
     tool: str
     args: dict = Field(default_factory=dict)
@@ -410,10 +462,32 @@ class NOVAApp:
         self._memory_executor = ThreadPoolExecutor(max_workers=1)
         self._sync_executor = ThreadPoolExecutor(max_workers=1)
         self._goal_plan_executor = ThreadPoolExecutor(max_workers=2)
+        self._self_eval_executor = ThreadPoolExecutor(max_workers=1)
         self.goal_runner = None
         self.autonomy_runner = None
         self._tts_queue = queue.Queue()
         self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
+
+        # Optional BYOK keystore bootstrap.
+        keystore_password = os.getenv("NOVA_KEYSTORE_PASSWORD", "").strip()
+        if keystore_password:
+            try:
+                store = EncryptedKeyStore()
+                loaded = store.load(keystore_password)
+                if loaded.get("openai"):
+                    settings.OPENAI_API_KEYS = list(loaded["openai"])
+                if loaded.get("gemini"):
+                    settings.GEMINI_API_KEYS = list(loaded["gemini"])
+                if loaded.get("mem0"):
+                    settings.MEM0_API_KEY = str(loaded["mem0"][0])
+                if loaded.get("telegram"):
+                    settings.TELEGRAM_BOT_TOKEN = str(loaded["telegram"][0])
+                if loaded.get("porcupine"):
+                    settings.PORCUPINE_ACCESS_KEY = str(loaded["porcupine"][0])
+                if loaded.get("virustotal"):
+                    settings.VIRUSTOTAL_API_KEY = str(loaded["virustotal"][0])
+            except Exception:
+                pass
 
         startup_phase = "cloud" if settings.has_cloud_llm else "minimal"
         settings.validate_startup(phase=startup_phase)
@@ -427,6 +501,7 @@ class NOVAApp:
             max_history_turns=settings.MAX_SESSION_HISTORY_TURNS,
         )
         self._muted = False
+        self._theme_lock_name = ""
         self.trimmer = ContextTrimmer(max_raw_turns=10)
         self.health = HealthMonitor(on_change=self._handle_health_event)
         self.emotion = EmotionEngine()
@@ -438,6 +513,7 @@ class NOVAApp:
         # Add tracking for daily resets (fix 1.5)
         self._hard_cap_hit_date: date | None = None
         self._usage_lock = threading.Lock()  # Fix 3: Lock around usage caps
+        self._session_privacy_overrides: dict[str, str] = {}
 
         # Bug 1 fix: if the persisted usage was from a previous day, don't carry
         # _hard_cap_hit forward — the user would be silently blocked all of day 2.
@@ -507,6 +583,7 @@ class NOVAApp:
             mem0=Mem0Client(api_key=settings.MEM0_API_KEY),
             local=LocalMemoryStore(),
         )
+        self._virus_scanner = VirusScanner(api_key=settings.VIRUSTOTAL_API_KEY)
         self.docs = DocumentStore()
         self._browser: Browser | None = None
         self._browser_needs_reset = False
@@ -566,7 +643,10 @@ class NOVAApp:
             interval_seconds=settings.PROACTIVE_WATCHER_INTERVAL,
             cooldown_seconds=settings.PROACTIVE_WATCHER_COOLDOWN,
             on_alert=self._handle_proactive_alert,
-            on_screen_state=lambda active_app, scene_type: self._behavior_model.record_screen_state(active_app, scene_type),
+            on_screen_state=lambda active_app, scene_type: (
+                self._behavior_model.record_screen_state(active_app, scene_type),
+                self._nudge_engine.update_context(task_key=f"{active_app}:{scene_type}"),
+            ),
             omniparser_url=settings.OMNIPARSER_SERVER_URL,
         )
         self.phone_watcher = None
@@ -581,8 +661,36 @@ class NOVAApp:
             ollama_base_url=settings.OLLAMA_BASE_URL,
             ollama_model=settings.OLLAMA_MODEL,
         )
+        self._self_evaluator = SelfEvaluator(
+            llm_ask_fn=lambda prompt, system: self.engine.ask(prompt=prompt, system=system, history=[]),
+        )
+        self._nudge_engine = NudgeEngine(export_callback=lambda: self.export_session("md"))
+        self._ambient_listener = AmbientListener(
+            keywords=list(getattr(settings, "AMBIENT_KEYWORDS", [])),
+            on_event=self._handle_ambient_event,
+        )
+        self._a2a_enabled = bool(getattr(settings, "A2A_ENABLED", False))
+        self._a2a_agent_name = str(getattr(settings, "A2A_AGENT_NAME", "nova")).strip() or "nova"
+        self._peer_registry = PeerRegistry()
+        self._shared_bus = SharedMemoryBus(path=getattr(settings, "A2A_SHARED_BUS_PATH", ".jarvis/shared_bus.jsonl"))
+        self._conflict_resolver = ConflictResolver()
+        self._mission_manager = MissionManager(
+            scheduler=self.scheduler,
+            enqueue_goal_fn=lambda goal_text: self._add_goal(goal_text, max_steps=settings.AUTONOMY_MAX_STEPS),
+        )
+        self._ensure_default_missions()
         self.base_system_prompt = DEFAULT_SYSTEM_PROMPT
         self._register_builtin_tools()
+        if self._a2a_enabled:
+            try:
+                self._a2a_register_presence()
+                self._a2a_send(
+                    to_agent="broadcast",
+                    msg_type="status_update",
+                    payload={"status": "online", "session": self.session.current.name},
+                )
+            except Exception:
+                pass
         
         # Separate manual-goal execution from autonomy-goal execution to avoid cross-blocking.
         self._goal_execution_lock = threading.Semaphore(1)
@@ -726,6 +834,7 @@ class NOVAApp:
             health_check_fn=lambda: self.health.status_table(),
         )
         # ── end proactive intelligence init ─────────────────────────────────────
+        self._apply_privacy_mode_for_session(self.session.current.session_id)
 
         if settings.PLUGINS_ENABLED:
             try:
@@ -793,6 +902,54 @@ class NOVAApp:
     def emotion_state(self) -> str:
         return self.emotion.state
 
+    @staticmethod
+    def _normalize_privacy_mode(mode: str) -> str:
+        cleaned = (mode or "").strip().lower()
+        if cleaned in {"local_only", "balanced", "full_cloud"}:
+            return cleaned
+        return "full_cloud"
+
+    def _get_session_privacy_mode(self, session_id: str | None = None) -> str:
+        sid = session_id or self.session.current.session_id
+        override = self._session_privacy_overrides.get(sid)
+        if override:
+            return self._normalize_privacy_mode(override)
+        return self._normalize_privacy_mode(getattr(settings, "PRIVACY_MODE", "full_cloud"))
+
+    def _apply_privacy_mode_for_session(self, session_id: str | None = None) -> str:
+        mode = self._get_session_privacy_mode(session_id=session_id)
+        remote_memory_ok = mode == "full_cloud"
+        try:
+            self.memory.set_remote_sync_enabled(remote_memory_ok)
+        except Exception:
+            pass
+        try:
+            # In local-only mode, behavioral features avoid richer text capture.
+            local_only = mode == "local_only"
+            self._behavior_model.privacy_mode = local_only
+            self._intent_graph.privacy_mode = local_only
+        except Exception:
+            pass
+        return mode
+
+    def _set_session_privacy_mode(self, mode: str, session_id: str | None = None) -> str:
+        normalized = self._normalize_privacy_mode(mode)
+        sid = session_id or self.session.current.session_id
+        self._session_privacy_overrides[sid] = normalized
+        self._apply_privacy_mode_for_session(session_id=sid)
+        return normalized
+
+    def set_theme_lock(self, theme_name: str) -> str:
+        cleaned = (theme_name or "").strip().lower()
+        if cleaned in {"", "auto", "none", "default_auto"}:
+            self._theme_lock_name = ""
+            return "auto"
+        self._theme_lock_name = cleaned
+        return cleaned
+
+    def get_theme_lock(self) -> str:
+        return self._theme_lock_name or "auto"
+
     def switch_session(self, name: str):
         previous_session_id = self.session.current.session_id
         state = self.session.switch(name)
@@ -828,6 +985,12 @@ class NOVAApp:
         if getattr(self, "adb", None):
             try:
                 self.adb.device = None
+            except Exception:
+                pass
+        self._apply_privacy_mode_for_session(state.session_id)
+        if getattr(self, "_a2a_enabled", False):
+            try:
+                self._a2a_register_presence()
             except Exception:
                 pass
         return state
@@ -938,11 +1101,16 @@ class NOVAApp:
                 "emotion": self.emotion.state,
                 "usage_today": self.usage.today_summary(session_id=self.session.current.session_id),
                 "usage_week": self.usage.weekly_summary(session_id=self.session.current.session_id),
+                "missions": self._mission_manager.list_missions(),
                 "tailscale_ip": tailscale_ip_v4(),
                 "tailscale_status": tailscale_status(),
                 "mcp_connected_services": self.master_mcp.list_services(),
                 "mcp_registered_keys": self.master_api.list_services(),
                 "muted": self._muted,
+                "privacy_mode": self._get_session_privacy_mode(),
+                "theme_lock": self.get_theme_lock(),
+                "a2a_enabled": self._a2a_enabled,
+                "a2a_role": self._a2a_role(),
                 "autonomy_notify_telegram": settings.AUTONOMY_NOTIFY_TELEGRAM,
                 "autonomy_notify_tts": settings.AUTONOMY_NOTIFY_TTS,
                 "health_summary": summarize_health(health_items),
@@ -1346,6 +1514,18 @@ class NOVAApp:
                 "path": str(target),
                 "allowed_roots": [str(root) for root in allowed_roots],
             }
+        try:
+            scan = self._virus_scanner.scan_file(str(target))
+            if isinstance(scan, dict) and not scan.get("safe", True):
+                return {
+                    "status": "blocked",
+                    "reason": "virus_scan_flagged",
+                    "scan": scan,
+                    "path": str(target),
+                }
+        except Exception:
+            # Scanning is best effort unless an explicit detection is returned.
+            pass
         result = self.docs.ingest(str(target))
         try:
             if getattr(self, "_fs_watcher", None) is not None and isinstance(result, dict):
@@ -1624,6 +1804,9 @@ class NOVAApp:
     def _safety_status(self) -> dict:
         return {"emergency_stop": guardrails.is_emergency_stopped()}
 
+    def _safety_scan_file(self, path: str) -> dict:
+        return self._virus_scanner.scan_file(path)
+
     def _session_export_tool(self, format: str = "md") -> dict:
         fmt = format.lower().strip()
         if fmt not in {"md", "markdown", "json"}:
@@ -1877,6 +2060,65 @@ class NOVAApp:
         except Exception as e:
             _log_pi.warning("[proactive] commitment reminder failed: %s", e)
 
+        # Phase 16: Nudge engine periodic checks.
+        def _nudge_job() -> None:
+            try:
+                if not getattr(settings, "NUDGE_ENGINE_ENABLED", True):
+                    return
+                world = snapshot_environment(include_clipboard=False)
+                active_app = str(world.get("foreground_app", "") or "")
+                try:
+                    topic_items = self._intent_graph.hot_topics(top_k=1)
+                    topic = topic_items[0][0] if topic_items else ""
+                except Exception:
+                    topic = ""
+                task_key = f"{topic}:{active_app}".strip(":")
+                if task_key:
+                    self._nudge_engine.update_context(task_key=task_key)
+                self._nudge_engine.detect_break(idle_seconds=0.0, active_app=active_app)
+                message, insistent = self._nudge_engine.maybe_nudge()
+                if message:
+                    prefix = "Nudge (insistent)" if insistent else "Nudge"
+                    self._handle_proactive_alert(f"{prefix}: {message}")
+            except Exception:
+                pass
+
+        try:
+            self.scheduler.add_interval(
+                fn=_nudge_job,
+                seconds=max(30, int(getattr(settings, "NUDGE_CHECK_SECONDS", 300))),
+                job_id="nudge_engine",
+            )
+        except Exception as e:
+            _log_pi.warning("[proactive] nudge job register failed: %s", e)
+
+        # Phase 17: daily A2A standup aggregation.
+        def _a2a_daily_standup() -> None:
+            try:
+                if not self._a2a_enabled:
+                    return
+                peers = self._peer_registry.list_peers()
+                if not peers:
+                    return
+                names = sorted([str(p.get("agent_name", "")) for p in peers if p.get("agent_name")])
+                if not names or names[0] != self._a2a_agent_name:
+                    return
+                recent = self.recent_events(limit=25)
+                lines = [f"- {e.get('kind')}: {str(e.get('message', ''))[:100]}" for e in recent[:10]]
+                text = "A2A Daily Standup\n" + "\n".join(lines)
+                self._notify_telegram(text)
+            except Exception:
+                pass
+
+        try:
+            self.scheduler.add_from_text(
+                fn=_a2a_daily_standup,
+                schedule_text="every day at 18:00",
+                job_id="a2a_daily_standup",
+            )
+        except Exception as e:
+            _log_pi.warning("[proactive] a2a standup job register failed: %s", e)
+
     def _start_watchers_if_enabled(self) -> None:
         if settings.PROACTIVE_WATCHER_ENABLED:
             try:
@@ -1886,6 +2128,11 @@ class NOVAApp:
         if settings.PHONE_WATCHER_ENABLED and self.phone_watcher is not None:
             try:
                 self.phone_watcher.start()
+            except Exception:
+                pass
+        if getattr(settings, "AMBIENT_MONITOR_ENABLED", False):
+            try:
+                self._ambient_listener.start()
             except Exception:
                 pass
 
@@ -2159,6 +2406,14 @@ class NOVAApp:
         phone_watcher = getattr(self, "phone_watcher", None)
         if settings.PHONE_WATCHER_ENABLED and phone_watcher is not None:
             phone_watcher.stop()
+        try:
+            self._ambient_listener.stop()
+        except Exception:
+            pass
+        try:
+            self._peer_registry.close()
+        except Exception:
+            pass
         if getattr(self, "scheduler", None):
             self.scheduler.stop()
         try:
@@ -2238,6 +2493,7 @@ class NOVAApp:
         self._memory_executor.shutdown(wait=False, **kwargs)
         self._sync_executor.shutdown(wait=False, **kwargs)
         self._goal_plan_executor.shutdown(wait=False, **kwargs)
+        self._self_eval_executor.shutdown(wait=False, **kwargs)
         # Drain queued TTS items so shutdown doesn't wait behind stale backlog.
         try:
             while True:
@@ -2298,6 +2554,8 @@ class NOVAApp:
             self._notify_telegram(message)
 
     def _notify_telegram(self, text: str, timeout_seconds: int = 12) -> dict | None:
+        if self._get_session_privacy_mode() == "local_only":
+            return None
         if not settings.AUTONOMY_NOTIFY_TELEGRAM:
             return None
         try:
@@ -2477,6 +2735,12 @@ class NOVAApp:
         self.dispatcher.register("task.schedule", self._schedule_prompt, TaskScheduleArgs)
         self.dispatcher.register("task.list", self._list_jobs, EmptyArgs)
         self.dispatcher.register("task.cancel", self._cancel_job, TaskCancelArgs)
+        self.dispatcher.register("mission.add", self._mission_add, MissionAddArgs)
+        self.dispatcher.register("mission.list", self._mission_list, EmptyArgs)
+        self.dispatcher.register("mission.enable", self._mission_enable, MissionToggleArgs)
+        self.dispatcher.register("mission.disable", self._mission_disable, MissionToggleArgs)
+        self.dispatcher.register("mission.run_now", self._mission_run_now, MissionRunArgs)
+        self.dispatcher.register("model.list", list_ollama_models, EmptyArgs)
         self.dispatcher.register("goal.run", self._run_goal, GoalRunArgs)
         self.dispatcher.register("goal.add", self._add_goal, GoalAddArgs)
         self.dispatcher.register("goal.list", self._list_goals, EmptyArgs)
@@ -2490,9 +2754,16 @@ class NOVAApp:
         self.dispatcher.register("safety.emergency_stop", self._safety_emergency_stop, EmptyArgs)
         self.dispatcher.register("safety.clear_stop", self._safety_clear_stop, EmptyArgs)
         self.dispatcher.register("safety.status", self._safety_status, EmptyArgs)
+        self.dispatcher.register("safety.scan_file", self._safety_scan_file, SafetyScanFileArgs)
         self.dispatcher.register("session.export", self._session_export_tool, ExportSessionArgs)
         self.dispatcher.register("assistant.set_mute", self._set_mute_tool, SetMuteArgs)
         self.dispatcher.register("assistant.mute_status", self._mute_status_tool, EmptyArgs)
+        self.dispatcher.register("a2a.peers", self._a2a_peers, EmptyArgs)
+        self.dispatcher.register("a2a.send", self._a2a_send, A2ASendArgs)
+        self.dispatcher.register("a2a.inbox", self._a2a_inbox, A2AInboxArgs)
+        self.dispatcher.register("a2a.claim_file", self._a2a_claim_file, A2AClaimArgs)
+        self.dispatcher.register("a2a.release_file", self._a2a_release_file, A2AClaimArgs)
+        self.dispatcher.register("a2a.delegate_tool", self._a2a_delegate_tool, A2ADelegateArgs)
         # ── Feature 14: cross-platform window manager tools ───────────────────
         if self._window_manager is not None:
             self.dispatcher.register(
@@ -2532,6 +2803,7 @@ class NOVAApp:
         self._plugin_generator = PluginGenerator(
             llm_callable=_llm_for_plugin,
             dispatcher=self.dispatcher,
+            scan_code_callback=lambda code, filename: self._virus_scanner.scan_text_buffer(code, filename),
         )
         self.dispatcher.register(
             "plugin.generate",
@@ -2592,10 +2864,174 @@ class NOVAApp:
 
     def _run_weekly_extraction_and_evolve(self) -> dict | None:
         insight = self._insight_extractor.run_weekly_extraction()
+        try:
+            session_id = self.session.current.session_id
+            averages = self._self_evaluator.weekly_averages(session_prefix=session_id[:8])
+            self.memory.add(
+                text=(
+                    "Self-eval weekly averages: "
+                    f"relevance={averages.get('relevance')} "
+                    f"actionability={averages.get('actionability')} "
+                    f"conciseness={averages.get('conciseness')}"
+                ),
+                session_id=session_id,
+                metadata={"source": "self_evaluator"},
+            )
+        except Exception:
+            pass
         if insight:
             self._prompt_evolver.propose_variant(insight, self.base_system_prompt)
             return {"status": "ok", "insight_generated": True}
         return None
+
+    def _ensure_default_missions(self) -> None:
+        try:
+            existing = {m.get("name") for m in self._mission_manager.list_missions()}
+        except Exception:
+            return
+        defaults = [
+            ("morning_brief", "every day at 08:00", "Summarize overnight updates and give a concise morning brief."),
+            ("daily_backup", "every day at 03:00", "Check backups and summarize backup health."),
+            ("weekly_summary", "every monday at 09:00", "Summarize last week progress, blockers, and top priorities."),
+            ("code_review_check", "every day at 18:00", "Review pending PRs and report high-risk findings."),
+        ]
+        for name, schedule_text, goal in defaults:
+            if name in existing:
+                continue
+            try:
+                self._mission_manager.add_mission(name=name, schedule=schedule_text, goal=goal, enabled=False)
+            except Exception:
+                continue
+
+    def _handle_ambient_event(self, event: AmbientEvent) -> None:
+        try:
+            msg = f"Ambient event: {event.event_type} (confidence {event.confidence:.2f})"
+            if event.detail:
+                msg += f" [{event.detail}]"
+            self._handle_proactive_alert(msg)
+        except Exception:
+            pass
+
+    def _mission_add(self, name: str, schedule: str, goal: str, enabled: bool = True) -> dict:
+        return self._mission_manager.add_mission(name=name, schedule=schedule, goal=goal, enabled=enabled)
+
+    def _mission_list(self) -> dict:
+        return {"missions": self._mission_manager.list_missions()}
+
+    def _mission_enable(self, name: str) -> dict:
+        return self._mission_manager.enable_mission(name, True)
+
+    def _mission_disable(self, name: str) -> dict:
+        return self._mission_manager.enable_mission(name, False)
+
+    def _mission_run_now(self, name: str) -> dict:
+        return self._mission_manager.run_mission_now(name)
+
+    def _a2a_role(self) -> dict:
+        tools = list(self.dispatcher.registry.keys()) if hasattr(self.dispatcher, "registry") else []
+        role = assign_role(
+            tools=tools,
+            can_run_tests=any("pytest" in t for t in tools) or bool(shutil.which("pytest")),
+            has_git=bool(shutil.which("git")),
+            has_rag=any(t.startswith("doc.") for t in tools),
+        )
+        return {"agent_name": self._a2a_agent_name, "role": role.role, "rationale": role.rationale}
+
+    def _a2a_register_presence(self) -> dict:
+        tools = list(self.dispatcher.registry.keys()) if hasattr(self.dispatcher, "registry") else []
+        cap_hash = hashlib.sha256(",".join(sorted(tools)).encode("utf-8")).hexdigest()[:16]
+        return self._peer_registry.upsert_self(
+            agent_name=self._a2a_agent_name,
+            session=self.session.current.name,
+            tools=tools,
+            capabilities_hash=cap_hash,
+            health_port=int(getattr(settings, "NOVA_HEALTH_PORT", 8765)),
+        )
+
+    def _a2a_peers(self) -> dict:
+        mdns = self._peer_registry.discover_mdns_peers(timeout_seconds=1.0)
+        local = self._peer_registry.list_peers()
+        tailscale = self._peer_registry.discover_tailscale_peers()
+        return {
+            "local_registry": local,
+            "mdns_peers": mdns,
+            "tailscale_peers": tailscale,
+            "role": self._a2a_role(),
+        }
+
+    def _a2a_send(self, to_agent: str, msg_type: str = "status_update", payload: dict | None = None) -> dict:
+        if payload is None:
+            payload = {}
+        return self._shared_bus.publish(
+            from_agent=self._a2a_agent_name,
+            to_agent=to_agent,
+            msg_type=msg_type,
+            payload=payload,
+        )
+
+    def _a2a_inbox(self, limit: int = 50) -> dict:
+        rows = self._shared_bus.read(to_agent=self._a2a_agent_name, limit=max(1, min(int(limit), 200)))
+        return {"messages": rows}
+
+    def _a2a_claim_file(self, path: str) -> dict:
+        result = self._conflict_resolver.claim_file(agent_name=self._a2a_agent_name, filepath=path)
+        if result.get("status") == "conflict":
+            payload = {
+                "path": str(path),
+                "held_by": result.get("held_by"),
+                "winner": result.get("winner"),
+                "paused_agent": result.get("paused_agent"),
+                "ts": int(time.time()),
+            }
+            try:
+                self._a2a_send(to_agent="broadcast", msg_type="conflict_alert", payload=payload)
+                self.record_event("a2a", f"conflict_alert: {payload}")
+                result["alert_sent"] = True
+            except Exception:
+                result["alert_sent"] = False
+        return result
+
+    def _a2a_release_file(self, path: str) -> dict:
+        return self._conflict_resolver.release_file(agent_name=self._a2a_agent_name, filepath=path)
+
+    def _a2a_delegate_tool(
+        self,
+        to_agent: str,
+        tool_name: str,
+        args: dict | None = None,
+        service: str | None = None,
+    ) -> dict:
+        payload_args = dict(args or {})
+        target_service = (service or to_agent).strip()
+        if target_service and self.master_mcp.is_connected(target_service):
+            result = self.master_mcp.call_tool(target_service, tool_name, **payload_args)
+            return {
+                "status": "executed",
+                "service": target_service,
+                "to_agent": to_agent,
+                "tool_name": tool_name,
+                "result": result,
+            }
+
+        request_id = uuid.uuid4().hex[:12]
+        self._a2a_send(
+            to_agent=to_agent,
+            msg_type="tool_delegation",
+            payload={
+                "request_id": request_id,
+                "tool_name": tool_name,
+                "args": payload_args,
+                "requested_by": self._a2a_agent_name,
+                "ts": int(time.time()),
+            },
+        )
+        return {
+            "status": "queued",
+            "request_id": request_id,
+            "to_agent": to_agent,
+            "tool_name": tool_name,
+            "reason": "target_service_not_connected_locally",
+        }
 
     def _context_messages(
         self,
@@ -2811,6 +3247,87 @@ class NOVAApp:
         if text in {"toggle mute", "mute toggle"}:
             now_muted = self.toggle_mute()
             return "Muted." if now_muted else "Unmuted."
+        if text in {f"{agent} use local mode", "use local mode"}:
+            mode = self._set_session_privacy_mode("local_only")
+            return f"Session privacy mode set to {mode}. Cloud LLM, mem0 sync, and Telegram notifications are disabled for this session."
+        if text in {f"{agent} use cloud mode", "use cloud mode"}:
+            mode = self._set_session_privacy_mode("full_cloud")
+            return f"Session privacy mode set to {mode}. Full cloud features are enabled for this session."
+        if text in {f"{agent} use balanced mode", "use balanced mode"}:
+            mode = self._set_session_privacy_mode("balanced")
+            return f"Session privacy mode set to {mode}. Cloud LLM stays enabled while remote memory sync remains disabled."
+        if text in {"privacy mode", f"{agent} privacy mode"}:
+            mode = self._get_session_privacy_mode()
+            return f"Current session privacy mode: {mode}."
+        if text in {f"{agent} no nudges today", "no nudges today"}:
+            self._nudge_engine.mute_today()
+            return "Nudges muted for today."
+        if text.startswith("schedule mission ") or text.startswith(f"{agent} schedule mission "):
+            parsed = self._mission_manager.parse_and_add_from_text(user_text)
+            return str(parsed)
+        if text.startswith("/mission "):
+            cmd_body = user_text.strip()[len("/mission ") :].strip()
+            if cmd_body.lower() == "list":
+                return json.dumps(self._mission_list(), ensure_ascii=False, indent=2)
+            if cmd_body.lower().startswith("enable "):
+                return str(self._mission_enable(cmd_body.split(" ", 1)[1].strip()))
+            if cmd_body.lower().startswith("disable "):
+                return str(self._mission_disable(cmd_body.split(" ", 1)[1].strip()))
+            if cmd_body.lower().startswith("run "):
+                return str(self._mission_run_now(cmd_body.split(" ", 1)[1].strip()))
+            if cmd_body.lower().startswith("add "):
+                raw = cmd_body[4:].strip()
+                parts = [p.strip() for p in raw.split("|")]
+                if len(parts) != 3:
+                    return "Usage: /mission add <name> | <schedule> | <goal>"
+                return str(self._mission_add(parts[0], parts[1], parts[2], True))
+            return "Usage: /mission list|enable <name>|disable <name>|run <name>|add ..."
+        if text.startswith("/a2a "):
+            cmd_body = user_text.strip()[len("/a2a ") :].strip()
+            if cmd_body.lower() == "peers":
+                return json.dumps(self._a2a_peers(), ensure_ascii=False, indent=2)
+            if cmd_body.lower().startswith("inbox"):
+                parts = cmd_body.split()
+                limit = 20
+                if len(parts) > 1:
+                    try:
+                        limit = int(parts[1])
+                    except Exception:
+                        limit = 20
+                return json.dumps(self._a2a_inbox(limit), ensure_ascii=False, indent=2)
+            if cmd_body.lower().startswith("send "):
+                raw = cmd_body[5:].strip()
+                parts = [p.strip() for p in raw.split("|")]
+                if len(parts) != 3:
+                    return "Usage: /a2a send <to_agent> | <msg_type> | <json_payload>"
+                try:
+                    payload = json.loads(parts[2]) if parts[2] else {}
+                except Exception as exc:
+                    return f"Invalid JSON payload: {exc}"
+                return str(self._a2a_send(parts[0], parts[1], payload))
+            if cmd_body.lower().startswith("delegate "):
+                raw = cmd_body[9:].strip()
+                parts = [p.strip() for p in raw.split("|")]
+                if len(parts) != 3:
+                    return "Usage: /a2a delegate <to_agent> | <tool_name> | <json_args>"
+                try:
+                    payload = json.loads(parts[2]) if parts[2] else {}
+                except Exception as exc:
+                    return f"Invalid JSON args: {exc}"
+                return str(self._a2a_delegate_tool(parts[0], parts[1], payload, None))
+            return "Usage: /a2a peers|inbox [limit]|send ...|delegate ..."
+        if text.startswith("/theme ") or text.startswith("theme "):
+            requested = user_text.split(" ", 1)[1].strip()
+            selected = self.set_theme_lock(requested)
+            if selected == "auto":
+                return "Theme auto-switch enabled."
+            return f"Theme locked to '{selected}'."
+        if any(phrase in text for phrase in {"i am leaving home", "leaving home", "headed out"}):
+            return (
+                "Before you leave, I can help run Home Assistant actions: "
+                "lock doors, arm alarm, and set thermostat eco mode. "
+                "Say: 'run leaving-home routine'."
+            )
         if re.match(r"^switch session\s+.+$", text):
             m = re.match(r"^\s*switch\s+session\s+(.+?)\s*$", user_text, flags=re.IGNORECASE)
             name = (m.group(1) if m else "").strip()
@@ -2868,7 +3385,9 @@ class NOVAApp:
             )
         except Exception:
             pass
-        self.memory.set_online(self._network_online_cached())
+        privacy_mode = self._apply_privacy_mode_for_session(current_session_id)
+        remote_memory_online = self._network_online_cached() and privacy_mode == "full_cloud"
+        self.memory.set_online(remote_memory_online)
         if self.memory.online:
             self._schedule_sync_all_pending()
 
@@ -2886,102 +3405,167 @@ class NOVAApp:
         )
 
         output_chunks: list[str] = []
-        stream = self.engine.ask_stream(prompt=user_text, system=system_prompt, history=history)
         user_added = False
         committed = False
         usage_tracked = False
         assistant_text = ""
 
-        try:
+        with self.engine.local_only_mode(privacy_mode == "local_only"):
+            stream = self.engine.ask_stream(prompt=user_text, system=system_prompt, history=history)
             try:
-                first_token = next(stream)
-                _append_turn("user", user_text)
-                user_added = True
-                output_chunks.append(first_token)
-                yield first_token
-                for token in stream:
-                    output_chunks.append(token)
-                    yield token
-            except StopIteration:
-                if not user_added:
+                try:
+                    first_token = next(stream)
                     _append_turn("user", user_text)
                     user_added = True
-                assistant_text = "(no response)"
-            except RuntimeError as exc:
-                # PEP 479: inner StopIteration may surface as RuntimeError.
-                if "StopIteration" in str(exc):
+                    output_chunks.append(first_token)
+                    yield first_token
+                    for token in stream:
+                        output_chunks.append(token)
+                        yield token
+                except StopIteration:
                     if not user_added:
                         _append_turn("user", user_text)
                         user_added = True
                     assistant_text = "(no response)"
-                else:
-                    raise
+                except RuntimeError as exc:
+                    # PEP 479: inner StopIteration may surface as RuntimeError.
+                    if "StopIteration" in str(exc):
+                        if not user_added:
+                            _append_turn("user", user_text)
+                            user_added = True
+                        assistant_text = "(no response)"
+                    else:
+                        raise
 
-            if not assistant_text:
-                assistant_text = "".join(output_chunks).strip()
-            tool_call = self.dispatcher.try_parse_tool_call(assistant_text) if allow_tools else None
-            if tool_call:
-                result = self.dispatcher.execute(
-                    tool_call,
-                    confirm_callback=self._interactive_confirm,
-                    dry_run=dry_run_tools,
-                )
-                try:
-                    serialized_result = json.dumps(result, ensure_ascii=False)
-                except TypeError:
-                    serialized_result = str(result)
-                tool_result_text = f"[tool_result] {serialized_result}"
-                if output_chunks:
-                    yield "\n"
-                yield tool_result_text
-                assistant_text = tool_result_text
+                if not assistant_text:
+                    assistant_text = "".join(output_chunks).strip()
+                tool_call = self.dispatcher.try_parse_tool_call(assistant_text) if allow_tools else None
+                if tool_call:
+                    result = self.dispatcher.execute(
+                        tool_call,
+                        confirm_callback=self._interactive_confirm,
+                        dry_run=dry_run_tools,
+                    )
+                    try:
+                        serialized_result = json.dumps(result, ensure_ascii=False)
+                    except TypeError:
+                        serialized_result = str(result)
+                    tool_result_text = f"[tool_result] {serialized_result}"
+                    if output_chunks:
+                        yield "\n"
+                    yield tool_result_text
+                    assistant_text = tool_result_text
 
-            if assistant_text:
-                _append_turn("assistant", assistant_text)
-                committed = True
-                self._track_usage(
-                    system_prompt,
-                    history,
-                    user_text,
-                    assistant_text,
-                    day_anchor=today,
-                    session_id=current_session_id,
+                if assistant_text:
+                    _append_turn("assistant", assistant_text)
+                    committed = True
+                    self._track_usage(
+                        system_prompt,
+                        history,
+                        user_text,
+                        assistant_text,
+                        day_anchor=today,
+                        session_id=current_session_id,
+                    )
+                    usage_tracked = True
+                    self._commit_memory_async(user_text, assistant_text, session_id=current_session_id)
+                    self._schedule_self_eval(
+                        user_text=user_text,
+                        assistant_text=assistant_text,
+                        session_id=current_session_id,
+                    )
+            except Exception as exc:
+                yield f"[ERROR] Generation failed: {exc}"
+            finally:
+                # If caller abandons this generator mid-stream, persist partial output.
+                if not committed and (user_added or output_chunks):
+                    partial = assistant_text or "".join(output_chunks).strip()
+                    if not partial:
+                        return
+                    if self._shutting_down.is_set():
+                        partial = f"{partial}\n[truncated: shutdown]"
+                    if not user_added:
+                        _append_turn("user", user_text)
+                        user_added = True
+                    try:
+                        if not usage_tracked:
+                            self._track_usage(
+                                system_prompt,
+                                history,
+                                user_text,
+                                partial,
+                                day_anchor=today,
+                                session_id=current_session_id,
+                            )
+                    except Exception:
+                        pass
+                    if user_added:
+                        _append_turn("assistant", partial)
+                        self._commit_memory_async(user_text, partial, session_id=current_session_id)
+                        self._schedule_self_eval(user_text=user_text, assistant_text=partial, session_id=current_session_id)
+
+    def _schedule_self_eval(self, *, user_text: str, assistant_text: str, session_id: str) -> None:
+        try:
+            estimated = estimate_tokens(assistant_text)
+            daily_total = int(self.usage.total_tokens_today(session_id=session_id))
+            if not self._self_evaluator.should_rate(
+                assistant_text=assistant_text,
+                estimated_tokens=estimated,
+                daily_total_tokens=daily_total,
+                daily_alert_threshold=int(settings.DAILY_TOKEN_ALERT_THRESHOLD),
+                enabled=bool(getattr(settings, "SELF_EVAL_ENABLED", True)),
+                min_response_tokens=int(getattr(settings, "SELF_EVAL_MIN_RESPONSE_TOKENS", 50)),
+                skip_usage_pct=int(getattr(settings, "SELF_EVAL_SKIP_USAGE_PCT", 90)),
+            ):
+                return
+        except Exception:
+            return
+
+        def _job() -> None:
+            try:
+                payload = self._self_evaluator.evaluate(
+                    prompt=user_text,
+                    response=assistant_text,
+                    session_id=session_id,
                 )
-                usage_tracked = True
-                self._commit_memory_async(user_text, assistant_text, session_id=current_session_id)
-        except Exception as exc:
-            yield f"[ERROR] Generation failed: {exc}"
-        finally:
-            # If caller abandons this generator mid-stream, persist partial output.
-            if not committed and (user_added or output_chunks):
-                partial = assistant_text or "".join(output_chunks).strip()
-                if not partial:
-                    return
-                if self._shutting_down.is_set():
-                    partial = f"{partial}\n[truncated: shutdown]"
-                if not user_added:
-                    _append_turn("user", user_text)
-                    user_added = True
-                try:
-                    if not usage_tracked:
-                        self._track_usage(
-                            system_prompt,
-                            history,
-                            user_text,
-                            partial,
-                            day_anchor=today,
-                            session_id=current_session_id,
-                        )
-                except Exception:
-                    pass
-                if user_added:
-                    _append_turn("assistant", partial)
-                    self._commit_memory_async(user_text, partial, session_id=current_session_id)
+                self.record_event("self_eval", f"rated: {payload.get('ratings', {})}")
+            except Exception:
+                pass
+
+        try:
+            self._self_eval_executor.submit(_job)
+        except Exception:
+            pass
+
+    def _a2a_publish_context_sync(self, *, user_text: str, assistant_text: str, session_id: str) -> None:
+        if not self._a2a_enabled:
+            return
+        try:
+            content = f"u:{user_text}\na:{assistant_text}"
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+            self._shared_bus.publish(
+                from_agent=self._a2a_agent_name,
+                to_agent="broadcast",
+                msg_type="context_sync",
+                payload={
+                    "session_id": session_id,
+                    "digest": digest,
+                    "preview": assistant_text[:160],
+                    "ts": int(time.time()),
+                },
+            )
+        except Exception:
+            pass
 
     def _commit_memory_async(self, user_text: str, assistant_text: str, session_id: str | None = None) -> None:
         if self._shutting_down.is_set():
             return
         session_id = session_id or self.session.current.session_id
+        self._a2a_publish_context_sync(
+            user_text=user_text,
+            assistant_text=assistant_text,
+            session_id=session_id,
+        )
 
         # ── Tier 2: Intent Graph update ───────────────────────────────────────
         if hasattr(self, '_intent_graph') and self._intent_graph:

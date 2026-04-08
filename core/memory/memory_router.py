@@ -46,6 +46,7 @@ class MemoryRouter:
         self.mem0 = mem0
         self.local = local
         self._online = True
+        self._remote_sync_enabled = True
         self._pending_sync: dict[str, list[dict]] = defaultdict(list)
         self._seen_hashes: set[str] = set()
         self._sync_lock = threading.Lock()  # fix 2.2
@@ -56,6 +57,10 @@ class MemoryRouter:
 
     def set_online(self, online: bool) -> None:
         self._online = online
+
+    def set_remote_sync_enabled(self, enabled: bool) -> None:
+        with self._sync_lock:
+            self._remote_sync_enabled = bool(enabled)
 
     def add(self, text: str, session_id: str, metadata: dict | None = None) -> dict:
         safe_text = _sanitize_memory_text(text)  # fix 7.2
@@ -70,9 +75,9 @@ class MemoryRouter:
             with self._sync_lock:
                 self._seen_hashes.add(hash_id)
 
-        if self._online:
+        if self._online and self._remote_sync_enabled:
             self.mem0.add(safe_text, session_id, metadata)
-        else:
+        elif self._remote_sync_enabled:
             with self._sync_lock:
                 self._pending_sync[session_id].append({"text": safe_text, "metadata": metadata or {}})
 
@@ -80,7 +85,7 @@ class MemoryRouter:
 
     def sync_pending(self, session_id: str) -> int:
         """Sync pending items for a session. Only removes items after successful sync (fix 2.14)."""
-        if not self._online:
+        if not self._online or not self._remote_sync_enabled:
             return 0
 
         with self._sync_lock:
@@ -116,7 +121,7 @@ class MemoryRouter:
 
     def sync_all_pending(self) -> int:
         """Sync all sessions. Thread-safe snapshot of keys before iterating (fix 2.2)."""
-        if not self._online:
+        if not self._online or not self._remote_sync_enabled:
             return 0
         with self._sync_lock:
             session_ids = list(self._pending_sync.keys())
@@ -156,7 +161,7 @@ class MemoryRouter:
 
     def get_all(self, session_id: str) -> list[dict]:
         local_items = self.local.get_all(session_id)
-        if self._online:
+        if self._online and self._remote_sync_enabled:
             try:
                 remote_items = self.mem0.get_all(session_id)
                 if remote_items:

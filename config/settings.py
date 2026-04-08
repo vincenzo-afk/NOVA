@@ -67,6 +67,7 @@ class Settings:
 
     # Privacy / context injection (fix 2.13)
     INCLUDE_CLIPBOARD_IN_CONTEXT: bool = False
+    PRIVACY_MODE: str = "full_cloud"  # local_only | balanced | full_cloud
 
     # Voice
     DEFAULT_LANG: str = "en"
@@ -104,6 +105,26 @@ class Settings:
     EMERGENCY_STOP_FILE: str = ".jarvis/emergency_stop"
     NOVA_HEALTH_PORT: int = 8765
     NOVA_STARTUP_DELAY_SECONDS: float = 0.0
+    VIRUSTOTAL_API_KEY: str = ""
+    VIRUSTOTAL_SCAN_WRITES: bool = False
+
+    # Self-evaluation (Phase 16)
+    SELF_EVAL_ENABLED: bool = True
+    SELF_EVAL_MIN_RESPONSE_TOKENS: int = 50
+    SELF_EVAL_SKIP_USAGE_PCT: int = 90
+
+    # Nudge engine (Phase 16)
+    NUDGE_ENGINE_ENABLED: bool = True
+    NUDGE_CHECK_SECONDS: int = 300
+
+    # Ambient listener (Phase 16)
+    AMBIENT_MONITOR_ENABLED: bool = False
+    AMBIENT_KEYWORDS: list[str] = field(default_factory=lambda: ["doorbell", "alarm", "phone"])
+
+    # A2A (Phase 17)
+    A2A_ENABLED: bool = False
+    A2A_AGENT_NAME: str = "nova"
+    A2A_SHARED_BUS_PATH: str = ".jarvis/shared_bus.jsonl"
 
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "Settings":
@@ -147,6 +168,12 @@ class Settings:
             except ValueError:
                 return default
 
+        def normalize_privacy_mode(value: str) -> str:
+            mode = (value or "").strip().lower()
+            if mode in {"local_only", "balanced", "full_cloud"}:
+                return mode
+            return "full_cloud"
+
         return cls(
             OPENAI_API_KEYS=_csv_to_list(env("OPENAI_API_KEYS")),
             OPENAI_BASE_URL=env("OPENAI_BASE_URL"),
@@ -174,6 +201,7 @@ class Settings:
             DAILY_TOKEN_HARD_CAP_WARNING_PCT=max(0, min(100, env_int("DAILY_TOKEN_HARD_CAP_WARNING_PCT", 80))),
             AMBIGUITY_THRESHOLD=env_float("AMBIGUITY_THRESHOLD", 0.6),
             INCLUDE_CLIPBOARD_IN_CONTEXT=env_bool("INCLUDE_CLIPBOARD_IN_CONTEXT", "false"),
+            PRIVACY_MODE=normalize_privacy_mode(env("PRIVACY_MODE", "full_cloud")),
             DEFAULT_LANG=env("DEFAULT_LANG", "en"),
             VAD_SILENCE_MS=env_int("VAD_SILENCE_MS", 800),
             WHISPER_MODEL=env("WHISPER_MODEL", "base"),
@@ -201,6 +229,18 @@ class Settings:
             EMERGENCY_STOP_FILE=env("EMERGENCY_STOP_FILE", ".jarvis/emergency_stop"),
             NOVA_HEALTH_PORT=env_int("NOVA_HEALTH_PORT", 8765),
             NOVA_STARTUP_DELAY_SECONDS=env_float("NOVA_STARTUP_DELAY_SECONDS", 0.0),
+            VIRUSTOTAL_API_KEY=env("VIRUSTOTAL_API_KEY"),
+            VIRUSTOTAL_SCAN_WRITES=env_bool("VIRUSTOTAL_SCAN_WRITES", "false"),
+            SELF_EVAL_ENABLED=env_bool("SELF_EVAL_ENABLED", "true"),
+            SELF_EVAL_MIN_RESPONSE_TOKENS=max(1, env_int("SELF_EVAL_MIN_RESPONSE_TOKENS", 50)),
+            SELF_EVAL_SKIP_USAGE_PCT=max(0, min(100, env_int("SELF_EVAL_SKIP_USAGE_PCT", 90))),
+            NUDGE_ENGINE_ENABLED=env_bool("NUDGE_ENGINE_ENABLED", "true"),
+            NUDGE_CHECK_SECONDS=max(30, env_int("NUDGE_CHECK_SECONDS", 300)),
+            AMBIENT_MONITOR_ENABLED=env_bool("AMBIENT_MONITOR_ENABLED", "false"),
+            AMBIENT_KEYWORDS=_csv_to_list(env("AMBIENT_KEYWORDS", "doorbell,alarm,phone")),
+            A2A_ENABLED=env_bool("A2A_ENABLED", "false"),
+            A2A_AGENT_NAME=env("A2A_AGENT_NAME", "nova"),
+            A2A_SHARED_BUS_PATH=env("A2A_SHARED_BUS_PATH", ".jarvis/shared_bus.jsonl"),
         )
 
     _PLACEHOLDER_KEYS = {"key1", "key2", "key3", "key_a", "key_b", "ghp_test_key", "your_key_here", ""}
@@ -290,24 +330,34 @@ class Settings:
     @property
     def has_cloud_llm(self) -> bool:
         """True if cloud LLM is configured."""
+        if self.PRIVACY_MODE == "local_only":
+            return False
         real_keys = [k for k in self.OPENAI_API_KEYS if not self._is_placeholder_key(k)]
         return bool(real_keys and self.OPENAI_BASE_URL)
 
     @property
     def has_gemini(self) -> bool:
         """True if any Gemini API key is present."""
+        if self.PRIVACY_MODE == "local_only":
+            return False
         real_keys = [k for k in self.GEMINI_API_KEYS if not self._is_placeholder_key(k)]
         return bool(real_keys)
 
     @property
     def has_telegram(self) -> bool:
         """True if Telegram bot is configured."""
+        if self.PRIVACY_MODE == "local_only":
+            return False
         return bool(self.TELEGRAM_BOT_TOKEN and self.TELEGRAM_CHAT_ID)
 
     @property
     def has_wakeword(self) -> bool:
         """True if Porcupine wake word is configured."""
         return bool(self.PORCUPINE_ACCESS_KEY and self.PORCUPINE_KEYWORD_PATH)
+
+    @property
+    def remote_memory_enabled(self) -> bool:
+        return self.PRIVACY_MODE == "full_cloud" and bool(self.MEM0_API_KEY)
 
 
 settings = Settings.from_env()

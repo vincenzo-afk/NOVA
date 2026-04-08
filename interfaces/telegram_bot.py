@@ -23,6 +23,8 @@ from control.adb.qr_pairing import QRPairing
 from vision.capture import capture_screen_png
 from vision.gemini_vision import analyze_image
 from interfaces.cli import format_usage_message
+from interfaces.key_manager import summarize_env_keys
+from interfaces.model_manager import list_ollama_models
 from utils.events import format_event_log
 from utils.goals import format_goal_list
 from utils.health import format_health_table, summarize_health
@@ -380,6 +382,145 @@ def run_telegram_bot(
         except Exception as exc:
             await update.message.reply_text(f"QR generation failed: {exc}")
 
+    async def on_keys(update, _context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        summary = summarize_env_keys(settings)
+        if not summary:
+            await update.message.reply_text("No configured keys found in current environment.")
+            return
+        lines = ["Configured key pools (masked):"]
+        for provider in sorted(summary.keys()):
+            masked = summary.get(provider, [])
+            lines.append(f"- {provider}: {', '.join(masked)}")
+        lines.append("")
+        lines.append("Use GUI Key Manager for encrypted edits/storage.")
+        await update.message.reply_text("\n".join(lines))
+
+    async def on_models(update, _context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        try:
+            models = list_ollama_models()
+            if not models:
+                await update.message.reply_text("No Ollama models found.")
+                return
+            lines = ["Installed Ollama models:"]
+            for item in models[:40]:
+                name = item.get("name") or item.get("model") or "unknown"
+                size = item.get("size") or ""
+                lines.append(f"- {name} ({size})")
+            await update.message.reply_text("\n".join(lines))
+        except Exception as exc:
+            await update.message.reply_text(f"Model list failed: {exc}")
+
+    async def on_privacy(update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        if not context.args:
+            mode = getattr(agent, "_get_session_privacy_mode", lambda *_: "full_cloud")()
+            await update.message.reply_text(f"Current session privacy mode: {mode}")
+            return
+        raw = context.args[0].strip().lower()
+        setter = getattr(agent, "_set_session_privacy_mode", None)
+        if not callable(setter):
+            await update.message.reply_text("Privacy controls unavailable.")
+            return
+        selected = setter(raw)
+        await update.message.reply_text(f"Session privacy mode set to: {selected}")
+
+    async def on_mission(update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        args = [a.strip() for a in (context.args or []) if a.strip()]
+        if not args or args[0].lower() == "list":
+            await update.message.reply_text(str(agent._mission_list()))
+            return
+        sub = args[0].lower()
+        if sub == "enable" and len(args) >= 2:
+            await update.message.reply_text(str(agent._mission_enable(args[1])))
+            return
+        if sub == "disable" and len(args) >= 2:
+            await update.message.reply_text(str(agent._mission_disable(args[1])))
+            return
+        if sub == "run" and len(args) >= 2:
+            await update.message.reply_text(str(agent._mission_run_now(args[1])))
+            return
+        if sub == "add":
+            # /mission add name | schedule | goal
+            raw = (update.message.text or "").split(" ", 2)
+            body = raw[2] if len(raw) >= 3 else ""
+            parts = [p.strip() for p in body.split("|")]
+            if len(parts) != 3:
+                await update.message.reply_text("Usage: /mission add <name> | <schedule> | <goal>")
+                return
+            await update.message.reply_text(str(agent._mission_add(parts[0], parts[1], parts[2], True)))
+            return
+        await update.message.reply_text("Usage: /mission list|enable <name>|disable <name>|run <name>|add ...")
+
+    async def on_theme(update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        args = [a.strip() for a in (context.args or []) if a.strip()]
+        getter = getattr(agent, "get_theme_lock", None)
+        setter = getattr(agent, "set_theme_lock", None)
+        if not args:
+            current = str(getter()) if callable(getter) else "auto"
+            await update.message.reply_text(f"Current theme mode: {current}")
+            return
+        if not callable(setter):
+            await update.message.reply_text("Theme controls unavailable.")
+            return
+        selected = str(setter(args[0]))
+        if selected == "auto":
+            await update.message.reply_text("Theme auto-switch enabled.")
+        else:
+            await update.message.reply_text(f"Theme locked to '{selected}'.")
+
+    async def on_a2a(update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _authorized(update):
+            return
+        args = [a.strip() for a in (context.args or []) if a.strip()]
+        if not args or args[0].lower() == "peers":
+            await update.message.reply_text(str(agent._a2a_peers()))
+            return
+        if args[0].lower() == "inbox":
+            await update.message.reply_text(str(agent._a2a_inbox(20)))
+            return
+        if args[0].lower() == "send":
+            text = update.message.text or ""
+            body = text.split(" ", 2)[2] if len(text.split(" ", 2)) >= 3 else ""
+            parts = [p.strip() for p in body.split("|")]
+            if len(parts) != 3:
+                await update.message.reply_text("Usage: /a2a send <to_agent> | <msg_type> | <json_payload>")
+                return
+            try:
+                payload = json.loads(parts[2]) if parts[2] else {}
+            except Exception as exc:
+                await update.message.reply_text(f"Invalid JSON payload: {exc}")
+                return
+            await update.message.reply_text(str(agent._a2a_send(parts[0], parts[1], payload)))
+            return
+        if args[0].lower() == "delegate":
+            text = update.message.text or ""
+            body = text.split(" ", 2)[2] if len(text.split(" ", 2)) >= 3 else ""
+            parts = [p.strip() for p in body.split("|")]
+            if len(parts) != 3:
+                await update.message.reply_text("Usage: /a2a delegate <to_agent> | <tool_name> | <json_args>")
+                return
+            try:
+                payload = json.loads(parts[2]) if parts[2] else {}
+            except Exception as exc:
+                await update.message.reply_text(f"Invalid JSON args: {exc}")
+                return
+            fn = getattr(agent, "_a2a_delegate_tool", None)
+            if not callable(fn):
+                await update.message.reply_text("A2A delegation unavailable.")
+                return
+            await update.message.reply_text(str(fn(parts[0], parts[1], payload, None)))
+            return
+        await update.message.reply_text("Usage: /a2a peers|inbox|send ...|delegate ...")
+
     async def on_image(update, context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
             return
@@ -420,6 +561,12 @@ def run_telegram_bot(
     app.add_handler(CommandHandler("usage_week", on_usage_week))
     app.add_handler(CommandHandler("screenshot", on_screenshot))
     app.add_handler(CommandHandler("qr", on_qr))
+    app.add_handler(CommandHandler("keys", on_keys))
+    app.add_handler(CommandHandler("models", on_models))
+    app.add_handler(CommandHandler("privacy", on_privacy))
+    app.add_handler(CommandHandler("mission", on_mission))
+    app.add_handler(CommandHandler("theme", on_theme))
+    app.add_handler(CommandHandler("a2a", on_a2a))
     app.add_handler(MessageHandler(filters.PHOTO, on_image))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     if stop_event is None:

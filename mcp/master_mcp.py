@@ -565,15 +565,93 @@ class MasterMCP:
                 pass
             return []
 
+        def list_automations() -> list:
+            response = self._request_with_retry(
+                method="get",
+                url=f"{base_url}/api/states",
+                headers=headers,
+                timeout=15,
+            )
+            try:
+                data = response.json()
+            except Exception:
+                return []
+            rows = []
+            for e in (data if isinstance(data, list) else []):
+                if not isinstance(e, dict):
+                    continue
+                entity_id = str(e.get("entity_id", ""))
+                if not entity_id.startswith("automation."):
+                    continue
+                rows.append(
+                    {
+                        "entity_id": entity_id,
+                        "state": e.get("state"),
+                        "friendly_name": e.get("attributes", {}).get("friendly_name"),
+                    }
+                )
+            return rows
+
+        def trigger_automation(automation_id: str) -> dict:
+            entity_id = automation_id if automation_id.startswith("automation.") else f"automation.{automation_id}"
+            response = self._request_with_retry(
+                method="post",
+                url=f"{base_url}/api/services/automation/trigger",
+                headers=headers,
+                json={"entity_id": entity_id},
+                timeout=10,
+            )
+            try:
+                return {"ok": response.ok, "result": response.json()}
+            except Exception:
+                return {"ok": response.ok, "status_code": response.status_code}
+
+        def set_climate(entity_id: str, temperature: float) -> dict:
+            response = self._request_with_retry(
+                method="post",
+                url=f"{base_url}/api/services/climate/set_temperature",
+                headers=headers,
+                json={"entity_id": entity_id, "temperature": float(temperature)},
+                timeout=10,
+            )
+            try:
+                return {"ok": response.ok, "result": response.json()}
+            except Exception:
+                return {"ok": response.ok, "status_code": response.status_code}
+
+        def get_energy_stats(period: str = "day") -> dict:
+            # Home Assistant energy endpoint availability varies by version; use
+            # recorder statistics endpoint as a stable fallback.
+            response = self._request_with_retry(
+                method="get",
+                url=f"{base_url}/api/recorder/statistics_during_period",
+                headers=headers,
+                params={"period": period},
+                timeout=20,
+            )
+            try:
+                payload = response.json()
+                return {"ok": response.ok, "period": period, "result": payload}
+            except Exception:
+                return {"ok": response.ok, "period": period, "status_code": response.status_code}
+
         tools = [
             {"name": "get_state", "description": "Get current state of a Home Assistant entity."},
             {"name": "list_entities", "description": "List Home Assistant entities, filtered by domain."},
             {"name": "call_service", "description": "Call a Home Assistant service (e.g. turn lights on/off)."},
             {"name": "get_history", "description": "Get state history for an entity over the last N hours."},
+            {"name": "list_automations", "description": "List Home Assistant automations."},
+            {"name": "trigger_automation", "description": "Trigger a Home Assistant automation entity."},
+            {"name": "set_climate", "description": "Set thermostat temperature for a climate entity."},
+            {"name": "get_energy_stats", "description": "Get Home Assistant energy/recorder statistics."},
         ]
         return tools, {
             "get_state": get_state,
             "list_entities": list_entities,
             "call_service": call_service,
             "get_history": get_history,
+            "list_automations": list_automations,
+            "trigger_automation": trigger_automation,
+            "set_climate": set_climate,
+            "get_energy_stats": get_energy_stats,
         }

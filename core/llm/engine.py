@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from contextlib import contextmanager
 from typing import Generator, Iterable
 
 import requests
@@ -38,6 +39,8 @@ class LLMEngine:
             self.pool = RoundRobinPool(openai_keys)
         self._last_provider = "unknown"
         self._provider_lock = threading.Lock()
+        self._force_local_only = False
+        self._mode_lock = threading.Lock()
 
     @property
     def last_provider(self) -> str:
@@ -59,9 +62,11 @@ class LLMEngine:
         history: list[dict] | None = None,
     ) -> Generator[str, None, None]:
         messages = self._build_messages(prompt=prompt, system=system, history=history or [])
+        with self._mode_lock:
+            force_local = self._force_local_only
 
         # Attempt cloud keys if pool is available
-        if self.pool is not None:
+        if self.pool is not None and not force_local:
             tried: set[str] = set()
             while True:
                 key = self.pool.get_next()
@@ -98,6 +103,25 @@ class LLMEngine:
             )
         except Exception as exc:
             yield f"[ERROR] Fallback LLM failed: {exc}"
+
+    @contextmanager
+    def local_only_mode(self, enabled: bool):
+        with self._mode_lock:
+            previous = self._force_local_only
+            self._force_local_only = bool(enabled)
+        try:
+            yield
+        finally:
+            with self._mode_lock:
+                self._force_local_only = previous
+
+    def provider_snapshot(self) -> dict:
+        if self.pool is None:
+            return {"cloud": [], "active_count": 0}
+        try:
+            return self.pool.snapshot()
+        except Exception:
+            return {"cloud": [], "active_count": self.pool.active_count()}
 
     def _build_messages(self, prompt: str, system: str, history: list[dict]) -> list[dict]:
         msgs = [{"role": "system", "content": system}]
