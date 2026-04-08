@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import hashlib
 import hmac
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +48,7 @@ def build_status_snapshot(agent: Any) -> dict[str, Any]:
         "session": session_name,
         "provider": str(getattr(agent, "last_provider_label", lambda: "unknown")()),
         "emotion": str(getattr(agent, "emotion_state", "neutral")),
+        "privacy_mode": str(getattr(agent, "_get_session_privacy_mode", lambda *_: "full_cloud")()),
         "muted": bool(getattr(agent, "is_muted", lambda: False)()),
         "online": bool(NetworkState.is_online()),
         "tokens_today": tokens_today,
@@ -59,9 +62,10 @@ def format_status_line(snapshot: dict[str, Any]) -> str:
     session = snapshot.get("session", "unknown")
     provider = snapshot.get("provider", "unknown")
     emotion = snapshot.get("emotion", "neutral")
+    privacy = snapshot.get("privacy_mode", "full_cloud")
     return (
         f"Session: {session} | Mode: {mode} | Emotion: {emotion} | "
-        f"Provider: {provider} | Alerts: {mute}"
+        f"Provider: {provider} | Privacy: {privacy} | Alerts: {mute}"
     )
 
 
@@ -183,6 +187,9 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     voice_loop_btn = QPushButton("Voice Loop Start")
     upload_btn = QPushButton("Upload Image")
     export_btn = QPushButton("Export")
+    key_btn = QPushButton("Keys")
+    model_btn = QPushButton("Models")
+    voice_cfg_btn = QPushButton("VoiceCfg")
     mute_btn = QPushButton("Mute")
     status_btn = QPushButton("Status JSON")
     goal_input = QLineEdit()
@@ -193,9 +200,25 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     goal_refresh_btn = QPushButton("Refresh Goals")
     goal_resume_btn = QPushButton("Resume Goal")
     goal_cancel_btn = QPushButton("Cancel Goal")
+    mission_name_input = QLineEdit()
+    mission_name_input.setPlaceholderText("mission name")
+    mission_schedule_input = QLineEdit()
+    mission_schedule_input.setPlaceholderText("schedule (e.g. every day at 08:00)")
+    mission_goal_input = QLineEdit()
+    mission_goal_input.setPlaceholderText("mission goal")
+    mission_target_input = QLineEdit()
+    mission_target_input.setPlaceholderText("mission name for enable/disable/run")
+    mission_add_btn = QPushButton("Add Mission")
+    mission_list_btn = QPushButton("Refresh Missions")
+    mission_enable_btn = QPushButton("Enable Mission")
+    mission_disable_btn = QPushButton("Disable Mission")
+    mission_run_btn = QPushButton("Run Mission")
     goal_output = QTextEdit()
     goal_output.setReadOnly(True)
     goal_output.setMinimumHeight(120)
+    mission_output = QTextEdit()
+    mission_output.setReadOnly(True)
+    mission_output.setMinimumHeight(120)
     event_output = QTextEdit()
     event_output.setReadOnly(True)
     event_output.setMinimumHeight(120)
@@ -215,12 +238,40 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     whisper_holder: dict[str, Any] = {"instance": None}
     mic_lock = threading.Lock()
     voice_loop_state: dict[str, Any] = {"thread": None, "stop_event": None}
+    theme_state: dict[str, str] = {"current": ""}
 
     def refresh_status() -> None:
         snapshot = build_status_snapshot(agent)
         status_label.setText(format_status_line(snapshot))
         usage_label.setText(format_usage_line(snapshot))
         mute_btn.setText("Unmute" if snapshot.get("muted") else "Mute")
+
+    def apply_dynamic_theme() -> None:
+        try:
+            from utils.theme_engine import choose_theme
+
+            topic = ""
+            try:
+                summary_fn = getattr(getattr(agent, "_intent_graph", None), "summary", None)
+                if callable(summary_fn):
+                    summary = summary_fn() or {}
+                    if isinstance(summary, dict):
+                        topic = str(summary.get("top_topic", "") or "")
+            except Exception:
+                topic = ""
+            emotion = str(getattr(agent, "emotion_state", "neutral"))
+            lock_name = str(getattr(agent, "get_theme_lock", lambda: "auto")())
+            decision = choose_theme(
+                hour=datetime.now().hour,
+                topic=topic,
+                emotion=emotion,
+                locked_theme="" if lock_name == "auto" else lock_name,
+            )
+            if decision.name != theme_state.get("current"):
+                app.setStyleSheet(decision.stylesheet)
+                theme_state["current"] = decision.name
+        except Exception:
+            pass
 
     def append_line(text: str) -> None:
         output.append(text)
@@ -268,6 +319,13 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
         except Exception as exc:
             goal_output.setPlainText(f"Failed to load goals: {exc}")
 
+    def refresh_missions() -> None:
+        try:
+            payload = agent._mission_list()
+            mission_output.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
+        except Exception as exc:
+            mission_output.setPlainText(f"Failed to load missions: {exc}")
+
     def refresh_health() -> None:
         try:
             items = agent.health.status_table()
@@ -294,6 +352,30 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
         muted = agent.toggle_mute()
         append_line("[system] muted proactive alerts" if muted else "[system] unmuted proactive alerts")
         refresh_status()
+
+    def open_key_manager() -> None:
+        try:
+            from interfaces.key_manager import open_key_manager_dialog
+
+            open_key_manager_dialog(settings_obj=settings, parent=window)
+        except Exception as exc:
+            append_line(f"[error] key manager unavailable: {exc}")
+
+    def open_model_manager() -> None:
+        try:
+            from interfaces.model_manager import open_model_manager_dialog
+
+            open_model_manager_dialog(agent, parent=window)
+        except Exception as exc:
+            append_line(f"[error] model manager unavailable: {exc}")
+
+    def open_voice_settings() -> None:
+        try:
+            from interfaces.voice_settings import open_voice_settings_dialog
+
+            open_voice_settings_dialog(settings_obj=settings, parent=window)
+        except Exception as exc:
+            append_line(f"[error] voice settings unavailable: {exc}")
 
     def add_goal() -> None:
         goal = goal_input.text().strip()
@@ -331,6 +413,62 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
             refresh_goals()
         except Exception as exc:
             append_line(f"[goal-error] {exc}")
+
+    def add_mission() -> None:
+        name = mission_name_input.text().strip()
+        schedule = mission_schedule_input.text().strip()
+        goal = mission_goal_input.text().strip()
+        if not name or not schedule or not goal:
+            append_line("[mission] enter name, schedule, and goal")
+            return
+        try:
+            result = agent._mission_add(name, schedule, goal, True)
+            append_line(f"[mission] {result}")
+            refresh_missions()
+        except Exception as exc:
+            append_line(f"[mission-error] {exc}")
+
+    def _selected_mission_name() -> str:
+        value = mission_target_input.text().strip()
+        if value:
+            return value
+        return mission_name_input.text().strip()
+
+    def enable_mission() -> None:
+        name = _selected_mission_name()
+        if not name:
+            append_line("[mission] enter a mission name")
+            return
+        try:
+            result = agent._mission_enable(name)
+            append_line(f"[mission] {result}")
+            refresh_missions()
+        except Exception as exc:
+            append_line(f"[mission-error] {exc}")
+
+    def disable_mission() -> None:
+        name = _selected_mission_name()
+        if not name:
+            append_line("[mission] enter a mission name")
+            return
+        try:
+            result = agent._mission_disable(name)
+            append_line(f"[mission] {result}")
+            refresh_missions()
+        except Exception as exc:
+            append_line(f"[mission-error] {exc}")
+
+    def run_mission_now() -> None:
+        name = _selected_mission_name()
+        if not name:
+            append_line("[mission] enter a mission name")
+            return
+        try:
+            result = agent._mission_run_now(name)
+            append_line(f"[mission] {result}")
+            refresh_missions()
+        except Exception as exc:
+            append_line(f"[mission-error] {exc}")
 
     def upload_image() -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -444,6 +582,9 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     top_row.addWidget(mic_btn)
     top_row.addWidget(voice_loop_btn)
     top_row.addWidget(export_btn)
+    top_row.addWidget(key_btn)
+    top_row.addWidget(model_btn)
+    top_row.addWidget(voice_cfg_btn)
     top_row.addWidget(mute_btn)
 
     goal_controls = QHBoxLayout()
@@ -456,6 +597,17 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     goal_controls.addWidget(alert_refresh_btn)
     goal_controls.addWidget(health_refresh_btn)
 
+    mission_controls = QHBoxLayout()
+    mission_controls.addWidget(mission_name_input)
+    mission_controls.addWidget(mission_schedule_input)
+    mission_controls.addWidget(mission_goal_input)
+    mission_controls.addWidget(mission_target_input)
+    mission_controls.addWidget(mission_add_btn)
+    mission_controls.addWidget(mission_enable_btn)
+    mission_controls.addWidget(mission_disable_btn)
+    mission_controls.addWidget(mission_run_btn)
+    mission_controls.addWidget(mission_list_btn)
+
     # Chat input row
     input_row = QHBoxLayout()
     input_row.addWidget(input_box)
@@ -466,9 +618,11 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     layout.addWidget(status_label)
     layout.addWidget(usage_label)
     layout.addWidget(goal_output)
+    layout.addWidget(mission_output)
     layout.addWidget(event_output)
     layout.addWidget(health_output)
     layout.addLayout(goal_controls)
+    layout.addLayout(mission_controls)
     layout.addWidget(output)
     layout.addLayout(input_row)
     window.setLayout(layout)
@@ -481,11 +635,19 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     mic_btn.clicked.connect(mic_one_shot)
     voice_loop_btn.clicked.connect(toggle_voice_loop)
     export_btn.clicked.connect(export_session)
+    key_btn.clicked.connect(open_key_manager)
+    model_btn.clicked.connect(open_model_manager)
+    voice_cfg_btn.clicked.connect(open_voice_settings)
     mute_btn.clicked.connect(toggle_mute)
     goal_add_btn.clicked.connect(add_goal)
     goal_resume_btn.clicked.connect(resume_goal)
     goal_cancel_btn.clicked.connect(cancel_goal)
     goal_refresh_btn.clicked.connect(refresh_goals)
+    mission_add_btn.clicked.connect(add_mission)
+    mission_enable_btn.clicked.connect(enable_mission)
+    mission_disable_btn.clicked.connect(disable_mission)
+    mission_run_btn.clicked.connect(run_mission_now)
+    mission_list_btn.clicked.connect(refresh_missions)
     alert_refresh_btn.clicked.connect(refresh_events)
     health_refresh_btn.clicked.connect(refresh_health)
 
@@ -493,12 +655,15 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     timer = QTimer()
     timer.timeout.connect(refresh_status)
     timer.timeout.connect(refresh_events)
+    timer.timeout.connect(apply_dynamic_theme)
     timer.start(3000)
     refresh_status()
     refresh_goals()
+    refresh_missions()
     refresh_events()
     refresh_health()
+    apply_dynamic_theme()
 
-    window.resize(1080, 760)
+    window.resize(1280, 860)
     window.show()
     app.exec()

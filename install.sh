@@ -27,10 +27,12 @@ section() { echo -e "\n${BOLD}── $* ─────────────�
 # ── flags ─────────────────────────────────────────────────────────────────────
 NO_OPTIONAL=false
 DRY_RUN=false
+GUI_SETUP=false
 for arg in "$@"; do
   case "$arg" in
     --no-optional) NO_OPTIONAL=true ;;
     --dry-run)     DRY_RUN=true ;;
+    --gui)         GUI_SETUP=true ;;
   esac
 done
 
@@ -309,4 +311,10 @@ echo "  To activate the environment:  source .venv/bin/activate"
 echo "  To start NOVA:                python main.py"
 echo "  To reset onboarding:          python -m interfaces.onboarding --reset"
 echo "  To rescan hardware:           python -m config.pc_scanner"
+if $GUI_SETUP; then
+  echo "  Launching GUI onboarding wizard..."
+  if ! $DRY_RUN; then
+    "$PYTHON" -m interfaces.onboarding --force || warn "GUI onboarding did not complete"
+  fi
+fi
 echo ""

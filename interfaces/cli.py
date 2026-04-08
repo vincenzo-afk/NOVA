@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -158,6 +159,33 @@ def run_cli(agent) -> None:
         if user_text == "/status":
             console.print(agent.status_text())
             continue
+        if user_text == "/keys":
+            try:
+                from config.settings import settings
+                from interfaces.key_manager import summarize_env_keys
+
+                summary = summarize_env_keys(settings)
+                if not summary:
+                    console.print("No configured keys found.")
+                else:
+                    for provider in sorted(summary.keys()):
+                        console.print(f"{provider}: {', '.join(summary[provider])}")
+            except Exception as exc:
+                console.print(f"Key summary failed: {exc}")
+            continue
+        if user_text == "/privacy":
+            mode = getattr(agent, "_get_session_privacy_mode", lambda *_: "full_cloud")()
+            console.print(f"Current session privacy mode: {mode}")
+            continue
+        if user_text.startswith("/privacy "):
+            mode_raw = user_text.split(" ", 1)[1].strip()
+            setter = getattr(agent, "_set_session_privacy_mode", None)
+            if callable(setter):
+                selected = setter(mode_raw)
+                console.print(f"Session privacy mode set to: {selected}")
+            else:
+                console.print("Privacy mode controls unavailable.")
+            continue
         if user_text == "/usage":
             session_id = agent.session.current.session_id
             console.print(format_usage_message("Usage today", agent.usage.today_summary(session_id=session_id)))
@@ -221,6 +249,97 @@ def run_cli(agent) -> None:
                 history_snapshot = list(session.history)
             path = agent.export_session(fmt, history=history_snapshot)
             console.print(f"Exported session -> {path}")
+            continue
+        if user_text.startswith("/models"):
+            try:
+                from interfaces.model_manager import list_ollama_models
+
+                rows = list_ollama_models()
+                if not rows:
+                    console.print("No Ollama models found.")
+                else:
+                    for item in rows:
+                        name = item.get("name") or item.get("model") or "unknown"
+                        size = item.get("size") or ""
+                        modified = item.get("modified") or item.get("modified_at") or ""
+                        console.print(f"{name} | {size} | {modified}")
+            except Exception as exc:
+                console.print(f"Model listing failed: {exc}")
+            continue
+        if user_text == "/theme":
+            current = str(getattr(agent, "get_theme_lock", lambda: "auto")())
+            console.print(f"Theme mode: {current}")
+            continue
+        if user_text.startswith("/theme "):
+            requested = user_text.split(" ", 1)[1].strip()
+            selected = str(getattr(agent, "set_theme_lock", lambda x: x)(requested))
+            if selected == "auto":
+                console.print("Theme auto-switch enabled.")
+            else:
+                console.print(f"Theme locked to '{selected}'.")
+            continue
+        if user_text == "/mission list":
+            try:
+                console.print(agent._mission_list())
+            except Exception as exc:
+                console.print(f"Mission list failed: {exc}")
+            continue
+        if user_text.startswith("/mission enable "):
+            name = user_text.split(" ", 2)[2].strip()
+            console.print(agent._mission_enable(name))
+            continue
+        if user_text.startswith("/mission disable "):
+            name = user_text.split(" ", 2)[2].strip()
+            console.print(agent._mission_disable(name))
+            continue
+        if user_text.startswith("/mission run "):
+            name = user_text.split(" ", 2)[2].strip()
+            console.print(agent._mission_run_now(name))
+            continue
+        if user_text.startswith("/mission add "):
+            # /mission add <name> | <schedule> | <goal>
+            raw = user_text[len("/mission add ") :].strip()
+            parts = [p.strip() for p in raw.split("|")]
+            if len(parts) != 3:
+                console.print("Usage: /mission add <name> | <schedule> | <goal>")
+            else:
+                console.print(agent._mission_add(parts[0], parts[1], parts[2], True))
+            continue
+        if user_text == "/a2a peers":
+            console.print(agent._a2a_peers())
+            continue
+        if user_text == "/a2a inbox":
+            console.print(agent._a2a_inbox(50))
+            continue
+        if user_text.startswith("/a2a send "):
+            raw = user_text[len("/a2a send ") :].strip()
+            parts = [p.strip() for p in raw.split("|")]
+            if len(parts) != 3:
+                console.print("Usage: /a2a send <to_agent> | <msg_type> | <json_payload>")
+                continue
+            try:
+                payload = json.loads(parts[2]) if parts[2] else {}
+            except Exception as exc:
+                console.print(f"Invalid JSON payload: {exc}")
+                continue
+            console.print(agent._a2a_send(parts[0], parts[1], payload))
+            continue
+        if user_text.startswith("/a2a delegate "):
+            raw = user_text[len("/a2a delegate ") :].strip()
+            parts = [p.strip() for p in raw.split("|")]
+            if len(parts) != 3:
+                console.print("Usage: /a2a delegate <to_agent> | <tool_name> | <json_args>")
+                continue
+            try:
+                args = json.loads(parts[2]) if parts[2] else {}
+            except Exception as exc:
+                console.print(f"Invalid JSON args: {exc}")
+                continue
+            fn = getattr(agent, "_a2a_delegate_tool", None)
+            if not callable(fn):
+                console.print("A2A delegation unavailable.")
+            else:
+                console.print(fn(parts[0], parts[1], args, None))
             continue
 
         prefix = f"[bold magenta]{AGENT_NAME}[/bold magenta] > " if HAS_RICH else f"{AGENT_NAME} > "

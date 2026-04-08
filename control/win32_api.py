@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fnmatch import fnmatch
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -17,6 +18,19 @@ def read_file(path: str) -> str:
 
 
 def write_file(path: str, content: str) -> str:
+    if os.getenv("VIRUSTOTAL_SCAN_WRITES", "").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            from safety.virus_scanner import VirusScanner
+
+            api_key = os.getenv("VIRUSTOTAL_API_KEY", "").strip()
+            scan = VirusScanner(api_key=api_key).scan_text_buffer(content, filename=path)
+            if not scan.get("safe", True):
+                raise RuntimeError(f"Write blocked by scanner: {scan}")
+        except RuntimeError:
+            raise
+        except Exception:
+            # Scan errors should not block normal writes unless scanner explicitly flagged danger.
+            pass
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")

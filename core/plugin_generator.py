@@ -66,6 +66,7 @@ class PluginGenerator:
         llm_callable: Callable[[str, str], str],
         dispatcher,
         confirm_callback: Callable[[str, str], bool] | None = None,
+        scan_code_callback: Callable[[str, str], dict[str, Any]] | None = None,
     ):
         """
         Args:
@@ -77,6 +78,7 @@ class PluginGenerator:
         self._llm = llm_callable
         self._dispatcher = dispatcher
         self._confirm = confirm_callback or _cli_confirm
+        self._scan_code = scan_code_callback
 
     def generate_and_propose(self, description: str) -> dict[str, Any]:
         """Full pipeline: generate → validate → show to user → approve → save → load.
@@ -98,6 +100,17 @@ class PluginGenerator:
 
         if not code:
             raise PluginGenerationError("LLM returned empty code.")
+
+        # Optional malware/suspicious-content scan before AST and file writes.
+        if self._scan_code is not None:
+            try:
+                scan = self._scan_code(code, "generated_plugin.py")
+                if isinstance(scan, dict) and not scan.get("safe", True):
+                    raise PluginGenerationError(f"Generated code blocked by scanner: {scan}")
+            except PluginGenerationError:
+                raise
+            except Exception as exc:
+                log.warning("[plugin_generator] scanner failed (continuing cautiously): %s", exc)
 
         # 2. AST validation (first gate)
         try:
