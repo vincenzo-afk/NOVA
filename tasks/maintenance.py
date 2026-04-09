@@ -170,7 +170,10 @@ class MaintenanceOrchestrator:
             archive = log_file.with_name(f"jarvis_{ts}.log.gz")
             with log_file.open("rb") as f_in, gzip.open(archive, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
-            log_file.write_text("")  # truncate
+            if archive.exists() and archive.stat().st_size > 0:
+                log_file.write_text("")  # truncate only after successful archive write
+            else:
+                return "compression failed: empty archive output"
             return f"compressed → {archive.name}"
         except Exception as exc:
             return f"compression failed: {exc}"

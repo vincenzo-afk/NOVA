@@ -61,4 +61,4 @@ class ContextTrimmer:
         except Exception:
             with self._lock:
                 self._summary_inflight.discard(session_id)
-            raise
+            return summary, recent

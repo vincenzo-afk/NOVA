@@ -152,13 +152,21 @@ class OmniParserServer:
                     except Exception:
                         pass
                 self.log_file = log_path.open("a", encoding="utf-8")
-                self.proc = subprocess.Popen(
-                    self.command,
-                    stdout=self.log_file,
-                    stderr=self.log_file,
-                    env=env,
-                    cwd=str(project_root),
-                )
+                try:
+                    self.proc = subprocess.Popen(
+                        self.command,
+                        stdout=self.log_file,
+                        stderr=self.log_file,
+                        env=env,
+                        cwd=str(project_root),
+                    )
+                except Exception:
+                    try:
+                        self.log_file.close()
+                    except Exception:
+                        pass
+                    self.log_file = None
+                    raise
 
         # Poll with exponential backoff up to startup_timeout
         delay = 1.0

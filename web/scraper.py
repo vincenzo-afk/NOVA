@@ -111,7 +111,7 @@ def scrape_text(url: str) -> str:
         headers = {"User-Agent": "Mozilla/5.0 (NOVA/1.0)"}
         request_url = current_url
 
-        if scheme == "http":
+        if scheme in {"http", "https"}:
             parsed = urlparse(current_url)
             safe_host = _format_host_for_netloc(resolved_ip)
             netloc = safe_host
