@@ -69,11 +69,14 @@ class MemoryRouter:
         with self._sync_lock:  # fix 2.2: lock before mutating shared state
             if hash_id in self._seen_hashes:
                 return {"status": "duplicate", "id": hash_id}
+            # Reserve the hash before local I/O to avoid TOCTOU duplicates.
+            self._seen_hashes.add(hash_id)
 
         local_result = self.local.add(safe_text, session_id, metadata)
-        if local_result.get("status") in {"ok", "duplicate"}:
+        if local_result.get("status") not in {"ok", "duplicate"}:
             with self._sync_lock:
-                self._seen_hashes.add(hash_id)
+                self._seen_hashes.discard(hash_id)
+            return local_result
 
         if self._online and self._remote_sync_enabled:
             self.mem0.add(safe_text, session_id, metadata)

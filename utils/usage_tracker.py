@@ -151,6 +151,10 @@ class UsageTracker:
         summary = self.today_summary(session_id=session_id)
         return sum(item["total_tokens"] for item in summary.values())
 
+    def total_tokens_for_day(self, day: date, session_id: str | None = None) -> int:
+        summary = self._summary_for_dates([day], session_id=session_id)
+        return sum(item["total_tokens"] for item in summary.values())
+
     def total_tokens_week(self, session_id: str | None = None, end_date: date | None = None) -> int:
         summary = self.weekly_summary(session_id=session_id, end_date=end_date)
         return sum(item["total_tokens"] for item in summary.values())

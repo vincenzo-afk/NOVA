@@ -62,7 +62,10 @@ def _backup_chromadb(chroma_dir: str = ".jarvis_chroma", export_dir: str = "expo
         tmp_path.replace(out_path)
 
         # Keep only the last 7 snapshots including the newly written file.
-        existing = sorted(out_dir.glob("memory_backup_*.json"))
+        existing = sorted(
+            out_dir.glob("memory_backup_*.json"),
+            key=lambda p: (p.stat().st_mtime, p.name),
+        )
         for old in existing[:-7]:
             old.unlink(missing_ok=True)
 

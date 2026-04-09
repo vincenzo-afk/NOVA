@@ -31,6 +31,22 @@ _SECRET_ENV_PREFIXES = (
 )
 
 
+def _is_safe_pythonpath_entry(entry: str) -> bool:
+    try:
+        resolved = Path(entry).expanduser().resolve()
+    except Exception:
+        return False
+    if not resolved.exists():
+        return False
+    safe_roots = [
+        Path.cwd().resolve(),
+        Path.home().resolve(),
+        Path(sys.prefix).resolve(),
+        Path(getattr(sys, "base_prefix", sys.prefix)).resolve(),
+    ]
+    return any(str(resolved).startswith(str(root)) for root in safe_roots)
+
+
 def _safe_env(extra_pythonpath: str = "", auth_token: str = "") -> dict[str, str]:
     """Build a minimal environment for the OmniParser subprocess.
 
@@ -55,7 +71,16 @@ def _safe_env(extra_pythonpath: str = "", auth_token: str = "") -> dict[str, str
         if val:
             safe[key] = val
 
-    pythonpath_parts = [p for p in [extra_pythonpath, os.environ.get("PYTHONPATH", "")] if p]
+    pythonpath_parts: list[str] = []
+    for source in (extra_pythonpath, os.environ.get("PYTHONPATH", "")):
+        if not source:
+            continue
+        for raw in source.split(os.pathsep):
+            value = raw.strip()
+            if not value:
+                continue
+            if _is_safe_pythonpath_entry(value) and value not in pythonpath_parts:
+                pythonpath_parts.append(value)
     if pythonpath_parts:
         safe["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
     if auth_token:

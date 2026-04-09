@@ -156,12 +156,17 @@ class GoalRunner:
                 dry_run=dry_run,
             )
             if dry_run or authorized.reason == "dry_run":
-                return GoalResult(
-                    status="dry_run",
-                    reason="dry_run",
-                    results=[],
-                    next_index=idx,
+                guard.record(tool, args)
+                results.append(
+                    {
+                        "status": "dry_run",
+                        "tool": tool,
+                        "args": args,
+                        "risk": authorized.score,
+                        "level": authorized.level,
+                    }
                 )
+                continue
             if authorized.blocked:
                 return GoalResult(
                     status="blocked",
@@ -189,6 +194,7 @@ class GoalRunner:
                 try:
                     future = self._executor.submit(self.dispatcher.execute, call, None, None, dry_run, True)
                 except RuntimeError:
+                    self._closed = True
                     return GoalResult(
                         status="failed",
                         reason="runner_closed",
@@ -223,4 +229,6 @@ class GoalRunner:
             if self.step_delay_seconds > 0 and idx < len(indexed_steps) - 1:
                 self._sleep_fn(self.step_delay_seconds)
 
+        if dry_run:
+            return GoalResult(status="dry_run", reason="dry_run", results=results, next_index=len(indexed_steps))
         return GoalResult(status="completed", reason="ok", results=results, next_index=len(indexed_steps))

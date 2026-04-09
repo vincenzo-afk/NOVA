@@ -73,6 +73,7 @@ class EncryptedKeyStore:
     def save(self, password: str, data: dict[str, list[str]]) -> None:
         try:
             import json
+            import tempfile
         except Exception as exc:
             raise RuntimeError("json module unavailable") from exc
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,7 +94,22 @@ class EncryptedKeyStore:
             "ciphertext": ciphertext,
             "updated_at": int(time.time()),
         }
-        self.path.write_text(json.dumps(wrapper, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload = json.dumps(wrapper, ensure_ascii=False, indent=2)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(self.path.parent),
+            delete=False,
+            suffix=".tmp",
+        ) as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            tmp_path = Path(tmp.name)
+        tmp_path.replace(self.path)
+        try:
+            self.path.chmod(0o600)
+        except Exception:
+            pass
 
     def list_masked(self, password: str) -> dict[str, list[str]]:
         loaded = self.load(password)

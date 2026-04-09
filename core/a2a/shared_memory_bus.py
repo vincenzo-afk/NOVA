@@ -36,6 +36,10 @@ class SharedMemoryBus:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(asdict(msg), ensure_ascii=False) + "\n")
+            try:
+                self.path.chmod(0o600)
+            except Exception:
+                pass
         return {"status": "ok", "message": asdict(msg)}
 
     def read(self, *, to_agent: str, limit: int = 50, include_broadcast: bool = True) -> list[dict]:

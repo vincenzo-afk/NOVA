@@ -54,14 +54,20 @@ def _ensure_worker() -> None:
             return
         # In pytest, rebuild worker per test case to avoid cross-test shared queue state.
         if os.getenv("PYTEST_CURRENT_TEST"):
-            if _QUEUE is not None and _WORKER_THREAD is not None and _WORKER_THREAD.is_alive():
+            old_queue = _QUEUE
+            old_thread = _WORKER_THREAD
+            if old_queue is not None:
                 try:
-                    _QUEUE.put(None)
-                    _WORKER_THREAD.join()
+                    old_queue.put(None)
                 except Exception:
                     pass
-                _WORKER_THREAD = None
-                _QUEUE = None
+            if old_thread is not None:
+                try:
+                    old_thread.join(timeout=1.0)
+                except Exception:
+                    pass
+            _WORKER_THREAD = None
+            _QUEUE = None
         if _QUEUE is None:
             _QUEUE = queue.Queue()
         if _WORKER_THREAD is None or not _WORKER_THREAD.is_alive():

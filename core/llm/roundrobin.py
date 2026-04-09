@@ -77,7 +77,6 @@ class RoundRobinPool:
     def mark_rate_limited(self, key: str, retry_after: int = 60) -> None:
         with self._lock:
             record = self._find(key)
-            failure_count = record.failures + 1
             record.failures += 1
             raw_backoff = max(retry_after, 60) * (2 ** (record.failures - 1))
             # fix 2.5: cap backoff so keys are always recoverable within 1 hour max
@@ -90,7 +89,7 @@ class RoundRobinPool:
             logging.getLogger(__name__).warning(
                 "Key %s is rate-limited (failure #%s); cooldown %ss (capped at %ss)",
                 label,
-                failure_count,
+                record.failures,
                 backoff,
                 MAX_BACKOFF_SECONDS,
             )

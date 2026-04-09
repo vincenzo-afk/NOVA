@@ -28,11 +28,13 @@ class HybridRanker:
 
         bm25_ranks = sorted(range(len(docs)), key=lambda i: bm25_scores[i], reverse=True)
         sem_ranks = sorted(range(len(docs)), key=lambda i: semantic_scores[i], reverse=True)
+        bm25_rank_by_idx = {doc_idx: rank + 1 for rank, doc_idx in enumerate(bm25_ranks)}
+        sem_rank_by_idx = {doc_idx: rank + 1 for rank, doc_idx in enumerate(sem_ranks)}
 
         fused = []
         for i, _ in enumerate(docs):
-            r1 = bm25_ranks.index(i) + 1
-            r2 = sem_ranks.index(i) + 1
+            r1 = bm25_rank_by_idx[i]
+            r2 = sem_rank_by_idx[i]
             fused.append(((1 / (60 + r1)) + (1 / (60 + r2)), docs[i]))
 
         fused.sort(key=lambda x: x[0], reverse=True)

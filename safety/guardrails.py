@@ -62,6 +62,7 @@ def _emergency_stop_paths(cwd: Path | None = None) -> tuple[Path, Path]:
 # Backward-compatible module-level aliases for tests/patching.
 _EMERGENCY_STOP_FILE: Path | None = None
 _EMERGENCY_STOP_FILE_FALLBACK: Path | None = None
+_EMERGENCY_STOP_INIT_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -146,8 +147,9 @@ class Guardrails:
         # Fix 1.9: load persisted emergency stop on startup
         self._emergency_stop = threading.Event()
         global _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK
-        if _EMERGENCY_STOP_FILE is None or _EMERGENCY_STOP_FILE_FALLBACK is None:
-            _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths(self._cwd_at_init)
+        with _EMERGENCY_STOP_INIT_LOCK:
+            if _EMERGENCY_STOP_FILE is None or _EMERGENCY_STOP_FILE_FALLBACK is None:
+                _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths(self._cwd_at_init)
         primary, fallback = self._resolve_emergency_stop_files()
         if primary.exists() or fallback.exists():
             self._emergency_stop.set()
@@ -242,6 +244,10 @@ class Guardrails:
                     requires_confirmation=False,
                     plan=self._build_plan(tool_call),
                 )
+            if path.startswith("hkcu\\"):
+                path = "hkey_current_user\\" + path[len("hkcu\\"):]
+            elif path.startswith("hklm\\"):
+                path = "hkey_local_machine\\" + path[len("hklm\\"):]
             normalized = ntpath.normpath(path.replace("/", "\\")).lower()
             allowlist = {"hkey_current_user\\software\\nova", "hkey_current_user\\environment"}
             if not any(normalized.startswith(a) for a in allowlist):

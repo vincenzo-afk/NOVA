@@ -119,12 +119,24 @@ class MaintenanceOrchestrator:
     def _check_disk(self) -> tuple[bool, str]:
         try:
             import shutil
-            total, used, free = shutil.disk_usage("/")
-            free_gb = free / 1e9
-            pct_used = (used / total) * 100 if total else 0
-            if free_gb < _DISK_WARN_GB:
-                return False, f"Disk at {pct_used:.0f}% — only {free_gb:.1f} GB free"
-            return True, f"Disk ok ({free_gb:.1f} GB free, {pct_used:.0f}% used)"
+            targets = [
+                Path(".jarvis_chroma").resolve(),
+                Path("exports").resolve(),
+            ]
+            worst_free_gb = float("inf")
+            worst_pct = 0.0
+            worst_target = targets[0]
+            for target in targets:
+                total, used, free = shutil.disk_usage(str(target))
+                free_gb = free / 1e9
+                pct_used = (used / total) * 100 if total else 0
+                if free_gb < worst_free_gb:
+                    worst_free_gb = free_gb
+                    worst_pct = pct_used
+                    worst_target = target
+            if worst_free_gb < _DISK_WARN_GB:
+                return False, f"Disk at {worst_pct:.0f}% on {worst_target} — only {worst_free_gb:.1f} GB free"
+            return True, f"Disk ok ({worst_free_gb:.1f} GB free min, {worst_pct:.0f}% used max)"
         except Exception as exc:
             return True, f"Disk check error: {exc}"
 

@@ -40,7 +40,8 @@ def build_status_snapshot(agent: Any) -> dict[str, Any]:
         tokens_today = 0
 
     try:
-        active_keys = int(agent.engine.pool.active_count())
+        pool = getattr(getattr(agent, "engine", None), "pool", None)
+        active_keys = int(pool.active_count()) if pool is not None else 0
     except Exception:
         active_keys = 0
 

@@ -1362,11 +1362,12 @@ class NOVAApp:
 
         raw = ""
         steps = []
+        usage_system_prompt = system_prompt
         for attempt in range(3):
             if self._is_hard_cap_active_today(date.today()):
                 return {"goal": goal, "status": "failed", "reason": "daily_hard_cap_reached"}
             raw = self.engine.ask(prompt=f"Goal: {goal}", system=system_prompt, history=[])
-            self._track_usage(system_prompt, [], f"[goal_plan] {goal}", raw)
+            self._track_usage(usage_system_prompt, [], f"[goal_plan] {goal}", raw)
             if self._is_hard_cap_active_today(date.today()):
                 return {"goal": goal, "status": "failed", "reason": "daily_hard_cap_reached"}
             steps = _extract_steps(raw)
@@ -1418,6 +1419,14 @@ class NOVAApp:
                             break
                 return {"status": "error", "reason": "goal_planning_queue_full", "id": goal_id}
             self._goal_plan_jobs_inflight += 1
+        inflight_released = {"value": False}
+
+        def _release_plan_slot() -> None:
+            with self._goal_plan_submit_lock:
+                if inflight_released["value"]:
+                    return
+                inflight_released["value"] = True
+                self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
 
         def background_plan():
             try:
@@ -1443,14 +1452,12 @@ class NOVAApp:
                             self._persist_goals()
                             break
             finally:
-                with self._goal_plan_submit_lock:
-                    self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
+                _release_plan_slot()
 
         try:
             future = self._goal_plan_executor.submit(background_plan)
         except Exception as exc:
-            with self._goal_plan_submit_lock:
-                self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
+            _release_plan_slot()
             with self._goal_lock:
                 for item in self._goals:
                     if item.get("id") == goal_id and item.get("status") == "planning":
@@ -1460,6 +1467,9 @@ class NOVAApp:
                         break
             return {"status": "error", "reason": f"planning_submit_exception:{exc}", "id": goal_id}
         def _on_done(fut):
+            if fut.cancelled():
+                _release_plan_slot()
+                return
             if self._shutting_down.is_set():
                 return
             try:
@@ -1497,7 +1507,6 @@ class NOVAApp:
         allowed_roots = [
             Path(os.getenv("NOVA_DOCS_ROOT", str(Path.cwd()))).expanduser().resolve(),
             Path.home().resolve(),
-            Path(Path(os.getenv("TMPDIR", "/tmp")).resolve()),
         ]
         inside_allowed = False
         for root in allowed_roots:
@@ -1605,6 +1614,14 @@ class NOVAApp:
                                     self._persist_goals()
                                     return {"goal_id": goal_id, "status": "failed", "reason": "goal_planning_queue_full"}
                                 self._goal_plan_jobs_inflight += 1
+                            inflight_released = {"value": False}
+
+                            def _release_plan_slot() -> None:
+                                with self._goal_plan_submit_lock:
+                                    if inflight_released["value"]:
+                                        return
+                                    inflight_released["value"] = True
+                                    self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
                             
                             def background_plan():
                                 try:
@@ -1630,19 +1647,20 @@ class NOVAApp:
                                                 self._persist_goals()
                                                 break
                                 finally:
-                                    with self._goal_plan_submit_lock:
-                                        self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
+                                    _release_plan_slot()
                             
                             try:
                                 future = self._goal_plan_executor.submit(background_plan)
                             except Exception as exc:
-                                with self._goal_plan_submit_lock:
-                                    self._goal_plan_jobs_inflight = max(0, self._goal_plan_jobs_inflight - 1)
+                                _release_plan_slot()
                                 item["status"] = "failed"
                                 item["last_result"] = {"status": "failed", "reason": f"planning_submit_exception:{exc}"}
                                 self._persist_goals()
                                 return {"goal_id": goal_id, "status": "failed"}
                             def _on_done(fut):
+                                if fut.cancelled():
+                                    _release_plan_slot()
+                                    return
                                 exc = fut.exception()
                                 if exc is not None:
                                     with self._goal_lock:
@@ -1708,6 +1726,7 @@ class NOVAApp:
             # Security fix (4.3): Never inject an Authorization Bearer token over plain HTTP.
             # If a key is present and the endpoint is not HTTPS or localhost, reject it.
             parsed_scheme, parsed_host = "", ""
+            resolved_addrs: list[str] = []
             try:
                 from urllib.parse import urlparse
                 parsed = urlparse(endpoint)
@@ -1719,14 +1738,14 @@ class NOVAApp:
             if key and parsed_scheme == "http":
                 resolved_private = False
                 try:
-                    addrs = set(_resolve_host_with_timeout(parsed_host, timeout_seconds=5.0))
-                    if not addrs:
+                    resolved_addrs = list({addr for addr in _resolve_host_with_timeout(parsed_host, timeout_seconds=5.0)})
+                    if not resolved_addrs:
                         return {
                             "status": "error",
                             "reason": "dns_resolution_timeout_or_failure",
                         }
                     resolved_private = True
-                    for ip in addrs:
+                    for ip in resolved_addrs:
                         parsed_ip = ipaddress.ip_address(ip)
                         mapped = getattr(parsed_ip, "ipv4_mapped", None)
                         if mapped is not None:
@@ -1748,11 +1767,27 @@ class NOVAApp:
                         ),
                     }
             merged_headers = dict(headers or {})
+            endpoint_to_connect = endpoint
+            # Pin plain-HTTP auth connections to the resolved IP to prevent DNS rebinding.
+            if key and parsed_scheme == "http" and resolved_addrs and parsed_host:
+                try:
+                    from urllib.parse import urlparse, urlunparse
+
+                    parsed = urlparse(endpoint)
+                    chosen_ip = sorted(resolved_addrs)[0]
+                    netloc = f"[{chosen_ip}]" if ":" in chosen_ip else chosen_ip
+                    if parsed.port:
+                        netloc = f"{netloc}:{parsed.port}"
+                    endpoint_to_connect = urlunparse(parsed._replace(netloc=netloc))
+                    host_header = parsed_host if parsed.port is None else f"{parsed_host}:{parsed.port}"
+                    merged_headers.setdefault("Host", host_header)
+                except Exception:
+                    endpoint_to_connect = endpoint
             if key and "Authorization" not in merged_headers:
                 merged_headers["Authorization"] = f"Bearer {key}"
             self.master_mcp.connect_http(
                 service=svc,
-                endpoint=endpoint,
+                endpoint=endpoint_to_connect,
                 headers=merged_headers,
                 timeout_seconds=timeout_seconds,
                 discover=discover,
@@ -2390,7 +2425,8 @@ class NOVAApp:
             )
             print(f"\n[autonomy] {message}")
             if not self._shutting_down.is_set():
-                self.session.add_turn("assistant", message)
+                goal_session_id = str(goal.get("session_id") or self.session.current.session_id)
+                self.session.add_turn_for_session(goal_session_id, "assistant", message)
             self._notify_autonomy_event(message)
 
     def shutdown(self) -> None:
@@ -3252,13 +3288,18 @@ class NOVAApp:
                 current_epoch = self._session_context_epoch.get(session_id, 0)
                 if current_epoch != session_epoch:
                     return
-                with self.trimmer._lock:
-                    # Keep epoch check + summary write in one critical section
-                    # with the same lock order used elsewhere (_summary_submit_lock -> trimmer._lock).
-                    self.trimmer.summaries[session_id] = summary
+            with self.trimmer._lock:
+                self.trimmer.summaries[session_id] = summary
+            stale_summary = False
             with self._summary_submit_lock:
+                current_epoch = self._session_context_epoch.get(session_id, 0)
+                stale_summary = current_epoch != session_epoch
                 # Cool down re-summarization churn after a successful summary.
                 self._summary_retry_after[session_id] = time.time() + 30.0
+            if stale_summary:
+                with self.trimmer._lock:
+                    if self.trimmer.summaries.get(session_id) == summary:
+                        self.trimmer.summaries.pop(session_id, None)
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning("Summarizer thread failed unconditionally: %s", e)
@@ -3281,15 +3322,21 @@ class NOVAApp:
             parts = user_text.strip().split()
             candidate_id = parts[1] if len(parts) > 1 else None
             with self._goal_lock:
-                for goal in self._goals:
-                    if candidate_id and goal["id"] == candidate_id and goal["status"] == "awaiting_confirmation":
-                        goal["status"] = "approved_for_step"
+                awaiting = [g for g in self._goals if g.get("status") == "awaiting_confirmation"]
+                if candidate_id:
+                    for goal in awaiting:
+                        if goal.get("id") == candidate_id:
+                            goal["status"] = "approved_for_step"
+                            self._persist_goals()
+                            return f"Goal {candidate_id} approved for next step."
+                else:
+                    if len(awaiting) == 1:
+                        awaiting[0]["status"] = "approved_for_step"
                         self._persist_goals()
-                        return f"Goal {candidate_id} approved for next step."
-                    elif not candidate_id and goal["status"] == "awaiting_confirmation":
-                        goal["status"] = "approved_for_step"
-                        self._persist_goals()
-                        return f"Goal {goal['id']} approved for next step."
+                        return f"Goal {awaiting[0]['id']} approved for next step."
+                    if len(awaiting) > 1:
+                        pending_ids = ", ".join(str(g.get("id")) for g in awaiting[:8])
+                        return f"Multiple goals await confirmation. Use /approve_goal <goal_id>. Pending: {pending_ids}"
             return "No matching goal awaiting confirmation."
 
         agent = AGENT_NAME.lower()
@@ -3509,6 +3556,21 @@ class NOVAApp:
             session_id=current_session_id,
             history=current_history,
         )
+        hardcap = int(settings.DAILY_TOKEN_HARD_CAP)
+        if hardcap > 0:
+            projected_input = estimate_tokens(system_prompt) + estimate_tokens(user_text)
+            projected_input += sum(estimate_tokens(str(m.get("content", ""))) for m in history)
+            with self._usage_lock:
+                current_total = int(self.usage.total_tokens_for_day(today, session_id=current_session_id))
+            if current_total + projected_input >= hardcap:
+                with self._usage_lock:
+                    self._hard_cap_hit = True
+                    self._hard_cap_hit_date = today
+                yield (
+                    f"Daily token hard cap of {hardcap} would be exceeded by this request. "
+                    "Further calls are blocked for today."
+                )
+                return
 
         output_chunks: list[str] = []
         user_added = False
@@ -3809,7 +3871,8 @@ class NOVAApp:
             steps = goal.get("steps") or []
             if len(steps) < 3:
                 return  # only doc multi-step goals
-            total_today = self.usage.total_tokens_today(session_id=None)
+            target_session_id = str(session_id or goal.get("session_id") or self.session.current.session_id)
+            total_today = self.usage.total_tokens_today(session_id=target_session_id)
             budget_ok = total_today < int(settings.DAILY_TOKEN_ALERT_THRESHOLD * 0.8) if settings.DAILY_TOKEN_ALERT_THRESHOLD else True
             if not budget_ok:
                 return
@@ -3827,7 +3890,7 @@ class NOVAApp:
             if note:
                 self.memory.add(
                     note,
-                    str(session_id or goal.get("session_id") or self.session.current.session_id),
+                    target_session_id,
                     {"source": "goal_outcome", "goal_id": str(goal.get("id", ""))},
                 )
         except Exception as exc:
@@ -3853,7 +3916,7 @@ class NOVAApp:
             session_id = session_id or self.session.current.session_id
             provider = self.engine.last_provider
             self.usage.add(provider, input_tokens, output_tokens, session_id=session_id, when=today)
-            total = self.usage.total_tokens_today(session_id=session_id)
+            total = self.usage.total_tokens_for_day(today, session_id=session_id)
             if self._hard_cap_warning_day != today:
                 self._hard_cap_warning_day = None
             if self._usage_alerted_day != today:
@@ -3961,17 +4024,13 @@ class NOVAApp:
                 return cached
             if cached is not None and self._network_online_refresh_inflight:
                 return cached
-            if cached is not None:
+            if not self._network_online_refresh_inflight:
                 self._network_online_refresh_inflight = True
                 threading.Thread(target=self._refresh_network_online_state, daemon=True).start()
+            if cached is not None:
                 return cached
-
-        # Cold-start path only: one synchronous probe with a shorter timeout to avoid long stalls.
-        state = NetworkState.is_online(timeout=0.25)
-        with self._network_online_lock:
-            self._network_online_cache = state
-            self._network_online_cache_at = time.monotonic()
-        return state
+        # Cold-start path: return optimistic state while first probe runs in background.
+        return True
 
     def _refresh_network_online_state(self) -> None:
         try:

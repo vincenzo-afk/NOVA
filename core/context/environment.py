@@ -150,6 +150,22 @@ _ENVIRONMENT_LOCK = threading.RLock()
 _REFRESH_INFLIGHT: dict[bool, bool] = {True: False, False: False}
 
 
+def _normalize_cache_state_locked() -> None:
+    global _ENVIRONMENT_CACHE, _ENVIRONMENT_CACHE_TIME, _REFRESH_INFLIGHT
+    # Backward-compat: tests or external code may still patch legacy scalar values.
+    if not isinstance(_ENVIRONMENT_CACHE_TIME, dict):
+        scalar = float(_ENVIRONMENT_CACHE_TIME or 0.0)
+        _ENVIRONMENT_CACHE_TIME = {True: scalar, False: scalar}
+    if not isinstance(_REFRESH_INFLIGHT, dict):
+        flag = bool(_REFRESH_INFLIGHT)
+        _REFRESH_INFLIGHT = {True: flag, False: flag}
+    if not isinstance(_ENVIRONMENT_CACHE, dict):
+        _ENVIRONMENT_CACHE = {True: {}, False: {}}
+    elif "time" in _ENVIRONMENT_CACHE and "network" in _ENVIRONMENT_CACHE:
+        legacy = dict(_ENVIRONMENT_CACHE)
+        _ENVIRONMENT_CACHE = {True: dict(legacy), False: dict(legacy)}
+
+
 def _compute_snapshot(include_clipboard: bool) -> dict:
     clipboard = _get_clipboard()[:1000] if include_clipboard else ""
     clipboard_type = _classify_clipboard(clipboard) if include_clipboard else "PLAIN_TEXT"
@@ -181,22 +197,9 @@ def _refresh_background(include_clipboard: bool) -> None:
             _REFRESH_INFLIGHT[include_clipboard] = False
 
 def snapshot_environment(include_clipboard: bool = True) -> dict:
-    global _ENVIRONMENT_CACHE, _ENVIRONMENT_CACHE_TIME, _REFRESH_INFLIGHT
-    # Backward-compat: tests or external code may still patch legacy scalar values.
-    if not isinstance(_ENVIRONMENT_CACHE_TIME, dict):
-        _ENVIRONMENT_CACHE_TIME = {True: float(_ENVIRONMENT_CACHE_TIME or 0.0), False: float(_ENVIRONMENT_CACHE_TIME or 0.0)}
-    if not isinstance(_REFRESH_INFLIGHT, dict):
-        flag = bool(_REFRESH_INFLIGHT)
-        _REFRESH_INFLIGHT = {True: flag, False: flag}
-    if not isinstance(_ENVIRONMENT_CACHE, dict):
-        _ENVIRONMENT_CACHE = {True: {}, False: {}}
-    elif "time" in _ENVIRONMENT_CACHE and "network" in _ENVIRONMENT_CACHE:
-        # Legacy single-cache payload promoted to both keys.
-        legacy = dict(_ENVIRONMENT_CACHE)
-        _ENVIRONMENT_CACHE = {True: dict(legacy), False: dict(legacy)}
-
     now = time.monotonic()
     with _ENVIRONMENT_LOCK:
+        _normalize_cache_state_locked()
         cache_time = _ENVIRONMENT_CACHE_TIME.get(include_clipboard, 0.0)
         cache = dict(_ENVIRONMENT_CACHE.get(include_clipboard, {}))
         if now - cache_time < _ENVIRONMENT_CACHE_TTL and cache:

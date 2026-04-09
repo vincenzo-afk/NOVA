@@ -114,7 +114,8 @@ class PromptEvolver:
         with self._lock:
             if not self._active_variant:
                 return False
-        digest = hashlib.md5(f"{session_id}{date.today().isoformat()}".encode()).hexdigest()
+        utc_day = datetime.now(timezone.utc).date().isoformat()
+        digest = hashlib.md5(f"{session_id}{utc_day}".encode()).hexdigest()
         return int(digest, 16) % _AB_BUCKET_RATIO == 0
 
     def get_active_suffix(self, session_id: str) -> str:
