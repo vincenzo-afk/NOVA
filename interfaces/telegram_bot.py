@@ -24,7 +24,14 @@ from vision.capture import capture_screen_png
 from vision.gemini_vision import analyze_image
 from interfaces.cli import format_usage_message
 from interfaces.key_manager import summarize_env_keys
-from interfaces.model_manager import list_ollama_models
+from interfaces.model_manager import (
+    benchmark_providers,
+    delete_ollama_model,
+    list_ollama_models,
+    provider_key_snapshot,
+    pull_ollama_model,
+    recommend_provider,
+)
 from utils.events import format_event_log
 from utils.goals import format_goal_list
 from utils.health import format_health_table, summarize_health
@@ -397,22 +404,64 @@ def run_telegram_bot(
         lines.append("Use GUI Key Manager for encrypted edits/storage.")
         await update.message.reply_text("\n".join(lines))
 
-    async def on_models(update, _context: ContextTypes.DEFAULT_TYPE):
+    async def on_models(update, context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):
             return
+        args = [a.strip() for a in (context.args or []) if a.strip()]
+        sub = args[0].lower() if args else "list"
         try:
-            models = list_ollama_models()
-            if not models:
-                await update.message.reply_text("No Ollama models found.")
+            if sub in {"list", "ls"}:
+                models = list_ollama_models()
+                if not models:
+                    await update.message.reply_text("No Ollama models found.")
+                    return
+                lines = ["Installed Ollama models:"]
+                for item in models[:40]:
+                    name = item.get("name") or item.get("model") or "unknown"
+                    size = item.get("size") or ""
+                    lines.append(f"- {name} ({size})")
+                await update.message.reply_text("\n".join(lines))
                 return
-            lines = ["Installed Ollama models:"]
-            for item in models[:40]:
-                name = item.get("name") or item.get("model") or "unknown"
-                size = item.get("size") or ""
-                lines.append(f"- {name} ({size})")
-            await update.message.reply_text("\n".join(lines))
+
+            if sub == "pull":
+                model = " ".join(args[1:]).strip() if len(args) > 1 else ""
+                if not model:
+                    await update.message.reply_text("Usage: /models pull <model_name>")
+                    return
+                await update.message.reply_text(f"Pulling {model} ... this may take a while.")
+                result = pull_ollama_model(model)
+                await update.message.reply_text(str(result))
+                return
+
+            if sub in {"delete", "rm"}:
+                model = " ".join(args[1:]).strip() if len(args) > 1 else ""
+                if not model:
+                    await update.message.reply_text("Usage: /models delete <model_name>")
+                    return
+                result = delete_ollama_model(model)
+                await update.message.reply_text(str(result))
+                return
+
+            if sub in {"benchmark", "bench"}:
+                rows = benchmark_providers(agent)
+                await update.message.reply_text(json.dumps(rows, ensure_ascii=False, indent=2)[:3900])
+                return
+
+            if sub in {"recommend", "auto"}:
+                rec = recommend_provider(agent)
+                await update.message.reply_text(json.dumps(rec, ensure_ascii=False, indent=2)[:3900])
+                return
+
+            if sub in {"keys", "health"}:
+                snap = provider_key_snapshot(agent)
+                await update.message.reply_text(json.dumps(snap, ensure_ascii=False, indent=2)[:3900])
+                return
+
+            await update.message.reply_text(
+                "Usage: /models list|pull <name>|delete <name>|benchmark|recommend|keys"
+            )
         except Exception as exc:
-            await update.message.reply_text(f"Model list failed: {exc}")
+            await update.message.reply_text(f"Model command failed: {exc}")
 
     async def on_privacy(update, context: ContextTypes.DEFAULT_TYPE):
         if not await _authorized(update):

@@ -163,3 +163,27 @@ def test_home_assistant_extended_tools(monkeypatch):
 
     energy = mcp.call_tool("home_assistant", "get_energy_stats", period="day")
     assert energy["ok"] is True
+
+
+def test_a2a_builtin_connector_round_trip(tmp_path):
+    peers = tmp_path / "peers.json"
+    bus = tmp_path / "bus.jsonl"
+    locks = tmp_path / "locks.json"
+    key = f"nova-a|{peers}|{bus}|{locks}"
+
+    mcp = MasterMCP()
+    mcp.connect_builtin("a2a", key)
+    names = {tool["name"] for tool in mcp.list_tools("a2a")}
+    assert {"list_peers", "send_message", "read_inbox", "claim_file", "release_file"} <= names
+
+    sent = mcp.call_tool("a2a", "send_message", to_agent="nova-b", msg_type="status_update", payload={"ok": True})
+    assert sent["status"] == "ok"
+
+    inbox = mcp.call_tool("a2a", "read_inbox", target_agent="nova-b", limit=10)
+    assert inbox["messages"]
+    assert inbox["messages"][0]["msg_type"] == "status_update"
+
+    claimed = mcp.call_tool("a2a", "claim_file", path="main.py")
+    assert claimed["status"] == "claimed"
+    released = mcp.call_tool("a2a", "release_file", path="main.py")
+    assert released["status"] == "released"

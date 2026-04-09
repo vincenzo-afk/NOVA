@@ -1758,7 +1758,7 @@ class NOVAApp:
                 discover=discover,
             )
         elif svc in BUILTIN_SERVICES:
-            if not key:
+            if not key and svc != "a2a":
                 return {
                     "status": "error",
                     "reason": f"api_key_required_for_builtin:{svc}",
@@ -3033,6 +3033,79 @@ class NOVAApp:
             "reason": "target_service_not_connected_locally",
         }
 
+    def _run_leaving_home_routine(self) -> dict:
+        service = "home_assistant"
+        if not self.master_mcp.is_connected(service):
+            return {"status": "error", "reason": "home_assistant_not_connected"}
+
+        result: dict[str, Any] = {"status": "ok", "steps": []}
+
+        def _step(name: str, payload: Any) -> None:
+            result["steps"].append({"step": name, "result": payload})
+
+        try:
+            automations = self.master_mcp.call_tool(service, "list_automations")
+            chosen = ""
+            if isinstance(automations, list):
+                for item in automations:
+                    if not isinstance(item, dict):
+                        continue
+                    entity_id = str(item.get("entity_id", "")).lower()
+                    friendly = str(item.get("friendly_name", "")).lower()
+                    if any(k in entity_id or k in friendly for k in ("leave", "away", "leaving_home", "goodbye")):
+                        chosen = str(item.get("entity_id", "")).strip()
+                        break
+            if chosen:
+                _step("trigger_automation", self.master_mcp.call_tool(service, "trigger_automation", automation_id=chosen))
+        except Exception as exc:
+            _step("trigger_automation", {"ok": False, "error": str(exc)})
+
+        try:
+            locks = self.master_mcp.call_tool(service, "list_entities", domain="lock")
+            if isinstance(locks, list):
+                for item in locks[:3]:
+                    entity_id = str((item or {}).get("entity_id", "")).strip()
+                    if not entity_id:
+                        continue
+                    _step(
+                        f"lock:{entity_id}",
+                        self.master_mcp.call_tool(service, "call_service", domain="lock", service="lock", entity_id=entity_id),
+                    )
+        except Exception as exc:
+            _step("lock_entities", {"ok": False, "error": str(exc)})
+
+        try:
+            alarms = self.master_mcp.call_tool(service, "list_entities", domain="alarm_control_panel")
+            if isinstance(alarms, list) and alarms:
+                alarm_id = str((alarms[0] or {}).get("entity_id", "")).strip()
+                if alarm_id:
+                    _step(
+                        f"alarm:{alarm_id}",
+                        self.master_mcp.call_tool(
+                            service,
+                            "call_service",
+                            domain="alarm_control_panel",
+                            service="alarm_arm_away",
+                            entity_id=alarm_id,
+                        ),
+                    )
+        except Exception as exc:
+            _step("arm_alarm", {"ok": False, "error": str(exc)})
+
+        try:
+            climates = self.master_mcp.call_tool(service, "list_entities", domain="climate")
+            if isinstance(climates, list) and climates:
+                climate_id = str((climates[0] or {}).get("entity_id", "")).strip()
+                if climate_id:
+                    _step(
+                        f"climate:{climate_id}",
+                        self.master_mcp.call_tool(service, "set_climate", entity_id=climate_id, temperature=24.0),
+                    )
+        except Exception as exc:
+            _step("set_climate", {"ok": False, "error": str(exc)})
+
+        return result
+
     def _context_messages(
         self,
         user_text: str,
@@ -3316,6 +3389,37 @@ class NOVAApp:
                     return f"Invalid JSON args: {exc}"
                 return str(self._a2a_delegate_tool(parts[0], parts[1], payload, None))
             return "Usage: /a2a peers|inbox [limit]|send ...|delegate ..."
+        if text.startswith("/models"):
+            from interfaces.model_manager import (
+                benchmark_providers,
+                delete_ollama_model,
+                list_ollama_models,
+                provider_key_snapshot,
+                pull_ollama_model,
+                recommend_provider,
+            )
+
+            cmd_body = user_text.strip()[len("/models") :].strip()
+            sub = cmd_body.split(" ", 1)[0].lower() if cmd_body else "list"
+            rest = cmd_body.split(" ", 1)[1].strip() if " " in cmd_body else ""
+            if sub in {"", "list"}:
+                rows = list_ollama_models()
+                return json.dumps({"models": rows}, ensure_ascii=False, indent=2)
+            if sub == "pull":
+                if not rest:
+                    return "Usage: /models pull <model_name>"
+                return str(pull_ollama_model(rest))
+            if sub in {"delete", "rm"}:
+                if not rest:
+                    return "Usage: /models delete <model_name>"
+                return str(delete_ollama_model(rest))
+            if sub in {"benchmark", "bench"}:
+                return json.dumps({"benchmark": benchmark_providers(self)}, ensure_ascii=False, indent=2)
+            if sub in {"recommend", "auto"}:
+                return json.dumps(recommend_provider(self), ensure_ascii=False, indent=2)
+            if sub in {"keys", "health"}:
+                return json.dumps(provider_key_snapshot(self), ensure_ascii=False, indent=2)
+            return "Usage: /models list|pull <name>|delete <name>|benchmark|recommend|keys"
         if text.startswith("/theme ") or text.startswith("theme "):
             requested = user_text.split(" ", 1)[1].strip()
             selected = self.set_theme_lock(requested)
@@ -3328,6 +3432,8 @@ class NOVAApp:
                 "lock doors, arm alarm, and set thermostat eco mode. "
                 "Say: 'run leaving-home routine'."
             )
+        if text in {"run leaving-home routine", "run leaving home routine", "leaving-home routine"}:
+            return str(self._run_leaving_home_routine())
         if re.match(r"^switch session\s+.+$", text):
             m = re.match(r"^\s*switch\s+session\s+(.+?)\s*$", user_text, flags=re.IGNORECASE)
             name = (m.group(1) if m else "").strip()
