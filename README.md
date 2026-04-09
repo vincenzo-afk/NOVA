@@ -879,6 +879,63 @@ Each phase produces something **fully working and testable** before you move on.
 
 ---
 
+### 🚧 PHASE 14 — Self-Learning Automation Expansion (Planned + In Progress)
+**Goal:** NOVA learns new tools/software patterns autonomously and turns repeated behavior into reusable automation.
+
+**Requested feature plan additions:**
+- Skill Learner: `"Nova, learn Figma"` -> crawl docs -> generate control plugin scaffold (for example `figma_control.py`) with human approval gate.
+- API Autodiscovery: `"Nova, use IRCTC API"` -> discover docs/endpoints -> generate client plugin quickly.
+- Game Bot Generator: `"Nova, play 2048"` -> vision board reading + strategy plugin loop.
+- App Reverse Engineer: `"Nova, learn this app"` -> infer repeatable UI workflows from observed sessions and propose control plugin.
+- Pattern Shortcut Compiler: weekly job (Sunday 11:00 PM) mines repeated action sequences and compiles one-command shortcuts.
+- Live Data Feed Builder: `"Nova, live cricket scores"` -> discover data source -> generate polling job (for example every 5 minutes) + announcement hooks.
+- Smart Home Discoverer: boot-time LAN scan + device fingerprinting + generated home-control plugins.
+- Batch Plugin Factory: queue many API/plugin generation jobs and process overnight with progress tracking.
+- Failure Recovery Writer: when same step fails twice, analyze failure context and propose targeted fix plugin.
+- Context-Aware Mode Writer: detect context (meeting/streaming/coding) and propose mode plugins with tailored behavior.
+
+**Implementation kickoff (completed in this update):**
+- Added `tasks/pattern_shortcuts.py` compiler to mine repeated successful tool sequences from `logs/guardrails_actions.jsonl`.
+- Added compiled shortcut store at `.jarvis/pattern_shortcuts.json`.
+- Added dispatcher tools:
+  - `shortcut.compile`
+  - `shortcut.list`
+  - `shortcut.run`
+- Added CLI text shortcuts:
+  - `/shortcut list`
+  - `/shortcut compile`
+  - `/shortcut run <name>`
+- Added scheduler job: every Sunday at 11:00 PM (`pattern_shortcuts_weekly`) to auto-compile shortcuts.
+- Added `tasks/automation_factory.py` self-learning manager with initial implementations for:
+  - Skill learning (`learn.skill`)
+  - API autodiscovery (`learn.api`)
+  - Game bot scaffold (`learn.game_bot`)
+  - App reverse-engineer scaffold (`learn.app`)
+  - Live feed builder + mission scheduling (`live.feed`)
+  - Smart home LAN discovery + plugin stubs (`home.discover`)
+  - Batch API plugin queue (`batch.api_plugins`, `batch.status`)
+  - Failure recovery writer trigger (`recovery.write`)
+  - Context-aware mode writer (`mode.write`)
+- Added natural command triggers:
+  - `Nova, learn <software>`
+  - `Nova, use <api> API`
+  - `Nova, play <game>`
+  - `Nova, live <topic>`
+  - `support these <api1, api2, ...> APIs`
+  - `/batch api ...`, `/batch status`, `/recover ...`, `/mode ...`
+- Added deterministic scaffold file writers for:
+  - `plugins/<skill>_control.py` (for example `plugins/figma_control.py`)
+  - `plugins/<api>_api_client.py`
+  - `plugins/<game>_bot.py`
+  - `plugins/<app>_control.py`
+  - `plugins/<topic>_live_feed.py`
+  - `plugins/recovery_<step>.py`
+  - `plugins/mode_<context>.py`
+
+**Testable milestone:** run `/shortcut compile` -> `/shortcut list` shows generated sequences -> `/shortcut run <name>` replays the learned sequence.
+
+---
+
 ## Complete Build Order
 
 ```
@@ -897,6 +954,7 @@ Phase 10 →  Master MCP + Master API + Plugin Architecture
 Phase 11 →  Full Safety Layer (replace dispatcher safety stub with guardrails.py)
 Phase 12 →  Offline Polish + Memory Sync + Health Monitor
 Phase 13 →  Cross-OS Abstraction + Full Test Suite + One-command Installer
+Phase 14 →  Self-Learning Automation Expansion (skill learning, API autodiscovery, game/app automation, pattern shortcuts)
 ```
 
 ---
