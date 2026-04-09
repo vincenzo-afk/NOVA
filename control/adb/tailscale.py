@@ -71,7 +71,7 @@ def tailscale_ip_v4() -> str:
     if not is_tailscale_installed():
         return ""
     try:
-        output = subprocess.check_output(["tailscale", "ip", "-4"], text=True).strip().splitlines()
+        output = subprocess.check_output(["tailscale", "ip", "-4"], text=True, timeout=10).strip().splitlines()
         return output[0].strip() if output else ""
     except Exception:
         return ""

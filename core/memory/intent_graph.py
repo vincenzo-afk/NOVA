@@ -78,6 +78,7 @@ class IntentGraph:
         if self.privacy_mode:
             return
         try:
+            import tempfile
             self._path.parent.mkdir(parents=True, exist_ok=True)
             # Prune to top edges so file stays small
             all_edges: list[tuple[str, str, int]] = []
@@ -89,7 +90,18 @@ class IntentGraph:
             for src, dst, cnt in all_edges[:_MAX_EDGES]:
                 pruned[src][dst] = cnt
             payload = {"adj": pruned, "last_seen": self._last_seen}
-            self._path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            content = json.dumps(payload, indent=2)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(self._path.parent),
+                delete=False,
+                suffix=".tmp",
+            ) as tmp:
+                tmp.write(content)
+                tmp.flush()
+                tmp_path = Path(tmp.name)
+            tmp_path.replace(self._path)
         except Exception:
             pass
 

@@ -116,10 +116,10 @@ def _scrub_args(args: Any) -> Any:
 def _scrub_result(result: Any) -> Any:
     """Truncate and scrub sensitive data from tool results (Sec 2)."""
     if isinstance(result, str):
-        if len(result) > 500:
-            result = result[:500] + "... [truncated]"
         import re
         result = re.sub(r"(?i)(key|password|secret|token)[\s=:]+['\"]?[\w\-]{16,}['\"]?", r"\1=***REDACTED***", result)
+        if len(result) > 500:
+            result = result[:500] + "... [truncated]"
         return result
     if isinstance(result, dict):
         return {k: _scrub_result(v) for k, v in result.items()}

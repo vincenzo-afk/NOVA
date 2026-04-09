@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import time
 from typing import Any
+from core.think.reasoning import detect_prompt_injection
 
 
 @dataclass
@@ -155,14 +156,16 @@ class Mem0Client:
         normalized = []
         for item in items:
             if isinstance(item, str):
-                normalized.append({"text": item, "metadata": {}, "score": 0.0})
+                safe_text = "[filtered] injection detected" if detect_prompt_injection(item) else item
+                normalized.append({"text": safe_text, "metadata": {}, "score": 0.0})
                 continue
             if not isinstance(item, dict):
                 continue
             text = item.get("text") or item.get("memory") or item.get("content") or ""
+            safe_text = "[filtered] injection detected" if detect_prompt_injection(str(text)) else text
             meta = item.get("metadata") or item.get("meta") or {}
             score = item.get("score") or item.get("similarity") or 0.0
-            normalized.append({"text": text, "metadata": meta, "score": score})
+            normalized.append({"text": safe_text, "metadata": meta, "score": score})
         return normalized
 
     def _normalize_list(self, raw: Any) -> list[dict]:

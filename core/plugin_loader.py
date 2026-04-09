@@ -60,7 +60,7 @@ def _check_ast(source: str):
         "__class__", "__mro__", "__subclasses__", "__globals__", "__builtins__",
         "__bases__", "__code__", "__func__", "__closure__", "__dict__", "__module__", "__getattribute__",
         "eval", "exec", "compile", "getattr", "setattr", "delattr",
-        "vars", "locals", "globals", "dir", "hasattr", "__import__",
+        "vars", "locals", "globals", "dir", "hasattr", "__import__", "open",
     }
     restricted_builtin_keys = {
         "eval", "exec", "compile", "__import__", "open", "getattr", "setattr", "delattr",

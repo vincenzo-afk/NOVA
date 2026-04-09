@@ -19,6 +19,7 @@ class QRPairing:
     def local_ip(self) -> str:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
+            sock.settimeout(3.0)
             sock.connect(("8.8.8.8", 80))
             return sock.getsockname()[0]
         finally:

@@ -64,13 +64,24 @@ def transcribe(audio_bytes: bytes, lang: str = "en") -> str:
 
     for api_key in _iter_api_keys():
         try:
-            response = requests.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-2.0-flash:generateContent?key={api_key}",
-                headers={"Content-Type": "application/json"},
-                data=json.dumps(body),
-                timeout=45,
-            )
+            response = None
+            for _attempt in range(2):
+                response = requests.post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"gemini-2.0-flash:generateContent?key={api_key}",
+                    headers={"Content-Type": "application/json"},
+                    data=json.dumps(body),
+                    timeout=45,
+                )
+                if response.ok:
+                    break
+                if response.status_code >= 500:
+                    import time as _t
+                    _t.sleep(0.5 * (_attempt + 1))
+                    continue
+                break
+            if response is None:
+                continue
             if not response.ok:
                 continue
             text = _extract_text(response.json())
