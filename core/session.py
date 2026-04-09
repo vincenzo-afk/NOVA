@@ -118,6 +118,10 @@ class SessionManager:
                     time.sleep(0.1)
                     tmp_path.replace(path)
             try:
+                path.chmod(0o600)
+            except Exception:
+                pass
+            try:
                 # Bug 4 fix: only remove the backup AFTER confirming the new file was
                 # written successfully. If the write failed (disk full, permissions, etc.)
                 # the .bak is our only copy — never delete it unconditionally.

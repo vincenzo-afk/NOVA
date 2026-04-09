@@ -1795,7 +1795,7 @@ class NOVAApp:
             except Exception:
                 pass
             is_local = parsed_host in {"localhost", "127.0.0.1", "::1"}
-            if key and parsed_scheme == "http":
+            if parsed_scheme == "http":
                 resolved_private = False
                 try:
                     resolved_addrs = list({addr for addr in _resolve_host_with_timeout(parsed_host, timeout_seconds=5.0)})
@@ -1822,14 +1822,14 @@ class NOVAApp:
                     return {
                         "status": "error",
                         "reason": (
-                            "Refusing to inject Authorization header over plain HTTP. "
-                            "Use an HTTPS endpoint or a local/private address."
+                            "SSRF: plain HTTP to public IP blocked. "
+                            "Use HTTPS or a local/private address."
                         ),
                     }
             merged_headers = dict(headers or {})
             endpoint_to_connect = endpoint
             # Pin plain-HTTP auth connections to the resolved IP to prevent DNS rebinding.
-            if key and parsed_scheme == "http" and resolved_addrs and parsed_host:
+            if parsed_scheme == "http" and resolved_addrs and parsed_host:
                 try:
                     from urllib.parse import urlparse, urlunparse
 
@@ -4074,7 +4074,7 @@ class NOVAApp:
         # ── Tier 2: Intent Graph update ───────────────────────────────────────
         if hasattr(self, '_intent_graph') and self._intent_graph:
             try:
-                self._intent_graph.ingest_turn(user_text)
+                self._memory_executor.submit(self._intent_graph.ingest_turn, user_text)
             except Exception:
                 pass
 

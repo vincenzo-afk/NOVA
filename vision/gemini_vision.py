@@ -92,13 +92,23 @@ def analyze_image(image_bytes: bytes) -> dict:
         if not api_key:
             continue
         try:
-            response = requests.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-2.0-flash:generateContent?key={api_key}",
-                headers={"Content-Type": "application/json"},
-                data=json.dumps(request_data),
-                timeout=30,
-            )
+            response = None
+            for _attempt in range(3):
+                response = requests.post(
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"gemini-2.0-flash:generateContent?key={api_key}",
+                    headers={"Content-Type": "application/json"},
+                    data=json.dumps(request_data),
+                    timeout=30,
+                )
+                if response.ok:
+                    break
+                if response.status_code < 500:
+                    break
+                import time as _t
+                _t.sleep(0.5 * (2 ** _attempt))
+            if response is None:
+                continue
             if not response.ok:
                 continue
             payload = response.json()

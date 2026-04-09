@@ -14,6 +14,7 @@ _SENSITIVE_PATTERNS = [
     (re.compile(r'"secret"\s*:\s*"[^"\\]*(?:\\.[^"\\]*)*"', re.IGNORECASE | re.DOTALL), '"secret": "***REDACTED***"'),
     (re.compile(r'"access_key"\s*:\s*"[^"\\]*(?:\\.[^"\\]*)*"', re.IGNORECASE | re.DOTALL), '"access_key": "***REDACTED***"'),
     (re.compile(r'"auth_token"\s*:\s*"[^"\\]*(?:\\.[^"\\]*)*"', re.IGNORECASE | re.DOTALL), '"auth_token": "***REDACTED***"'),
+    (re.compile(r'[?&](api[_-]?key|token|password|secret)[=][^\s&"\\\']+', re.IGNORECASE), r'\1=***REDACTED***'),
 ]
 
 

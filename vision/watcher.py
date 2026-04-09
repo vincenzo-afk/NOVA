@@ -68,8 +68,12 @@ class ScreenWatcher:
         while not self._stop.is_set():
             try:
                 self._tick()
-            except Exception:
-                pass
+            except Exception as exc:
+                try:
+                    from utils.logger import get_logger
+                    get_logger(__name__).warning("ScreenWatcher tick failed: %s", exc)
+                except Exception:
+                    pass
             time.sleep(self.interval_seconds)
 
     def _tick(self) -> None:

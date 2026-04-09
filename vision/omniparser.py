@@ -37,7 +37,7 @@ class OmniParserClient:
         response = requests.post(
             f"{self.base_url}/parse/",
             json={"base64_image": encoded},
-            timeout=30,
+            timeout=60,
             headers=headers,
         )
         response.raise_for_status()

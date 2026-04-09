@@ -28,7 +28,7 @@ class ADBClient:
             base.extend(["-s", self.device])
         base.extend(parts)
         with self._lock:
-            return subprocess.check_output(base, text=True).strip()  # nosec B603
+            return subprocess.check_output(base, text=True, timeout=30).strip()  # nosec B603
 
     def connect(self, host: str, port: int = 5555) -> str:
         return self._cmd("connect", f"{host}:{port}")
@@ -66,7 +66,7 @@ class ADBClient:
     def type_text(self, text: str) -> str:
         # Use ADB's own escaping for shell-sensitive characters.
         safe = text.replace("\n", " ").replace("\r", " ")
-        for ch in ("\\", "&", "|", ";", "<", ">", "(", ")", "$", "`", "\"", "'"):
+        for ch in ("\\", "&", "|", ";", "<", ">", "(", ")", "$", "`", "\"", "'", "!", "{", "}"):
             safe = safe.replace(ch, f"\\{ch}")
         safe = safe.replace(" ", "%s")
         return self.shell("input", "text", safe)
