@@ -58,8 +58,12 @@ def _check_ast(source: str):
     tree = ast.parse(source)
     restricted = {
         "__class__", "__mro__", "__subclasses__", "__globals__", "__builtins__",
+        "__bases__", "__code__", "__func__", "__closure__", "__dict__", "__module__", "__getattribute__",
         "eval", "exec", "compile", "getattr", "setattr", "delattr",
         "vars", "locals", "globals", "dir", "hasattr", "__import__",
+    }
+    restricted_builtin_keys = {
+        "eval", "exec", "compile", "__import__", "open", "getattr", "setattr", "delattr",
     }
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in restricted:
@@ -76,6 +80,13 @@ def _check_ast(source: str):
             and node.args[1].value in restricted
         ):
             raise ValueError(f"Restricted getattr target used: {node.args[1].value}")
+        if isinstance(node, ast.Subscript):
+            target_name = node.value.id if isinstance(node.value, ast.Name) else ""
+            if target_name == "__builtins__":
+                key_node = node.slice
+                if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+                    if key_node.value in restricted_builtin_keys:
+                        raise ValueError(f"Restricted __builtins__ key access: {key_node.value}")
 
 
 def load_plugins(dispatcher, plugin_dir: str = "plugins") -> list[str]:

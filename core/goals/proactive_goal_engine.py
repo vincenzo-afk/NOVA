@@ -161,7 +161,12 @@ class ProactiveGoalEngine:
         with self._lock:
             remaining: list[dict] = []
             for g in self._proposed:
-                age = now - g.get("proposed_at", now)
+                proposed_at = g.get("proposed_at")
+                if not isinstance(proposed_at, (int, float)):
+                    # Malformed item: reset age anchor so it can still progress instead of stalling forever.
+                    proposed_at = now
+                    g["proposed_at"] = proposed_at
+                age = now - proposed_at
                 if age < _GRACE_PERIOD_SECONDS:
                     remaining.append(g)
                     continue

@@ -191,6 +191,18 @@ class Dispatcher:
         # Default auth for bypass scenarios
         from safety.guardrails import RiskResult
         auth = RiskResult(blocked=False, reason="guard_bypass", score=0, level="low", plan="")
+        if _skip_guardrails:
+            # Keep risk scoring for audit trail integrity even when execution bypasses confirmation.
+            risk = guardrails.check(tool_call)
+            auth = RiskResult(
+                blocked=False,
+                reason="guard_bypass",
+                score=risk.score,
+                level=risk.level,
+                plan=risk.plan,
+                requires_confirmation=risk.requires_confirmation,
+                auto_confirm_seconds=risk.auto_confirm_seconds,
+            )
 
         if not _skip_guardrails:
             risk = guardrails.check(tool_call)
