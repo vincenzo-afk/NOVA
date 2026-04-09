@@ -95,7 +95,10 @@ from core.a2a.role_manager import assign_role
 from core.a2a.conflict_resolver import ConflictResolver
 from tasks.maintenance import MaintenanceOrchestrator
 from tasks.missions import MissionManager
+from tasks.pattern_shortcuts import PatternShortcutCompiler
+from tasks.automation_factory import AutomationFactory
 from voice.ambient_listener import AmbientListener, AmbientEvent
+from vision.gemini_vision import analyze_image as gemini_analyze_image
 
 
 class WebSearchArgs(BaseModel):
@@ -362,6 +365,45 @@ class MissionToggleArgs(BaseModel):
 
 class MissionRunArgs(BaseModel):
     name: str
+
+
+class ShortcutRunArgs(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128)
+    dry_run: bool = False
+
+
+class LearnSkillArgs(BaseModel):
+    skill_name: str = Field(..., min_length=2, max_length=120)
+
+
+class ApiAutodiscoveryArgs(BaseModel):
+    api_name: str = Field(..., min_length=2, max_length=200)
+
+
+class GameBotArgs(BaseModel):
+    game_name: str = Field(..., min_length=2, max_length=120)
+
+
+class LearnAppArgs(BaseModel):
+    app_name: str = Field(..., min_length=2, max_length=120)
+
+
+class LiveFeedArgs(BaseModel):
+    topic: str = Field(..., min_length=2, max_length=160)
+    interval_minutes: int = Field(default=5, ge=1, le=120)
+
+
+class BatchApiArgs(BaseModel):
+    api_names: list[str] = Field(default_factory=list)
+
+
+class FailureRecoveryArgs(BaseModel):
+    step_key: str = Field(..., min_length=1, max_length=200)
+    screenshot_path: str = ""
+
+
+class ContextModeArgs(BaseModel):
+    context_label: str = Field(..., min_length=2, max_length=120)
 
 
 class A2ASendArgs(BaseModel):
@@ -678,6 +720,16 @@ class NOVAApp:
             scheduler=self.scheduler,
             enqueue_goal_fn=lambda goal_text: self._add_goal(goal_text, max_steps=settings.AUTONOMY_MAX_STEPS),
         )
+        self._shortcut_compiler = PatternShortcutCompiler()
+        self._automation_factory = AutomationFactory(
+            plugin_generate_fn=lambda prompt: self._plugin_generator.generate_and_propose(prompt)
+            if hasattr(self, "_plugin_generator")
+            else {"status": "error", "reason": "plugin_generator_unavailable"},
+            schedule_every_fn=lambda name, schedule, goal: self._mission_add(name, schedule, goal, True),
+            notify_tts_fn=self._notify_tts,
+            vision_analyze_fn=gemini_analyze_image,
+            record_event_fn=self.record_event,
+        )
         self._ensure_default_missions()
         self.base_system_prompt = DEFAULT_SYSTEM_PROMPT
         self._register_builtin_tools()
@@ -857,6 +909,11 @@ class NOVAApp:
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Watcher startup failed: %s", exc)
+        try:
+            if bool(getattr(settings, "SMART_HOME_DISCOVER_ON_BOOT", True)):
+                self._home_discover()
+        except Exception:
+            pass
         try:
             self._start_autonomy_loop()
         except Exception as exc:
@@ -2037,6 +2094,21 @@ class NOVAApp:
         except Exception as e:
             _log_pi.warning("[proactive] insight job register failed: %s", e)
 
+        # Feature kickoff: weekly shortcut compiler (Sunday 11:00 PM local time)
+        def _shortcut_compile_job() -> None:
+            try:
+                self._compile_weekly_shortcuts()
+            except Exception:
+                pass
+        try:
+            self.scheduler.add_from_text(
+                fn=_shortcut_compile_job,
+                schedule_text="every sunday at 11:00 pm",
+                job_id="pattern_shortcuts_weekly",
+            )
+        except Exception as e:
+            _log_pi.warning("[proactive] weekly shortcut compiler register failed: %s", e)
+
         # Tier 5: Network context detect at 5-min intervals
         # (NetworkContextDetector runs its own thread; no extra scheduler job needed)
 
@@ -2450,6 +2522,10 @@ class NOVAApp:
             self._peer_registry.close()
         except Exception:
             pass
+        try:
+            self._automation_factory.stop()
+        except Exception:
+            pass
         if getattr(self, "scheduler", None):
             self.scheduler.stop()
         try:
@@ -2776,6 +2852,84 @@ class NOVAApp:
         self.dispatcher.register("mission.enable", self._mission_enable, MissionToggleArgs)
         self.dispatcher.register("mission.disable", self._mission_disable, MissionToggleArgs)
         self.dispatcher.register("mission.run_now", self._mission_run_now, MissionRunArgs)
+        self.dispatcher.register(
+            "shortcut.compile",
+            lambda: self._compile_weekly_shortcuts(),
+            EmptyArgs,
+            description="Compile repeated tool usage patterns into reusable shortcuts.",
+        )
+        self.dispatcher.register(
+            "shortcut.list",
+            self._shortcut_list,
+            EmptyArgs,
+            description="List compiled automatic shortcuts generated from repeated usage patterns.",
+        )
+        self.dispatcher.register(
+            "shortcut.run",
+            self._shortcut_run,
+            ShortcutRunArgs,
+            description="Run a compiled shortcut sequence by name.",
+        )
+        self.dispatcher.register(
+            "learn.skill",
+            self._learn_skill,
+            LearnSkillArgs,
+            description="Learn software docs and propose a control plugin scaffold.",
+        )
+        self.dispatcher.register(
+            "learn.api",
+            self._learn_api,
+            ApiAutodiscoveryArgs,
+            description="Autodiscover API docs and propose a client plugin scaffold.",
+        )
+        self.dispatcher.register(
+            "learn.game_bot",
+            self._learn_game_bot,
+            GameBotArgs,
+            description="Generate a game-bot strategy plugin scaffold.",
+        )
+        self.dispatcher.register(
+            "learn.app",
+            self._learn_app,
+            LearnAppArgs,
+            description="Generate an app-control plugin scaffold for a target app.",
+        )
+        self.dispatcher.register(
+            "live.feed",
+            self._live_feed_builder,
+            LiveFeedArgs,
+            description="Build a live data feed plugin and schedule periodic polling.",
+        )
+        self.dispatcher.register(
+            "home.discover",
+            self._home_discover,
+            EmptyArgs,
+            description="Scan LAN devices and write smart-home plugin stubs.",
+        )
+        self.dispatcher.register(
+            "batch.api_plugins",
+            self._batch_api_plugins,
+            BatchApiArgs,
+            description="Queue many API plugin-generation jobs for batch execution.",
+        )
+        self.dispatcher.register(
+            "batch.status",
+            self._batch_status,
+            EmptyArgs,
+            description="Show queued/running/done state for batch plugin jobs.",
+        )
+        self.dispatcher.register(
+            "recovery.write",
+            self._failure_recovery_write,
+            FailureRecoveryArgs,
+            description="Generate targeted recovery plugin after repeated failures.",
+        )
+        self.dispatcher.register(
+            "mode.write",
+            self._context_mode_write,
+            ContextModeArgs,
+            description="Generate a context-aware mode plugin for a situation label.",
+        )
         self.dispatcher.register("model.list", list_ollama_models, EmptyArgs)
         self.dispatcher.register("goal.run", self._run_goal, GoalRunArgs)
         self.dispatcher.register("goal.add", self._add_goal, GoalAddArgs)
@@ -2962,6 +3116,49 @@ class NOVAApp:
 
     def _mission_run_now(self, name: str) -> dict:
         return self._mission_manager.run_mission_now(name)
+
+    def _compile_weekly_shortcuts(self) -> dict:
+        result = self._shortcut_compiler.compile(lookback_days=7, min_repeats=3, max_sequence_len=3, top_k=10)
+        count = len(result.get("shortcuts", []))
+        self.record_event("shortcut", f"Compiled {count} shortcuts from weekly action history.")
+        return {"status": "ok", "compiled_count": count, "shortcuts": result.get("shortcuts", [])}
+
+    def _shortcut_list(self) -> dict:
+        rows = self._shortcut_compiler.list_shortcuts()
+        return {"shortcuts": rows, "count": len(rows)}
+
+    def _shortcut_run(self, name: str, dry_run: bool = False) -> dict:
+        return self._shortcut_compiler.run_shortcut(name=name, dispatcher=self.dispatcher, dry_run=dry_run)
+
+    def _learn_skill(self, skill_name: str) -> dict:
+        return self._automation_factory.learn_skill(skill_name)
+
+    def _learn_api(self, api_name: str) -> dict:
+        return self._automation_factory.api_autodiscovery(api_name)
+
+    def _learn_game_bot(self, game_name: str) -> dict:
+        return self._automation_factory.game_bot_generator(game_name)
+
+    def _learn_app(self, app_name: str) -> dict:
+        return self._automation_factory.app_reverse_engineer(app_name)
+
+    def _live_feed_builder(self, topic: str, interval_minutes: int = 5) -> dict:
+        return self._automation_factory.live_data_feed_builder(topic, interval_minutes=interval_minutes)
+
+    def _home_discover(self) -> dict:
+        return self._automation_factory.smart_home_discoverer()
+
+    def _batch_api_plugins(self, api_names: list[str]) -> dict:
+        return self._automation_factory.enqueue_batch_api_plugins(api_names)
+
+    def _batch_status(self) -> dict:
+        return self._automation_factory.batch_status()
+
+    def _failure_recovery_write(self, step_key: str, screenshot_path: str = "") -> dict:
+        return self._automation_factory.record_failure_and_recover(step_key=step_key, screenshot_path=screenshot_path)
+
+    def _context_mode_write(self, context_label: str) -> dict:
+        return self._automation_factory.context_mode_writer(context_label)
 
     def _a2a_role(self) -> dict:
         tools = list(self.dispatcher.registry.keys()) if hasattr(self.dispatcher, "registry") else []
@@ -3402,6 +3599,66 @@ class NOVAApp:
                     return "Usage: /mission add <name> | <schedule> | <goal>"
                 return str(self._mission_add(parts[0], parts[1], parts[2], True))
             return "Usage: /mission list|enable <name>|disable <name>|run <name>|add ..."
+        if text.startswith("/shortcut "):
+            cmd_body = user_text.strip()[len("/shortcut ") :].strip()
+            if cmd_body.lower() == "list":
+                return json.dumps(self._shortcut_list(), ensure_ascii=False, indent=2)
+            if cmd_body.lower() == "compile":
+                return json.dumps(self._compile_weekly_shortcuts(), ensure_ascii=False, indent=2)
+            if cmd_body.lower().startswith("run "):
+                name = cmd_body.split(" ", 1)[1].strip()
+                if not name:
+                    return "Usage: /shortcut run <name>"
+                return json.dumps(self._shortcut_run(name=name, dry_run=False), ensure_ascii=False, indent=2)
+            return "Usage: /shortcut list|compile|run <name>"
+        if text.startswith("nova, learn ") or text.startswith("nova learn "):
+            name = user_text.split("learn", 1)[1].strip()
+            if not name:
+                return "Usage: Nova, learn <software>"
+            return json.dumps(self._learn_skill(name), ensure_ascii=False, indent=2)
+        if text.startswith("nova, use ") and " api" in text:
+            raw = user_text.split("use", 1)[1].strip()
+            api_name = re.sub(r"\s+api\s*$", "", raw, flags=re.IGNORECASE).strip() or raw
+            return json.dumps(self._learn_api(api_name), ensure_ascii=False, indent=2)
+        if text.startswith("nova, play ") or text.startswith("nova play "):
+            game = user_text.split("play", 1)[1].strip()
+            if not game:
+                return "Usage: Nova, play <game>"
+            return json.dumps(self._learn_game_bot(game), ensure_ascii=False, indent=2)
+        if text.startswith("nova, learn this app") or text.startswith("nova learn this app"):
+            return json.dumps(self._learn_app("current_app"), ensure_ascii=False, indent=2)
+        if text.startswith("nova, live ") or text.startswith("nova live "):
+            topic = user_text.split("live", 1)[1].strip()
+            if not topic:
+                return "Usage: Nova, live <topic>"
+            return json.dumps(self._live_feed_builder(topic=topic, interval_minutes=5), ensure_ascii=False, indent=2)
+        if text == "nova, discover home" or text == "nova discover home":
+            return json.dumps(self._home_discover(), ensure_ascii=False, indent=2)
+        if text.startswith("support these ") and "api" in text:
+            raw = user_text.strip()[len("support these ") :].strip()
+            raw = re.sub(r"\bapis?\b", "", raw, flags=re.IGNORECASE).strip()
+            names = [p.strip() for p in raw.split(",") if p.strip()]
+            if not names:
+                return "Usage: support these <api1, api2, ...> APIs"
+            return json.dumps(self._batch_api_plugins(names), ensure_ascii=False, indent=2)
+        if text.startswith("/batch api "):
+            raw = user_text.strip()[len("/batch api ") :].strip()
+            names = [p.strip() for p in raw.split(",") if p.strip()]
+            if not names:
+                return "Usage: /batch api <api1, api2, ...>"
+            return json.dumps(self._batch_api_plugins(names), ensure_ascii=False, indent=2)
+        if text == "/batch status":
+            return json.dumps(self._batch_status(), ensure_ascii=False, indent=2)
+        if text.startswith("/recover "):
+            step = user_text.strip()[len("/recover ") :].strip()
+            if not step:
+                return "Usage: /recover <step_key>"
+            return json.dumps(self._failure_recovery_write(step_key=step, screenshot_path=""), ensure_ascii=False, indent=2)
+        if text.startswith("/mode "):
+            ctx = user_text.strip()[len("/mode ") :].strip()
+            if not ctx:
+                return "Usage: /mode <context_label>"
+            return json.dumps(self._context_mode_write(context_label=ctx), ensure_ascii=False, indent=2)
         if text.startswith("/a2a "):
             cmd_body = user_text.strip()[len("/a2a ") :].strip()
             if cmd_body.lower() == "peers":
@@ -3614,6 +3871,15 @@ class NOVAApp:
                         confirm_callback=self._interactive_confirm,
                         dry_run=dry_run_tools,
                     )
+                    try:
+                        status = str(result.get("status", "")).lower() if isinstance(result, dict) else ""
+                        if status in {"blocked", "cancelled", "error", "rate_limited", "partial"}:
+                            self._automation_factory.record_failure_and_recover(
+                                step_key=tool_call.tool,
+                                screenshot_path="assets/screen.png",
+                            )
+                    except Exception:
+                        pass
                     try:
                         serialized_result = json.dumps(result, ensure_ascii=False)
                     except TypeError:
