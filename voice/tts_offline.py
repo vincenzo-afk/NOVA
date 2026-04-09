@@ -107,9 +107,12 @@ def speak(text: str, stop_event: threading.Event | None = None) -> None:
                         pass
             break
         if (time.monotonic() - started) > 15.0:
-                    _ENGINE.stop()
-            except Exception:
-                pass
+            with _WORKER_LOCK:
+                if _ENGINE is not None:
+                    try:
+                        _ENGINE.stop()
+                    except Exception:
+                        pass
             break
         time.sleep(0.05)
 
