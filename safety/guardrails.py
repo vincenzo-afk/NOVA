@@ -46,22 +46,21 @@ _SENSITIVE_ARG_KEYS = {
     "private_key", "auth_token", "bearer_token", "api_secret",
 }
 
-def _emergency_stop_paths(cwd: Path | None = None) -> tuple[Path, Path]:
+def _emergency_stop_paths(base_path: Path | None = None) -> tuple[Path, Path]:
     configured = (settings.EMERGENCY_STOP_FILE or ".jarvis/emergency_stop").strip()
     primary = Path(configured).expanduser()
-    base_cwd = (cwd or Path.cwd()).resolve()
+    base_cwd = (base_path or Path.cwd()).resolve()
     if not primary.is_absolute():
         primary = (base_cwd / primary).resolve()
     home = Path.home().resolve()
+    # Ensure the path is within a reasonable boundary (home or CWD)
     if not str(primary).startswith(str(home)) and not str(primary).startswith(str(base_cwd)):
         primary = (base_cwd / ".jarvis" / "emergency_stop").resolve()
     fallback = (base_cwd / ".jarvis" / "emergency_stop").resolve()
     return primary, fallback
 
-
-# Backward-compatible module-level aliases for tests/patching.
-_EMERGENCY_STOP_FILE: Path | None = None
-_EMERGENCY_STOP_FILE_FALLBACK: Path | None = None
+# Initialize with current CWD, but Guardrails calls this again during __init__.
+_EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths()
 _EMERGENCY_STOP_INIT_LOCK = threading.Lock()
 
 
@@ -98,17 +97,19 @@ class ActionLogEntry:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _scrub_args(args: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of args with sensitive values masked (fix 1.1)."""
-    scrubbed: dict[str, Any] = {}
-    for key, value in args.items():
-        if key.lower() in _SENSITIVE_ARG_KEYS:
-            scrubbed[key] = "***REDACTED***"
-        elif isinstance(value, dict):
-            scrubbed[key] = _scrub_args(value)
-        else:
-            scrubbed[key] = value
-    return scrubbed
+def _scrub_args(args: Any) -> Any:
+    """Recursively redact sensitive values from tool arguments (fix 31)."""
+    if isinstance(args, dict):
+        out = {}
+        for k, v in args.items():
+            if str(k).lower() in _SENSITIVE_ARG_KEYS:
+                out[k] = "***REDACTED***"
+            else:
+                out[k] = _scrub_args(v)
+        return out
+    if isinstance(args, list):
+        return [_scrub_args(item) for item in args]
+    return args
 
 def _scrub_result(result: Any) -> Any:
     """Truncate and scrub sensitive data from tool results (Sec 2)."""
@@ -148,8 +149,9 @@ class Guardrails:
         self._emergency_stop = threading.Event()
         global _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK
         with _EMERGENCY_STOP_INIT_LOCK:
-            if _EMERGENCY_STOP_FILE is None or _EMERGENCY_STOP_FILE_FALLBACK is None:
-                _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths(self._cwd_at_init)
+            # Re-initialize paths using the CWD at time of Guardrails creation
+            # to handle cases where the module was imported before a chdir (fix 6).
+            _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths(self._cwd_at_init)
         primary, fallback = self._resolve_emergency_stop_files()
         if primary.exists() or fallback.exists():
             self._emergency_stop.set()

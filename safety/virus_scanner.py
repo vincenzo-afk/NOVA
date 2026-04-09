@@ -15,9 +15,10 @@ import requests
 
 
 class VirusScanner:
-    def __init__(self, api_key: str = "", timeout_seconds: int = 15):
+    def __init__(self, api_key: str = "", timeout_seconds: int = 15, max_scan_bytes: int = 50 * 1024 * 1024):
         self.api_key = (api_key or "").strip()
         self.timeout_seconds = max(3, int(timeout_seconds))
+        self.max_scan_bytes = max(1, int(max_scan_bytes))
 
     def scan_text_buffer(self, text: str, filename: str = "buffer.txt") -> dict[str, Any]:
         data = (text or "").encode("utf-8", errors="ignore")
@@ -36,6 +37,16 @@ class VirusScanner:
         target = Path(path).expanduser().resolve(strict=False)
         if not target.exists() or not target.is_file():
             return {"status": "error", "reason": "file_not_found", "path": str(target)}
+        try:
+            if target.stat().st_size > self.max_scan_bytes:
+                return {
+                    "status": "error",
+                    "reason": "file_too_large",
+                    "path": str(target),
+                    "max_scan_bytes": self.max_scan_bytes,
+                }
+        except Exception:
+            pass
 
         try:
             data = target.read_bytes()
@@ -164,7 +175,7 @@ class VirusScanner:
 
         # First: hash lookup to avoid upload if report exists.
         try:
-            report = requests.get(file_url, headers=headers, timeout=self.timeout_seconds)
+            report = self._http_request("get", file_url, headers=headers)
             if report.status_code == 200:
                 return self._parse_vt_file_report(report.json(), sha256)
         except Exception:
@@ -173,11 +184,11 @@ class VirusScanner:
         # Upload when hash not found.
         try:
             with path.open("rb") as fh:
-                up = requests.post(
+                up = self._http_request(
+                    "post",
                     f"{base}/files",
                     headers=headers,
                     files={"file": (path.name, fh)},
-                    timeout=self.timeout_seconds,
                 )
             if up.status_code >= 300:
                 return {
@@ -210,7 +221,7 @@ class VirusScanner:
         # Poll analysis completion briefly.
         for _ in range(8):
             try:
-                poll = requests.get(f"{base}/analyses/{analysis_id}", headers=headers, timeout=self.timeout_seconds)
+                poll = self._http_request("get", f"{base}/analyses/{analysis_id}", headers=headers)
                 if poll.status_code != 200:
                     time.sleep(1.2)
                     continue
@@ -221,7 +232,7 @@ class VirusScanner:
                     time.sleep(1.2)
                     continue
                 # Analysis finished: fetch file report by hash.
-                final_report = requests.get(file_url, headers=headers, timeout=self.timeout_seconds)
+                final_report = self._http_request("get", file_url, headers=headers)
                 if final_report.status_code == 200:
                     return self._parse_vt_file_report(final_report.json(), sha256)
                 break
@@ -235,6 +246,18 @@ class VirusScanner:
             "permalink": f"https://www.virustotal.com/gui/file/{sha256}",
             "note": "VirusTotal analysis pending",
         }
+
+    def _http_request(self, method: str, url: str, **kwargs):
+        last_exc = None
+        for i in range(3):
+            try:
+                return requests.request(method, url, timeout=self.timeout_seconds, **kwargs)
+            except requests.RequestException as exc:
+                last_exc = exc
+                time.sleep(0.4 * (2 ** i))
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("http_request_failed")
 
     @staticmethod
     def _parse_vt_file_report(report: dict[str, Any], sha256: str) -> dict[str, Any]:
@@ -257,4 +280,3 @@ class VirusScanner:
 
 def scan_file(path: str, api_key: str = "") -> dict[str, Any]:
     return VirusScanner(api_key=api_key).scan_file(path)
-

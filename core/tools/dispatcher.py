@@ -54,7 +54,7 @@ class Dispatcher:
         # Fix Perf 3 & Bug 10: Token bucket for rate limiting tool executions with Lock
         self._max_tokens = max(0, int(rate_limit_rpm))
         self._tokens = float(self._max_tokens)
-        self._last_refill = time.time()
+        self._last_refill = time.monotonic()
         self._refill_rate = self._max_tokens / 60.0 if self._max_tokens > 0 else 0.0
         self._token_lock = threading.RLock()
 
@@ -64,8 +64,10 @@ class Dispatcher:
             return  # No limit configured
             
         with self._token_lock:
-            now = time.time()
+            now = time.monotonic()
             elapsed = now - self._last_refill
+            if elapsed < 0:
+                elapsed = 0
             self._tokens = min(self._max_tokens, self._tokens + elapsed * self._refill_rate)
             self._last_refill = now
 

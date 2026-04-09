@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shlex
 from pathlib import Path
+import re
 import subprocess
 import threading
 
@@ -22,6 +23,8 @@ class ADBClient:
     def _cmd(self, *parts: str) -> str:
         base = ["adb"]
         if self.device:
+            if not re.fullmatch(r"[a-zA-Z0-9_:.-]+", self.device):
+                raise ValueError("Invalid ADB device identifier.")
             base.extend(["-s", self.device])
         base.extend(parts)
         with self._lock:

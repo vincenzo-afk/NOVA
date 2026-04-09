@@ -6,6 +6,7 @@ from core.a2a.shared_memory_bus import SharedMemoryBus
 from core.think.nudge_engine import NudgeEngine
 from core.think.self_evaluator import SelfEvaluator
 from tasks.missions import MissionManager
+from voice.ambient_listener import AmbientListener
 
 
 class _DummyScheduler:
@@ -105,6 +106,37 @@ def test_mission_manager_parse_schedule_and_run(tmp_path):
     assert "mission_morning_brief" in scheduler.removed
 
 
+def test_mission_manager_rejects_invalid_schedule(tmp_path):
+    scheduler = _DummyScheduler()
+    manager = MissionManager(
+        scheduler=scheduler,
+        enqueue_goal_fn=lambda goal: {"status": "queued", "goal": goal},
+        persist_path=tmp_path / "missions.json",
+    )
+    bad = manager.add_mission(
+        name="nightly",
+        schedule="every blursday at 25:99",
+        goal="summarize logs",
+        enabled=True,
+    )
+    assert bad["status"] == "error"
+    assert "invalid_schedule" in bad["reason"]
+
+
+def test_mission_manager_parses_daily_syntax(tmp_path):
+    scheduler = _DummyScheduler()
+    manager = MissionManager(
+        scheduler=scheduler,
+        enqueue_goal_fn=lambda goal: {"status": "queued", "goal": goal},
+        persist_path=tmp_path / "missions.json",
+    )
+    result = manager.parse_and_add_from_text(
+        "schedule mission standup daily at 09:00 to summarize blockers"
+    )
+    assert result["status"] == "ok"
+    assert "mission_standup" in scheduler.added
+
+
 def test_shared_memory_bus_reads_broadcast_and_target_messages(tmp_path):
     bus = SharedMemoryBus(path=tmp_path / "shared_bus.jsonl")
     bus.publish(
@@ -151,3 +183,16 @@ def test_peer_registry_upsert_and_mdns_discovery_graceful(tmp_path, monkeypatch)
     mdns = registry.discover_mdns_peers(timeout_seconds=0.1)
     assert isinstance(mdns, list)
     registry.close()
+
+
+def test_ambient_listener_keyword_match_and_wav_encode():
+    listener = AmbientListener(
+        keywords=["doorbell", "alarm"],
+        on_event=None,
+        transcribe_fn=lambda _wav, _sr: "front doorbell detected",
+    )
+    assert listener._match_keyword("there is a doorbell") == "doorbell"
+    assert listener._match_keyword("nothing important") == ""
+    wav_bytes = listener._to_wav_bytes([0.0, 0.1, -0.1, 0.0], 16000)
+    assert isinstance(wav_bytes, (bytes, bytearray))
+    assert len(wav_bytes) > 32

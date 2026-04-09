@@ -32,6 +32,8 @@ def _generalise_value(v: Any) -> Any:
         v = _URL_RE.sub("{url}", v)
         v = _PATH_RE.sub("{filepath}", v)
         v = _DATE_RE.sub("{date}", v)
+        if "{" in v and "}" in v:
+            return v
         v = _NUMBER_RE.sub("{n}", v)
         return v
     return v

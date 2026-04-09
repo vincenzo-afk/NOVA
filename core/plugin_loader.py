@@ -70,6 +70,12 @@ def _check_ast(source: str):
             raise ValueError(f"Restricted identifier used: {node.id}")
         if isinstance(node, ast.Attribute) and node.attr in restricted:
             raise ValueError(f"Restricted attribute used: {node.attr}")
+        if isinstance(node, ast.Attribute):
+            cur = node
+            while isinstance(cur, ast.Attribute):
+                if cur.attr in restricted:
+                    raise ValueError(f"Restricted attribute chain used: {cur.attr}")
+                cur = cur.value
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)

@@ -212,6 +212,14 @@ class GoalRunner:
                 )
             except FuturesTimeout:
                 future.cancel()
+                # Timeout does not reliably stop an already-running worker thread.
+                # Replace the executor so subsequent steps/runs don't deadlock behind it.
+                with self._executor_lock:
+                    try:
+                        self._executor.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        self._executor.shutdown(wait=False)
+                    self._executor = ThreadPoolExecutor(max_workers=1)
                 return GoalResult(
                     status="failed",
                     reason=f"step_timeout_seconds_exceeded:{self.step_timeout_seconds}",

@@ -81,3 +81,23 @@ def test_add_and_remove_runtime_key_openai_updates_pool(monkeypatch):
         assert snap2["active_count"] == 0
     finally:
         settings.OPENAI_API_KEYS = original_openai
+
+
+def test_add_runtime_key_rejects_invalid_or_duplicate(monkeypatch):
+    from config.settings import settings
+
+    original_openai = list(getattr(settings, "OPENAI_API_KEYS", []) or [])
+    try:
+        monkeypatch.setattr(settings, "OPENAI_API_KEYS", ["sk-valid-key-123456789012345"], raising=False)
+        agent = _DummyAgent(["sk-valid-key-123456789012345"])
+
+        bad = add_runtime_key(agent, "openai", "not-a-real-key")
+        assert bad["status"] == "error"
+        assert bad["reason"] == "invalid_key_format"
+
+        dup = add_runtime_key(agent, "openai", "sk-valid-key-123456789012345")
+        assert dup["status"] == "ok"
+        assert dup.get("duplicate") is True
+        assert dup["count"] == 1
+    finally:
+        settings.OPENAI_API_KEYS = original_openai

@@ -707,9 +707,12 @@ class NOVAApp:
             llm_ask_fn=lambda prompt, system: self.engine.ask(prompt=prompt, system=system, history=[]),
         )
         self._nudge_engine = NudgeEngine(export_callback=lambda: self.export_session("md"))
+        self._ambient_whisper = None
+        self._ambient_whisper_lock = threading.Lock()
         self._ambient_listener = AmbientListener(
             keywords=list(getattr(settings, "AMBIENT_KEYWORDS", [])),
             on_event=self._handle_ambient_event,
+            transcribe_fn=self._ambient_transcribe,
         )
         self._a2a_enabled = bool(getattr(settings, "A2A_ENABLED", False))
         self._a2a_agent_name = str(getattr(settings, "A2A_AGENT_NAME", "nova")).strip() or "nova"
@@ -1979,6 +1982,28 @@ class NOVAApp:
             check_fn=_check_llm_engine,
             restart_fn=_restart_llm_engine,
         )
+
+        # Fix 4: Register midnight reset for daily hard cap
+        try:
+            if self.scheduler.scheduler.running:
+                def _reset_hard_cap():
+                    with self._usage_lock:
+                        self._hard_cap_hit = False
+                        self._hard_cap_hit_date = None
+                    import logging
+                    logging.getLogger(__name__).info("Daily token hard-cap reset at midnight.")
+
+                self.scheduler.scheduler.add_job(
+                    _reset_hard_cap,
+                    "cron",
+                    hour=0,
+                    minute=0,
+                    id="daily_hard_cap_reset",
+                    replace_existing=True,
+                )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Failed to schedule daily hard-cap reset: %s", exc)
         can_watch_screen = True
         try:
             if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
@@ -2080,6 +2105,24 @@ class NOVAApp:
             self.scheduler.add_from_text(fn=_maintenance_job, schedule_text="every day at 03:00", job_id="maint_daily")
         except Exception as e:
             _log_pi.warning("[proactive] maintenance job register failed: %s", e)
+
+        # Daily reset of hard-cap latch so autonomy-only periods are not blocked
+        # until the next interactive ask_stream call.
+        def _hard_cap_reset_job() -> None:
+            try:
+                with self._usage_lock:
+                    self._hard_cap_hit = False
+                    self._hard_cap_hit_date = None
+            except Exception:
+                pass
+        try:
+            self.scheduler.add_from_text(
+                fn=_hard_cap_reset_job,
+                schedule_text="every day at 00:00",
+                job_id="hardcap_daily_reset",
+            )
+        except Exception as e:
+            _log_pi.warning("[proactive] hard-cap reset job register failed: %s", e)
 
         # Tier 2: Weekly insight extraction on Sunday at 2:30am
         def _weekly_insight_job() -> None:
@@ -2395,7 +2438,9 @@ class NOVAApp:
                                 confirm_callback=lambda _p: True,
                                 should_continue=lambda gid=str(goal.get("id")): not self._is_goal_cancelled(gid),
                             )
-                            result.next_index = min(len(steps), start_index + (1 if result.status == "completed" else 0))
+                            # Approved single-step runs must always advance the goal cursor
+                            # to avoid re-running the same blocked/stopped step forever.
+                            result.next_index = min(len(steps), start_index + 1)
                     else:
                         result = self.autonomy_runner.run(
                             steps,
@@ -3102,6 +3147,21 @@ class NOVAApp:
         except Exception:
             pass
 
+    def _ambient_transcribe(self, wav_bytes: bytes, sample_rate: int) -> str:
+        _ = sample_rate
+        if not wav_bytes:
+            return ""
+        try:
+            with self._ambient_whisper_lock:
+                if self._ambient_whisper is None:
+                    from voice.stt_offline import OfflineWhisper
+
+                    self._ambient_whisper = OfflineWhisper(model_size=settings.WHISPER_MODEL)
+                whisper = self._ambient_whisper
+            return whisper.transcribe(wav_bytes, lang=settings.DEFAULT_LANG)
+        except Exception:
+            return ""
+
     def _mission_add(self, name: str, schedule: str, goal: str, enabled: bool = True) -> dict:
         return self._mission_manager.add_mission(name=name, schedule=schedule, goal=goal, enabled=enabled)
 
@@ -3377,7 +3437,6 @@ class NOVAApp:
                 ):
                     self._last_snippet_hashes[session_id] = snippet_hash
                     self._summary_last_trigger_count[session_id] = older_count
-                    self._summary_inflight.add(session_id)
                     epoch = self._session_context_epoch.get(session_id, 0)
 
                     def _job(sn=snippet, sid=session_id, sid_epoch=epoch):
@@ -3390,7 +3449,12 @@ class NOVAApp:
 
                     if self._summary_jobs_inflight < self._max_background_summary_jobs:
                         self._summary_jobs_inflight += 1
-                        self._summarize_executor.submit(_job)
+                        try:
+                            self._summarize_executor.submit(_job)
+                        except Exception:
+                            self._summary_inflight.discard(session_id)
+                            self._summary_jobs_inflight = max(0, self._summary_jobs_inflight - 1)
+                            self._summary_retry_after[session_id] = time.time() + 10.0
         
         summary, recent = self.trimmer.trim(
             history,
@@ -3942,6 +4006,12 @@ class NOVAApp:
         try:
             estimated = estimate_tokens(assistant_text)
             daily_total = int(self.usage.total_tokens_today(session_id=session_id))
+            hard_cap = int(getattr(settings, "DAILY_TOKEN_HARD_CAP", 0) or 0)
+            if hard_cap > 0:
+                remaining = hard_cap - daily_total
+                # Avoid spending the final budget on self-evaluation.
+                if remaining <= max(2000, estimated * 2):
+                    return
             if not self._self_evaluator.should_rate(
                 assistant_text=assistant_text,
                 estimated_tokens=estimated,

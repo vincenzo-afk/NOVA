@@ -55,7 +55,7 @@ class OmniParserClient:
 
     def ui_elements(self, image_bytes: bytes) -> list[dict]:
         """Return UI elements with short-TTL caching to avoid per-click screenshot round-trips (fix 3.2)."""
-        key_material = (self.auth_token or "") + "|" + hashlib.sha256(image_bytes[:4096]).hexdigest()
+        key_material = (self.auth_token or "") + "|" + hashlib.sha256(image_bytes).hexdigest()
         cache_key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
         now = time.monotonic()
         if cache_key in _UI_ELEMENT_CACHE:

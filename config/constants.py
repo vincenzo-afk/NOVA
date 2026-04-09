@@ -4,6 +4,8 @@ Minor fix: updated agent identity constants from JARVIS → NOVA so that
 changing the project name requires only editing this single file.
 """
 
+from pathlib import Path
+
 # ── Agent identity ─────────────────────────────────────────────────────────
 AGENT_NAME = "NOVA"
 DEFAULT_SESSION_PERSONAL = "nova_personal"
@@ -23,6 +25,6 @@ DEFAULT_HEARTBEAT_SECONDS = 60
 MAX_CONTEXT_TOKENS = 12000
 
 # Auth / security
-CLI_PIN_HASH_FILE = ".jarvis/cli_pin_hash"
-CLI_PIN_LEGACY_FILE = ".jarvis/cli_pin"
-CLI_PIN_LOCK_FILE = ".jarvis/cli_pin.lock"
+CLI_PIN_HASH_FILE = str(Path.home() / ".jarvis" / "cli_pin_hash")
+CLI_PIN_LEGACY_FILE = str(Path.home() / ".jarvis" / "cli_pin")
+CLI_PIN_LOCK_FILE = str(Path.home() / ".jarvis" / "cli_pin.lock")

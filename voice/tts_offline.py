@@ -11,15 +11,20 @@ _QUEUE: queue.Queue | None = None
 _WORKER_THREAD: threading.Thread | None = None
 _WORKER_DISABLED: bool = False
 _WORKER_LOCK = threading.Lock()
+_ENGINE: Any = None
+_IS_STOPPED = False
 
 def _tts_worker() -> None:
+    global _ENGINE, _IS_STOPPED
     import pyttsx3
     try:
         engine = pyttsx3.init()
+        with _WORKER_LOCK:
+            _ENGINE = engine
     except Exception:
         return
         
-    while True:
+    while not _IS_STOPPED:
         try:
             item = _QUEUE.get(timeout=1.0)
         except queue.Empty:
@@ -40,10 +45,13 @@ def _tts_worker() -> None:
         finally:
             done_event.set()
             _QUEUE.task_done()
+    
+    with _WORKER_LOCK:
+        _ENGINE = None
 
 
 def _ensure_worker() -> None:
-    global _QUEUE, _WORKER_THREAD, _WORKER_DISABLED
+    global _QUEUE, _WORKER_THREAD, _WORKER_DISABLED, _IS_STOPPED
     with _WORKER_LOCK:
         if _WORKER_DISABLED:
             return
@@ -71,6 +79,7 @@ def _ensure_worker() -> None:
         if _QUEUE is None:
             _QUEUE = queue.Queue()
         if _WORKER_THREAD is None or not _WORKER_THREAD.is_alive():
+            _IS_STOPPED = False
             _WORKER_THREAD = threading.Thread(target=_tts_worker, daemon=True)
             _WORKER_THREAD.start()
 
@@ -90,8 +99,17 @@ def speak(text: str, stop_event: threading.Event | None = None) -> None:
     started = time.monotonic()
     while not done_event.is_set():
         if stop_event is not None and stop_event.is_set():
+            with _WORKER_LOCK:
+                if _ENGINE is not None:
+                    try:
+                        _ENGINE.stop()
+                    except Exception:
+                        pass
             break
         if (time.monotonic() - started) > 15.0:
+                    _ENGINE.stop()
+            except Exception:
+                pass
             break
         time.sleep(0.05)
 
