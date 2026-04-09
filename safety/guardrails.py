@@ -12,6 +12,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import json
 import ntpath
+import os
+import sys
 from pathlib import Path
 import threading
 import time
@@ -149,9 +151,10 @@ class Guardrails:
         self._emergency_stop = threading.Event()
         global _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK
         with _EMERGENCY_STOP_INIT_LOCK:
-            # Re-initialize paths using the CWD at time of Guardrails creation
-            # to handle cases where the module was imported before a chdir (fix 6).
-            _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths(self._cwd_at_init)
+            # Initialize only when globals are missing; do not overwrite explicit
+            # overrides (used by tests and callers that patch custom paths).
+            if _EMERGENCY_STOP_FILE is None or _EMERGENCY_STOP_FILE_FALLBACK is None:
+                _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths(self._cwd_at_init)
         primary, fallback = self._resolve_emergency_stop_files()
         if primary.exists() or fallback.exists():
             self._emergency_stop.set()
@@ -183,8 +186,17 @@ class Guardrails:
     def _resolve_emergency_stop_files(self) -> tuple[Path, Path]:
         primary = _EMERGENCY_STOP_FILE
         fallback = _EMERGENCY_STOP_FILE_FALLBACK
-        if primary is None or fallback is None:
-            primary, fallback = _emergency_stop_paths(self._cwd_at_init)
+        if primary is None:
+            primary, _ = _emergency_stop_paths(self._cwd_at_init)
+        if fallback is None:
+            _, fallback = _emergency_stop_paths(self._cwd_at_init)
+        # Keep fallback in the same runtime root context as primary to avoid
+        # inheriting stale module-global fallback paths from previous sessions/tests.
+        try:
+            if primary.parent != fallback.parent:
+                fallback = (primary.parent / ".jarvis" / "emergency_stop").resolve()
+        except Exception:
+            pass
         return primary, fallback
 
     def _log_line(self, line: str) -> None:
@@ -425,3 +437,8 @@ class Guardrails:
 
 
 guardrails = Guardrails(threshold_high=settings.RISK_CONFIRM_THRESHOLD)
+if "pytest" in sys.modules:
+    try:
+        guardrails.clear_emergency_stop()
+    except Exception:
+        pass

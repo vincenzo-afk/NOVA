@@ -200,12 +200,12 @@ case "$OS" in
     ;;
   debian)
     run sudo apt-get update -qq
-    for pkg in ffmpeg mpg123 xdotool wmctrl xclip scrot espeak-ng; do
+    for pkg in ffmpeg mpg123 xdotool ydotool wmctrl xclip scrot espeak-ng libnotify-bin; do
       install_apt_pkg "$pkg"
     done
     ;;
   arch)
-    for pkg in ffmpeg mpg123 xdotool wmctrl xclip scrot espeak-ng; do
+    for pkg in ffmpeg mpg123 xdotool ydotool wmctrl xclip scrot espeak-ng libnotify; do
       install_pacman_pkg "$pkg"
     done
     ;;

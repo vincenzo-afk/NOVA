@@ -37,6 +37,19 @@ def get_foreground_app() -> str:
             return app
         return _run(["bash", "-lc", f"xprop -id {shlex.quote(window_id)} WM_NAME 2>/dev/null"]) or "unknown"
     if "windows" in system:
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if hwnd:
+                buf = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, buf, 512)
+                title = str(buf.value or "").strip()
+                if title:
+                    return title
+        except Exception:
+            pass
         app = _run(
             [
                 "powershell",
@@ -71,6 +84,13 @@ def send_notification(title: str, message: str) -> None:
             subprocess.run(["notify-send", title, message], check=False)
             return
     if "windows" in system:
+        try:
+            from win10toast import ToastNotifier  # type: ignore[import]
+
+            ToastNotifier().show_toast(str(title), str(message), threaded=True, duration=5)
+            return
+        except Exception:
+            pass
         subprocess.run(
             [
                 "powershell",

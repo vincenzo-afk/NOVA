@@ -31,8 +31,8 @@ def _detect_backend() -> str:
         profile_path = Path("config/pc_profile.json")
         if profile_path.exists():
             profile = json.loads(profile_path.read_text())
-            backend = profile.get("input_backend")
-            if backend:
+            backend = str(profile.get("input_backend") or "").strip().lower()
+            if backend in {"pyautogui", "quartz", "xdotool", "ydotool", "pynput"}:
                 return backend
     except Exception:
         pass
@@ -51,6 +51,14 @@ def _detect_backend() -> str:
     if os.environ.get("WAYLAND_DISPLAY"):
         if shutil.which("ydotool"):
             return "ydotool"
+        if shutil.which("xdotool"):
+            return "xdotool"
+        try:
+            import pynput  # noqa: F401
+            return "pynput"
+        except ImportError:
+            pass
+    else:
         if shutil.which("xdotool"):
             return "xdotool"
         try:
@@ -219,6 +227,63 @@ class _YdotoolBackend:
         self._run(["mousemove", "--absolute", "-x", str(end_x), "-y", str(end_y)])
 
 
+class _PynputBackend:
+    """Cross-platform fallback backend via pynput."""
+
+    def __init__(self):
+        from pynput.keyboard import Controller as KeyboardController, Key  # type: ignore[import]
+        from pynput.mouse import Button, Controller as MouseController  # type: ignore[import]
+
+        self._mouse = MouseController()
+        self._keyboard = KeyboardController()
+        self._button_left = Button.left
+        self._key_mods = {
+            "ctrl": Key.ctrl,
+            "shift": Key.shift,
+            "alt": Key.alt,
+            "cmd": Key.cmd,
+            "command": Key.cmd,
+            "win": Key.cmd,
+        }
+
+    def click(self, x: int, y: int) -> None:
+        self._mouse.position = (int(x), int(y))
+        self._mouse.click(self._button_left, 1)
+
+    def type_text(self, text: str) -> None:
+        self._keyboard.type(str(text or ""))
+
+    def hotkey(self, *keys: str) -> None:
+        normalized = [str(k).strip().lower() for k in keys if str(k).strip()]
+        pressed = []
+        try:
+            for k in normalized[:-1]:
+                key_obj = self._key_mods.get(k, k)
+                self._keyboard.press(key_obj)
+                pressed.append(key_obj)
+            if normalized:
+                last = normalized[-1]
+                self._keyboard.press(last)
+                self._keyboard.release(last)
+        finally:
+            for key_obj in reversed(pressed):
+                try:
+                    self._keyboard.release(key_obj)
+                except Exception:
+                    pass
+
+    def scroll(self, clicks: int) -> None:
+        self._mouse.scroll(0, int(clicks))
+
+    def drag(
+        self, start_x: int, start_y: int, end_x: int, end_y: int, duration: float = 0.25
+    ) -> None:
+        self._mouse.position = (int(start_x), int(start_y))
+        self._mouse.press(self._button_left)
+        self._mouse.position = (int(end_x), int(end_y))
+        self._mouse.release(self._button_left)
+
+
 def _build_backend(backend: str):
     if backend == "quartz":
         try:
@@ -229,6 +294,11 @@ def _build_backend(backend: str):
         return _YdotoolBackend()
     if backend == "xdotool" and shutil.which("xdotool"):
         return _XdotoolBackend()
+    if backend == "pynput":
+        try:
+            return _PynputBackend()
+        except Exception:
+            log.warning("[mouse_keyboard] pynput unavailable — falling back to pyautogui")
     return _PyAutoGUIBackend()
 
 

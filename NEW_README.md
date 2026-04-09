@@ -117,7 +117,7 @@
 | `fix.txt` bugs 1–20 | All 20 documented bugs | Full fix pass (see Phase 15) |
 | `interfaces/onboarding.py` | Text-only, no GUI | Add PyQt6 wizard flow |
 | `config/pc_scanner.py` | Missing winget/registry scan on Windows | Extend with Windows deep inventory |
-| `install.sh` | No Windows `.bat` equivalent | Add `install.bat` PowerShell counterpart |
+| `install.sh` | Windows parity was missing | `install.bat` now included with `--gui`, `--dry-run`, `--no-onboarding` |
 | `interfaces/gui/app.py` | Static theme | Add Dynamic UI Skin Engine hooks |
 | `tasks/scheduler.py` | No recurring mission management UI | Add mission builder |
 | `core/plugin_generator.py` | CLI confirm only | Add GUI approval dialog |
@@ -583,11 +583,17 @@ Nothing silently breaks. Full parity offline.
 
 Linux/Mac-ready foundation. One-command install. Full test coverage.
 
-- `control/os_layer.py` — `get_foreground_app()` on Win32/macOS/Linux. `send_notification()` via Windows toast/macOS osascript/Linux notify-send. `startup_command()` builds shell wrapper. `register_startup()` writes systemd service / launchd plist / Windows schtask.
+- `control/os_layer.py` — `get_foreground_app()` on Win32/macOS/Linux. Windows now uses Win32 foreground-window title first, then PowerShell fallback. `send_notification()` via win10toast (preferred) or PowerShell fallback on Windows, osascript on macOS, notify-send on Linux. `startup_command()` builds shell wrapper. `register_startup()` writes systemd service / launchd plist / Windows schtask.
 - `control/window_manager.py` — Backend routing: Win32 (pywin32) / macOS (osascript) / Linux (xdotool → wmctrl) / NoOp. `list_windows()`, `focus()`, `resize()`, `close()` all return uniform dict.
+- `control/mouse_keyboard.py` — Runtime routing finalized:
+  - Windows: `pyautogui`
+  - macOS: Quartz CoreGraphics
+  - Linux X11: `xdotool` (preferred)
+  - Linux Wayland: `ydotool` → `xdotool` → `pynput` → `pyautogui`
+  - Cross-platform fallback: `pynput` backend implemented and wired.
 - `control/macos_permissions.py` — Checks `AXIsProcessTrusted()` for Accessibility and `CGWindowListCopyWindowInfo()` for Screen Recording. Logs clear warning with System Settings path if missing.
 - `setup.py` — Installs Python deps, Playwright Chromium, faster-whisper model, OmniParser (clone + weights from Hugging Face), Ollama model pull, wake word reminder, startup registration, post-install health checks.
-- `install.sh` — Detects macOS/Debian/Arch/Fedora. Installs system packages (ffmpeg, mpg123, xdotool, etc.). Creates venv. Runs PC scanner. Installs core + optional packages based on profile.
+- `install.sh` — Detects macOS/Debian/Arch/Fedora. Installs system packages (including `xdotool`, `ydotool`, `wmctrl`, and Linux notify dependencies), creates venv, runs PC scanner, installs core + optional packages based on profile.
 - Test suite: 40+ unit and integration tests covering LLM engine, memory router, dispatcher, hybrid ranker, guardrails, context trimmer, session manager, goals, usage tracker, health, events, tray, GUI status, voice TTS, ADB tools, screen watcher, master MCP, master API, and more.
 
 **Milestone:** `python setup.py` on fresh machine → NOVA running in <5 minutes. All tests pass.
