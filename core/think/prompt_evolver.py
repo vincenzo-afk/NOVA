@@ -112,8 +112,9 @@ class PromptEvolver:
     def is_variant_session(self, session_id: str) -> bool:
         """Return True if this session should use the candidate prompt."""
         with self._lock:
-            if not self._active_variant:
-                return False
+            has_variant = self._active_variant is not None
+        if not has_variant:
+            return False
         utc_day = datetime.now(timezone.utc).date().isoformat()
         digest = hashlib.md5(f"{session_id}{utc_day}".encode()).hexdigest()
         return int(digest, 16) % _AB_BUCKET_RATIO == 0
@@ -128,11 +129,12 @@ class PromptEvolver:
     # ── recording ─────────────────────────────────────────────────────────────
 
     def record_goal_outcome(self, session_id: str, succeeded: bool) -> None:
+        variant_bucket = self.is_variant_session(session_id)
         with self._lock:
             self._total_goals_since_last_evolution += 1
             if not self._active_variant:
                 return
-            if self.is_variant_session(session_id):
+            if variant_bucket:
                 self._active_variant.goals_run += 1
                 if succeeded:
                     self._active_variant.goals_succeeded += 1

@@ -101,7 +101,15 @@ class PatternShortcutCompiler:
         steps = target.get("steps", [])
         results: list[dict[str, Any]] = []
         for idx, step in enumerate(steps):
-            call = ToolCall(tool=str(step.get("tool", "")), args=dict(step.get("args", {}) or {}))
+            raw_args = dict(step.get("args", {}) or {})
+            if self._contains_placeholder(raw_args):
+                return {
+                    "status": "error",
+                    "reason": "shortcut_contains_generalized_placeholders",
+                    "name": target.get("name"),
+                    "step_index": idx,
+                }
+            call = ToolCall(tool=str(step.get("tool", "")), args=raw_args)
             result = dispatcher.execute(tool_call=call, dry_run=bool(dry_run))
             results.append({"step_index": idx, "tool": call.tool, "result": result})
             if result.get("status") in {"blocked", "cancelled", "error", "rate_limited"} or result.get("error"):
@@ -131,7 +139,7 @@ class PatternShortcutCompiler:
                     tool = str(item.get("tool", "")).strip()
                     if not tool:
                         continue
-                    if str(item.get("status", "")).strip().lower() != "ok":
+                    if str(item.get("status", "")).strip().lower() not in {"ok", "allowed"}:
                         continue
                     ts = _parse_ts(item.get("timestamp"))
                     if ts is not None and ts < cutoff:
@@ -196,6 +204,13 @@ class PatternShortcutCompiler:
         if isinstance(args, list):
             return [self._generalize_args(v) for v in args[:5]]
         return "<value>"
+
+    def _contains_placeholder(self, value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(self._contains_placeholder(v) for v in value.values())
+        if isinstance(value, list):
+            return any(self._contains_placeholder(v) for v in value)
+        return value == "<value>"
 
 
 def _parse_ts(value: Any) -> datetime | None:

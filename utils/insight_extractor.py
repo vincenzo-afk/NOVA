@@ -71,13 +71,14 @@ class InsightExtractor:
     def run_weekly_extraction(self) -> str | None:
         """Called by TaskScheduler on Sunday at 2:30am."""
         now = datetime.now(timezone.utc)
-        week_num = now.isocalendar()[1]
+        iso_year, week_num, _ = now.isocalendar()
+        week_key = int(f"{iso_year}{week_num:02d}")
 
         with self._lock:
             self._load_state()
-            if self._last_insight_week == week_num:
+            if self._last_insight_week == week_key:
                 return None  # already ran this week
-            self._last_insight_week = week_num
+            self._last_insight_week = week_key
             self._save_state()
 
         try:
@@ -130,7 +131,7 @@ class InsightExtractor:
             with self._lock:
                 self._pending_insight = insight
 
-            log.info("[insight_extractor] weekly insight stored for week %d", week_num)
+            log.info("[insight_extractor] weekly insight stored for week-key %d", week_key)
             return insight
 
         except Exception as exc:

@@ -71,13 +71,14 @@ class GoalTemplate:
     required_tools: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
+        steps_copy = [dict(step) for step in self.steps]
         return {
             "name": self.name,
-            "trigger_keywords": self.trigger_keywords,
-            "steps": self.steps,
+            "trigger_keywords": list(self.trigger_keywords),
+            "steps": steps_copy,
             "success_count": self.success_count,
             "avg_completion_time": self.avg_completion_time,
-            "required_tools": self.required_tools,
+            "required_tools": list(self.required_tools),
         }
 
     @classmethod
