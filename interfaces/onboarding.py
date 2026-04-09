@@ -100,6 +100,7 @@ def _apply_onboarding_config(data: dict[str, str | list[str]]) -> None:
     context = str(data.get("context", "")).strip()
     timezone = str(data.get("timezone", "")).strip()
     mode = str(data.get("privacy_mode", "full_cloud")).strip().lower()
+    talk_mode = str(data.get("talk_mode", "text")).strip().lower()
     language_name = str(data.get("language", "English")).strip()
     selected_apps = [str(x).strip().lower() for x in (data.get("apps") or []) if str(x).strip()]
 
@@ -111,6 +112,31 @@ def _apply_onboarding_config(data: dict[str, str | list[str]]) -> None:
         "WHISPER_MODEL": whisper_size,
         "PRIVACY_MODE": mode if mode in {"local_only", "balanced", "full_cloud"} else "full_cloud",
     }
+
+    if talk_mode in {"text", "text only"}:
+        env_updates.update(
+            {
+                "NOVA_VOICE_MODE": "text",
+                "VOICE_BARGEIN_ENABLED": "false",
+                "AMBIENT_MONITOR_ENABLED": "false",
+            }
+        )
+    elif talk_mode in {"voice with wake word", "voice_wake", "wakeword"}:
+        env_updates.update(
+            {
+                "NOVA_VOICE_MODE": "wakeword",
+                "VOICE_BARGEIN_ENABLED": "true",
+                "AMBIENT_MONITOR_ENABLED": "false",
+            }
+        )
+    elif talk_mode in {"voice always-on", "voice_always", "always_on", "always-on"}:
+        env_updates.update(
+            {
+                "NOVA_VOICE_MODE": "always_on",
+                "VOICE_BARGEIN_ENABLED": "true",
+                "AMBIENT_MONITOR_ENABLED": "true",
+            }
+        )
 
     if mode == "local_only":
         env_updates.update(

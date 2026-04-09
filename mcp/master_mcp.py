@@ -17,6 +17,7 @@ BUILTIN_SERVICES = {
     "google_drive",
     "jira",
     "home_assistant",  # Feature 9
+    "a2a",  # Phase 17
 }
 
 
@@ -213,6 +214,8 @@ class MasterMCP:
             return self._jira_connector(api_key)
         if service == "home_assistant":
             return self._home_assistant_connector(api_key)
+        if service == "a2a":
+            return self._a2a_connector(api_key)
         raise ValueError(f"unsupported builtin service: {service}")
 
     @staticmethod
@@ -655,3 +658,71 @@ class MasterMCP:
             "set_climate": set_climate,
             "get_energy_stats": get_energy_stats,
         }
+
+    def _a2a_connector(
+        self,
+        api_key: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Callable[..., Any]]]:
+        # api_key format is optional:
+        #   "agent_name|peers_path|bus_path|locks_path"
+        # any field can be omitted.
+        parts = [p.strip() for p in str(api_key or "").split("|")]
+        agent_name = parts[0] if len(parts) >= 1 and parts[0] else "nova"
+        peers_path = parts[1] if len(parts) >= 2 and parts[1] else ".jarvis/a2a_peers.json"
+        bus_path = parts[2] if len(parts) >= 3 and parts[2] else ".jarvis/shared_bus.jsonl"
+        locks_path = parts[3] if len(parts) >= 4 and parts[3] else ".jarvis/a2a_file_locks.json"
+
+        from core.a2a.conflict_resolver import ConflictResolver
+        from core.a2a.peer_registry import PeerRegistry
+        from core.a2a.shared_memory_bus import SharedMemoryBus
+
+        peers = PeerRegistry(path=peers_path)
+        bus = SharedMemoryBus(path=bus_path)
+        locks = ConflictResolver(lock_path=locks_path)
+
+        def list_peers(include_tailscale: bool = True, include_mdns: bool = True) -> dict:
+            mdns_rows: list[dict] = []
+            if include_mdns:
+                mdns_rows = peers.discover_mdns_peers(timeout_seconds=1.0)
+            tail_rows: list[dict] = []
+            if include_tailscale:
+                tail_rows = peers.discover_tailscale_peers()
+            return {
+                "local_registry": peers.list_peers(),
+                "mdns_peers": mdns_rows,
+                "tailscale_peers": tail_rows,
+            }
+
+        def send_message(to_agent: str, msg_type: str = "status_update", payload: dict | None = None) -> dict:
+            return bus.publish(
+                from_agent=agent_name,
+                to_agent=to_agent,
+                msg_type=msg_type,
+                payload=payload or {},
+            )
+
+        def read_inbox(target_agent: str | None = None, limit: int = 50) -> dict:
+            rows = bus.read(to_agent=target_agent or agent_name, limit=max(1, min(int(limit), 200)))
+            return {"messages": rows}
+
+        def claim_file(path: str, owner: str | None = None) -> dict:
+            return locks.claim_file(agent_name=owner or agent_name, filepath=path)
+
+        def release_file(path: str, owner: str | None = None) -> dict:
+            return locks.release_file(agent_name=owner or agent_name, filepath=path)
+
+        tools = [
+            {"name": "list_peers", "description": "List A2A peers from local registry, mDNS, and Tailscale."},
+            {"name": "send_message", "description": "Send an A2A message over the shared bus."},
+            {"name": "read_inbox", "description": "Read A2A inbox messages for an agent."},
+            {"name": "claim_file", "description": "Claim a file lock for conflict-free collaboration."},
+            {"name": "release_file", "description": "Release a previously claimed file lock."},
+        ]
+        handlers = {
+            "list_peers": list_peers,
+            "send_message": send_message,
+            "read_inbox": read_inbox,
+            "claim_file": claim_file,
+            "release_file": release_file,
+        }
+        return tools, handlers

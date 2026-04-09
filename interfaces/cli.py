@@ -252,19 +252,54 @@ def run_cli(agent) -> None:
             continue
         if user_text.startswith("/models"):
             try:
-                from interfaces.model_manager import list_ollama_models
+                from interfaces.model_manager import (
+                    benchmark_providers,
+                    delete_ollama_model,
+                    list_ollama_models,
+                    provider_key_snapshot,
+                    pull_ollama_model,
+                    recommend_provider,
+                )
 
-                rows = list_ollama_models()
-                if not rows:
-                    console.print("No Ollama models found.")
+                cmd = user_text.strip()
+                if cmd in {"/models", "/models list"}:
+                    rows = list_ollama_models()
+                    if not rows:
+                        console.print("No Ollama models found.")
+                    else:
+                        for item in rows:
+                            name = item.get("name") or item.get("model") or "unknown"
+                            size = item.get("size") or ""
+                            modified = item.get("modified") or item.get("modified_at") or ""
+                            console.print(f"{name} | {size} | {modified}")
+                elif cmd.startswith("/models pull "):
+                    model = cmd.split(" ", 2)[2].strip()
+                    if not model:
+                        console.print("Usage: /models pull <model_name>")
+                    else:
+                        result = pull_ollama_model(model, on_output=lambda line: console.print(line))
+                        console.print(result)
+                elif cmd.startswith("/models delete "):
+                    model = cmd.split(" ", 2)[2].strip()
+                    if not model:
+                        console.print("Usage: /models delete <model_name>")
+                    else:
+                        console.print(delete_ollama_model(model))
+                elif cmd in {"/models benchmark", "/models bench"}:
+                    rows = benchmark_providers(agent)
+                    console.print(json.dumps(rows, ensure_ascii=False, indent=2))
+                elif cmd in {"/models recommend", "/models auto"}:
+                    rec = recommend_provider(agent)
+                    console.print(json.dumps(rec, ensure_ascii=False, indent=2))
+                elif cmd in {"/models keys", "/models health"}:
+                    snap = provider_key_snapshot(agent)
+                    console.print(json.dumps(snap, ensure_ascii=False, indent=2))
                 else:
-                    for item in rows:
-                        name = item.get("name") or item.get("model") or "unknown"
-                        size = item.get("size") or ""
-                        modified = item.get("modified") or item.get("modified_at") or ""
-                        console.print(f"{name} | {size} | {modified}")
+                    console.print(
+                        "Usage: /models list|pull <name>|delete <name>|benchmark|recommend|keys"
+                    )
             except Exception as exc:
-                console.print(f"Model listing failed: {exc}")
+                console.print(f"Model command failed: {exc}")
             continue
         if user_text == "/theme":
             current = str(getattr(agent, "get_theme_lock", lambda: "auto")())

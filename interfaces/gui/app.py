@@ -190,6 +190,7 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     key_btn = QPushButton("Keys")
     model_btn = QPushButton("Models")
     voice_cfg_btn = QPushButton("VoiceCfg")
+    plugin_btn = QPushButton("Gen Plugin")
     mute_btn = QPushButton("Mute")
     status_btn = QPushButton("Status JSON")
     goal_input = QLineEdit()
@@ -213,6 +214,8 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     mission_enable_btn = QPushButton("Enable Mission")
     mission_disable_btn = QPushButton("Disable Mission")
     mission_run_btn = QPushButton("Run Mission")
+    plugin_desc_input = QLineEdit()
+    plugin_desc_input.setPlaceholderText("plugin description")
     goal_output = QTextEdit()
     goal_output.setReadOnly(True)
     goal_output.setMinimumHeight(120)
@@ -376,6 +379,21 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
             open_voice_settings_dialog(settings_obj=settings, parent=window)
         except Exception as exc:
             append_line(f"[error] voice settings unavailable: {exc}")
+
+    def generate_plugin() -> None:
+        description = plugin_desc_input.text().strip()
+        if not description:
+            append_line("[plugin] enter a description first")
+            return
+        generator = getattr(agent, "_plugin_generator", None)
+        if generator is None:
+            append_line("[plugin] plugin generator unavailable")
+            return
+        try:
+            result = generator.generate_and_propose(description)
+            append_line(f"[plugin] {result}")
+        except Exception as exc:
+            append_line(f"[plugin-error] {exc}")
 
     def add_goal() -> None:
         goal = goal_input.text().strip()
@@ -585,6 +603,7 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     top_row.addWidget(key_btn)
     top_row.addWidget(model_btn)
     top_row.addWidget(voice_cfg_btn)
+    top_row.addWidget(plugin_btn)
     top_row.addWidget(mute_btn)
 
     goal_controls = QHBoxLayout()
@@ -608,6 +627,9 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     mission_controls.addWidget(mission_run_btn)
     mission_controls.addWidget(mission_list_btn)
 
+    plugin_row = QHBoxLayout()
+    plugin_row.addWidget(plugin_desc_input)
+
     # Chat input row
     input_row = QHBoxLayout()
     input_row.addWidget(input_box)
@@ -623,6 +645,7 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     layout.addWidget(health_output)
     layout.addLayout(goal_controls)
     layout.addLayout(mission_controls)
+    layout.addLayout(plugin_row)
     layout.addWidget(output)
     layout.addLayout(input_row)
     window.setLayout(layout)
@@ -638,6 +661,7 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
     key_btn.clicked.connect(open_key_manager)
     model_btn.clicked.connect(open_model_manager)
     voice_cfg_btn.clicked.connect(open_voice_settings)
+    plugin_btn.clicked.connect(generate_plugin)
     mute_btn.clicked.connect(toggle_mute)
     goal_add_btn.clicked.connect(add_goal)
     goal_resume_btn.clicked.connect(resume_goal)

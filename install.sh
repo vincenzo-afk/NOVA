@@ -36,6 +36,15 @@ for arg in "$@"; do
   esac
 done
 
+# Auto-enable GUI onboarding on desktop environments unless explicitly headless.
+if ! $GUI_SETUP; then
+  if [[ "$OSTYPE" == "darwin"* && -z "${SSH_TTY:-}" ]]; then
+    GUI_SETUP=true
+  elif [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+    GUI_SETUP=true
+  fi
+fi
+
 run() {
   if $DRY_RUN; then
     info "[dry-run] $*"
@@ -108,6 +117,45 @@ else
 fi
 run "$PIP" install --upgrade pip setuptools wheel -q
 ok "Virtual environment ready"
+
+# ── dependency lock consistency ───────────────────────────────────────────────
+section "Dependency lock check"
+if [[ -f "requirements.lock" ]]; then
+  if $DRY_RUN; then
+    info "[dry-run] Would compare current env against requirements.lock"
+  else
+    MISMATCHES=$("$PYTHON" - <<'PY'
+import pkg_resources
+from pathlib import Path
+
+lock = Path("requirements.lock")
+required = {}
+for raw in lock.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or "==" not in line:
+        continue
+    name, version = line.split("==", 1)
+    required[name.strip().lower()] = version.strip()
+
+installed = {dist.key.lower(): dist.version for dist in pkg_resources.working_set}
+count = 0
+for name, expected in required.items():
+    current = installed.get(name)
+    if current is None or current != expected:
+        count += 1
+print(count)
+PY
+)
+    if [[ "${MISMATCHES:-0}" -gt 0 ]]; then
+      warn "Detected ${MISMATCHES} mismatches vs requirements.lock"
+      info "Suggested fix: $PIP install --upgrade -r requirements.lock"
+    else
+      ok "Environment matches requirements.lock"
+    fi
+  fi
+else
+  warn "requirements.lock not found; skipping lock consistency check"
+fi
 
 # ── system packages ───────────────────────────────────────────────────────────
 install_brew_pkg() {

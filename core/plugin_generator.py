@@ -17,6 +17,8 @@ import hashlib
 import json
 import logging
 import re
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -77,7 +79,7 @@ class PluginGenerator:
         """
         self._llm = llm_callable
         self._dispatcher = dispatcher
-        self._confirm = confirm_callback or _cli_confirm
+        self._confirm = confirm_callback or _default_confirm
         self._scan_code = scan_code_callback
 
     def generate_and_propose(self, description: str) -> dict[str, Any]:
@@ -179,3 +181,67 @@ def _cli_confirm(code: str, description: str) -> bool:
     except (EOFError, KeyboardInterrupt):
         ans = "n"
     return ans.startswith("y")
+
+
+def _default_confirm(code: str, description: str) -> bool:
+    gui_decision = _gui_confirm(code, description)
+    if gui_decision is not None:
+        return gui_decision
+    if threading.current_thread() is threading.main_thread() and sys.stdin and sys.stdin.isatty():
+        return _cli_confirm(code, description)
+    return False
+
+
+def _gui_confirm(code: str, description: str) -> bool | None:
+    try:
+        from PyQt6.QtWidgets import (
+            QApplication,
+            QDialog,
+            QHBoxLayout,
+            QLabel,
+            QPushButton,
+            QTextEdit,
+            QVBoxLayout,
+        )
+    except Exception:
+        return None
+
+    app = QApplication.instance()
+    if app is None:
+        return None
+    if threading.current_thread() is not threading.main_thread():
+        return None
+
+    dialog = QDialog()
+    dialog.setWindowTitle("NOVA Plugin Approval")
+    root = QVBoxLayout()
+    root.addWidget(QLabel(f"Task: {description}"))
+
+    code_box = QTextEdit()
+    code_box.setReadOnly(True)
+    code_box.setPlainText(code)
+    root.addWidget(code_box)
+
+    actions = QHBoxLayout()
+    approve_btn = QPushButton("Approve")
+    reject_btn = QPushButton("Reject")
+    actions.addWidget(approve_btn)
+    actions.addWidget(reject_btn)
+    root.addLayout(actions)
+    dialog.setLayout(root)
+
+    state = {"approved": False}
+
+    def _approve() -> None:
+        state["approved"] = True
+        dialog.accept()
+
+    def _reject() -> None:
+        state["approved"] = False
+        dialog.reject()
+
+    approve_btn.clicked.connect(_approve)
+    reject_btn.clicked.connect(_reject)
+    dialog.resize(960, 680)
+    dialog.exec()
+    return bool(state["approved"])
