@@ -78,6 +78,7 @@ class NOVAFSWatcher:
             str(Path(p).expanduser().resolve())
             for p in watched_paths[:_MAX_WATCHED_PATHS]
         }
+        self._doc_dirs: set[str] = {str(Path(p).parent) for p in self._doc_files}
         self._git_commit_file = str(self._cwd / ".git" / "COMMIT_EDITMSG")
 
     def start(self) -> None:
@@ -107,8 +108,29 @@ class NOVAFSWatcher:
                     if event.is_directory:
                         return
                     src = str(Path(event.src_path).expanduser().resolve())
-                    # New code/doc file — add to doc store if under line limit
-                    if src.endswith((".py", ".md", ".txt", ".rst")) and watcher._debounce.ok(src):
+                    src_path = Path(src)
+                    if not src.endswith((".py", ".md", ".txt", ".rst")):
+                        return
+                    # Only ingest newly created files inside the explicit document set directories.
+                    if str(src_path.parent) not in watcher._doc_dirs:
+                        return
+                    # Ignore hidden/temp/runtime directories and noisy temp file patterns.
+                    path_str = str(src_path).replace("\\", "/")
+                    if any(token in path_str for token in ("/.git/", "/.venv/", "/__pycache__/", "/.jarvis/", "/vendor/")):
+                        return
+                    if src_path.name.startswith((".", "tmp", "pip-", "pytest-")):
+                        return
+                    try:
+                        if src_path.exists():
+                            with src_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                                line_count = 0
+                                for _ in handle:
+                                    line_count += 1
+                                    if line_count > _MAX_FILE_LINES:
+                                        return
+                    except Exception:
+                        return
+                    if watcher._debounce.ok(src):
                         watcher.add_path(src)
                         if watcher._on_file_changed:
                             try:
@@ -144,6 +166,7 @@ class NOVAFSWatcher:
         """Dynamically add a new file to the watch list (after startup)."""
         resolved = str(Path(filepath).expanduser().resolve())
         self._doc_files.add(resolved)
+        self._doc_dirs.add(str(Path(resolved).parent))
 
     # ── internal ──────────────────────────────────────────────────────────────
 

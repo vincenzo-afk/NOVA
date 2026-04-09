@@ -552,7 +552,7 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
 
                 QTimer.singleShot(0, _submit_transcript)
             except Exception as exc:
-                QTimer.singleShot(0, lambda: append_line(f"[voice-error] {exc}"))
+                QTimer.singleShot(0, lambda err=str(exc): append_line(f"[voice-error] {err}"))
             finally:
                 mic_lock.release()
 
@@ -581,7 +581,7 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
                     stop_event=stop_event,
                 )
             except Exception as exc:
-                QTimer.singleShot(0, lambda: append_line(f"[voice-error] {exc}"))
+                QTimer.singleShot(0, lambda err=str(exc): append_line(f"[voice-error] {err}"))
             finally:
                 QTimer.singleShot(0, lambda: voice_loop_btn.setText("Voice Loop Start"))
 

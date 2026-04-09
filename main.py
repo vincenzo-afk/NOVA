@@ -644,7 +644,7 @@ class NOVAApp:
             self.adb = None
             self.health.register_subsystem("adb", check_fn=lambda: False)
             
-        if not settings.ALLOWED_PHONE_NUMBERS and settings.AUTONOMY_ENABLED:
+        if not settings.ALLOWED_PHONE_NUMBERS:
             import logging
             logging.getLogger(__name__).warning("ALLOWED_PHONE_NUMBERS is empty — adb.send_sms will always be blocked")
         self.qr = QRPairing(adb_port=settings.ADB_PORT)
@@ -1013,6 +1013,15 @@ class NOVAApp:
     def switch_session(self, name: str):
         previous_session_id = self.session.current.session_id
         state = self.session.switch(name)
+        try:
+            active_session_ids = {s.session_id for s in self.session._sessions.values()}
+            self._session_privacy_overrides = {
+                sid: mode
+                for sid, mode in self._session_privacy_overrides.items()
+                if sid in active_session_ids
+            }
+        except Exception:
+            pass
         # Clear per-session summary state on switch to avoid stale bleed-through.
         self._clear_session_context_state(previous_session_id, clear_summary=False)
         self._clear_session_context_state(state.session_id, clear_summary=True)
@@ -1503,7 +1512,7 @@ class NOVAApp:
                         if item.get("id") == goal_id:
                             if item.get("status") == "cancelled":
                                 break
-                            if plan.get("status") == "ok":
+                            if plan.get("status") == "ok" and item.get("status") == "planning":
                                 item["steps"] = plan["steps"]
                                 item["status"] = "pending"
                             else:
@@ -1528,7 +1537,6 @@ class NOVAApp:
             return {"status": "error", "reason": f"planning_submit_exception:{exc}", "id": goal_id}
         def _on_done(fut):
             if fut.cancelled():
-                _release_plan_slot()
                 return
             if self._shutting_down.is_set():
                 return
@@ -1698,7 +1706,7 @@ class NOVAApp:
                                             if g.get("id") == goal_id:
                                                 if g.get("status") == "cancelled":
                                                     break
-                                                if plan.get("status") == "ok":
+                                                if plan.get("status") == "ok" and g.get("status") == "planning":
                                                     g["steps"] = plan["steps"]
                                                     g["status"] = "pending"
                                                 else:
@@ -1719,7 +1727,6 @@ class NOVAApp:
                                 return {"goal_id": goal_id, "status": "failed"}
                             def _on_done(fut):
                                 if fut.cancelled():
-                                    _release_plan_slot()
                                     return
                                 exc = fut.exception()
                                 if exc is not None:
@@ -1983,27 +1990,8 @@ class NOVAApp:
             restart_fn=_restart_llm_engine,
         )
 
-        # Fix 4: Register midnight reset for daily hard cap
-        try:
-            if self.scheduler.scheduler.running:
-                def _reset_hard_cap():
-                    with self._usage_lock:
-                        self._hard_cap_hit = False
-                        self._hard_cap_hit_date = None
-                    import logging
-                    logging.getLogger(__name__).info("Daily token hard-cap reset at midnight.")
-
-                self.scheduler.scheduler.add_job(
-                    _reset_hard_cap,
-                    "cron",
-                    hour=0,
-                    minute=0,
-                    id="daily_hard_cap_reset",
-                    replace_existing=True,
-                )
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("Failed to schedule daily hard-cap reset: %s", exc)
+        # Daily hard-cap reset is registered once below as "hardcap_daily_reset".
+        # Keep a single scheduler job to avoid duplicate state mutations.
         can_watch_screen = True
         try:
             if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
@@ -2438,9 +2426,9 @@ class NOVAApp:
                                 confirm_callback=lambda _p: True,
                                 should_continue=lambda gid=str(goal.get("id")): not self._is_goal_cancelled(gid),
                             )
-                            # Approved single-step runs must always advance the goal cursor
-                            # to avoid re-running the same blocked/stopped step forever.
-                            result.next_index = min(len(steps), start_index + 1)
+                            # Advance cursor only on successful execution.
+                            if result.status == "completed":
+                                result.next_index = min(len(steps), start_index + 1)
                     else:
                         result = self.autonomy_runner.run(
                             steps,
@@ -3823,15 +3811,16 @@ class NOVAApp:
         with current_session._lock:
             current_history = list(current_session.history)
 
-        def _append_turn(role: str, content: str) -> None:
+        def _append_turn(role: str, content: str) -> bool:
             if self.session.current.session_id != current_session_id:
-                return
+                return False
             with current_session._lock:
                 current_session.history.append({"role": role, "content": content})
                 max_turns = getattr(self.session, "_max_history_turns", 500)
                 if len(current_session.history) > max_turns:
                     current_session.history = current_session.history[-max_turns:]
             self.session._persist_session(current_session)
+            return True
 
         command_response = self._apply_text_commands(user_text)
         if command_response:
@@ -3867,8 +3856,9 @@ class NOVAApp:
 
         if needs_clarification(user_text):
             question = clarifying_question(user_text)
-            _append_turn("user", user_text)
-            _append_turn("assistant", question)
+            user_added = _append_turn("user", user_text)
+            if user_added:
+                _append_turn("assistant", question)
             yield question
             return
 
@@ -3904,8 +3894,7 @@ class NOVAApp:
             try:
                 try:
                     first_token = next(stream)
-                    _append_turn("user", user_text)
-                    user_added = True
+                    user_added = _append_turn("user", user_text)
                     output_chunks.append(first_token)
                     yield first_token
                     for token in stream:
@@ -3913,15 +3902,13 @@ class NOVAApp:
                         yield token
                 except StopIteration:
                     if not user_added:
-                        _append_turn("user", user_text)
-                        user_added = True
+                        user_added = _append_turn("user", user_text)
                     assistant_text = "(no response)"
                 except RuntimeError as exc:
                     # PEP 479: inner StopIteration may surface as RuntimeError.
                     if "StopIteration" in str(exc):
                         if not user_added:
-                            _append_turn("user", user_text)
-                            user_added = True
+                            user_added = _append_turn("user", user_text)
                         assistant_text = "(no response)"
                     else:
                         raise
@@ -3955,8 +3942,7 @@ class NOVAApp:
                     assistant_text = tool_result_text
 
                 if assistant_text:
-                    _append_turn("assistant", assistant_text)
-                    committed = True
+                    committed = _append_turn("assistant", assistant_text)
                     self._track_usage(
                         system_prompt,
                         history,
@@ -3989,8 +3975,7 @@ class NOVAApp:
                     if self._shutting_down.is_set():
                         partial = f"{partial}\n[truncated: shutdown]"
                     if not user_added:
-                        _append_turn("user", user_text)
-                        user_added = True
+                        user_added = _append_turn("user", user_text)
                     try:
                         if not usage_tracked:
                             self._track_usage(
@@ -4265,9 +4250,12 @@ class NOVAApp:
             provider = self.engine.last_provider
             self.usage.add(provider, input_tokens, output_tokens, session_id=session_id, when=today)
             total = self.usage.total_tokens_for_day(today, session_id=session_id)
-            if self._hard_cap_warning_day != today:
+            if self._hard_cap_hit_date is not None and self._hard_cap_hit_date != today:
+                self._hard_cap_hit = False
+                self._hard_cap_hit_date = None
+            if self._hard_cap_warning_day is not None and self._hard_cap_warning_day != today:
                 self._hard_cap_warning_day = None
-            if self._usage_alerted_day != today:
+            if self._usage_alerted_day is not None and self._usage_alerted_day != today:
                 self._usage_alerted_day = None
             hardcap = settings.DAILY_TOKEN_HARD_CAP
             warning_pct = max(0, min(100, int(settings.DAILY_TOKEN_HARD_CAP_WARNING_PCT)))
@@ -4330,9 +4318,10 @@ class NOVAApp:
 
         try:
             self._sync_executor.submit(_job)
-        except Exception:
+        except BaseException:
             with self._sync_all_lock:
                 self._sync_all_inflight = False
+            return
 
     def _interactive_confirm(self, prompt: str) -> bool:
         try:
