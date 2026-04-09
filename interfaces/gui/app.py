@@ -297,12 +297,10 @@ def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
         if not text:
             return
         if len(text) > 50_000:
-            # Bug 3 fix: clear the input so the user is not stuck with an unsubmittable message.
-            input_box.clear()
             append_line("[system] Input too long. Please keep messages under 50,000 characters.")
             return
-        input_box.clear()
         append_line(f"You: {text}")
+        input_box.clear()
         stream_prompt(text)
 
     def switch_session() -> None:

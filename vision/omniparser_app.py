@@ -72,7 +72,8 @@ async def probe(request: Request):
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Validate authentication token for all endpoints except health/probe."""
-    if AUTH_TOKEN and request.url.path not in ["/health", "/probe/"]:
+    path = request.url.path.rstrip("/") or "/"
+    if AUTH_TOKEN and path not in {"/health", "/probe"}:
         auth_header = request.headers.get("Authorization")
         if not auth_header or auth_header != f"Bearer {AUTH_TOKEN}":
             raise HTTPException(status_code=401, detail="Invalid or missing authentication token")

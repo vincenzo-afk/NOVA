@@ -10,7 +10,7 @@ from typing import Any
 
 from config.settings import settings
 from core.llm.roundrobin import RoundRobinPool
-from interfaces.key_manager import test_provider_key
+from interfaces.key_manager import _MAX_KEYS_PER_PROVIDER, looks_like_valid_key, test_provider_key
 
 
 def _run(cmd: list[str], timeout: float = 20.0) -> str:
@@ -226,15 +226,25 @@ def add_runtime_key(agent: Any, provider: str, key: str) -> dict[str, Any]:
     value = (key or "").strip()
     if not value:
         return {"status": "error", "reason": "key_required"}
+    if not looks_like_valid_key(p, value):
+        return {"status": "error", "reason": "invalid_key_format"}
 
     if p == "openai":
         keys = list(getattr(settings, "OPENAI_API_KEYS", []) or [])
+        if value in keys:
+            return {"status": "ok", "provider": "openai", "count": len(keys), "duplicate": True}
+        if len(keys) >= _MAX_KEYS_PER_PROVIDER:
+            return {"status": "error", "reason": "key_pool_limit_reached"}
         keys.append(value)
         settings.OPENAI_API_KEYS = keys
         agent.engine.pool = RoundRobinPool(keys) if keys else None
         return {"status": "ok", "provider": "openai", "count": len(keys)}
     if p == "gemini":
         keys = list(getattr(settings, "GEMINI_API_KEYS", []) or [])
+        if value in keys:
+            return {"status": "ok", "provider": "gemini", "count": len(keys), "duplicate": True}
+        if len(keys) >= _MAX_KEYS_PER_PROVIDER:
+            return {"status": "error", "reason": "key_pool_limit_reached"}
         keys.append(value)
         settings.GEMINI_API_KEYS = keys
         return {"status": "ok", "provider": "gemini", "count": len(keys)}

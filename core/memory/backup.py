@@ -35,11 +35,12 @@ def _backup_chromadb(chroma_dir: str = ".jarvis_chroma", export_dir: str = "expo
 
         for col in collections:
             try:
-                result = col.get(include=["documents", "metadatas", "ids"])
+                result = col.get(include=["documents", "metadatas", "ids", "embeddings"])
                 snapshot["collections"][col.name] = {
                     "ids": result.get("ids", []),
                     "documents": result.get("documents", []),
                     "metadatas": result.get("metadatas", []),
+                    "embeddings": result.get("embeddings", []),
                 }
             except Exception as exc:
                 snapshot["collections"][col.name] = {"error": str(exc)}
@@ -123,10 +124,19 @@ def restore_chromadb(snapshot_path: str, chroma_dir: str = ".jarvis_chroma") -> 
             ids = payload.get("ids") or []
             docs = payload.get("documents") or []
             metas = payload.get("metadatas") or []
-            if not ids or not docs:
+            embeddings = payload.get("embeddings") or []
+            valid_embeddings = isinstance(embeddings, list) and len(embeddings) == len(ids)
+            if not ids or (not docs and not valid_embeddings):
                 continue
             collection = client.get_or_create_collection(name)
-            collection.upsert(ids=ids, documents=docs, metadatas=metas)
+            upsert_kwargs = {"ids": ids}
+            if docs:
+                upsert_kwargs["documents"] = docs
+            if metas:
+                upsert_kwargs["metadatas"] = metas
+            if valid_embeddings:
+                upsert_kwargs["embeddings"] = embeddings
+            collection.upsert(**upsert_kwargs)
             restored += 1
         return f"ok:{restored}"
     except Exception as exc:

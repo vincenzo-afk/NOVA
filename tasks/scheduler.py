@@ -112,7 +112,17 @@ def parse_schedule_text(schedule_text: str) -> dict:
         text,
     )
     if weekday_match:
-        day = weekday_match.group(1)[:3]
+        weekday_name = weekday_match.group(1)
+        weekday_map = {
+            "monday": "mon",
+            "tuesday": "tue",
+            "wednesday": "wed",
+            "thursday": "thu",
+            "friday": "fri",
+            "saturday": "sat",
+            "sunday": "sun",
+        }
+        day = weekday_map[weekday_name]
         h, m = _normalize_time(weekday_match.group(2), weekday_match.group(3), weekday_match.group(4))
         return {
             "day_of_week": day,

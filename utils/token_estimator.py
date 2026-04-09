@@ -6,10 +6,10 @@ from typing import Iterable
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~4 characters per token."""
+    """Rough token estimate: ~3.5 characters per token."""
     if not text:
         return 0
-    return max(1, int(len(text) / 4))
+    return max(1, int(len(text) / 3.5))
 
 
 def estimate_tokens_from_messages(messages: Iterable[dict]) -> int:

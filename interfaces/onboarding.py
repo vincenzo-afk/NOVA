@@ -6,6 +6,7 @@ import re
 import os
 import shutil
 import sys
+import time as _time
 from pathlib import Path
 
 _SOUL_PATH = Path("SOUL.md")
@@ -95,12 +96,38 @@ def _language_defaults(language_name: str) -> tuple[str, str]:
     return mapping.get(name, ("en", "base"))
 
 
+def _normalize_privacy_mode(mode: str) -> str:
+    m = (mode or "").strip().lower()
+    if m in {"local_only", "balanced", "full_cloud"}:
+        return m
+    return "full_cloud"
+
+
+def _normalize_talk_mode(mode: str) -> str:
+    m = (mode or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if m in {"text", "text_only"}:
+        return "text"
+    if m in {"voice_with_wake_word", "voice_wake", "wakeword"}:
+        return "wakeword"
+    if m in {"voice_always_on", "voice_always", "always_on"}:
+        return "always_on"
+    return "text"
+
+
+def _default_timezone() -> str:
+    try:
+        tz = _time.tzname[0] if _time.tzname else ""
+        return str(tz or "").strip() or "UTC"
+    except Exception:
+        return "UTC"
+
+
 def _apply_onboarding_config(data: dict[str, str | list[str]]) -> None:
     name = str(data.get("name", "")).strip()
     context = str(data.get("context", "")).strip()
-    timezone = str(data.get("timezone", "")).strip()
-    mode = str(data.get("privacy_mode", "full_cloud")).strip().lower()
-    talk_mode = str(data.get("talk_mode", "text")).strip().lower()
+    timezone = str(data.get("timezone", "")).strip() or _default_timezone()
+    mode = _normalize_privacy_mode(str(data.get("privacy_mode", "full_cloud")))
+    talk_mode = _normalize_talk_mode(str(data.get("talk_mode", "text")))
     language_name = str(data.get("language", "English")).strip()
     selected_apps = [str(x).strip().lower() for x in (data.get("apps") or []) if str(x).strip()]
 
@@ -110,10 +137,10 @@ def _apply_onboarding_config(data: dict[str, str | list[str]]) -> None:
     env_updates: dict[str, str] = {
         "DEFAULT_LANG": lang_code,
         "WHISPER_MODEL": whisper_size,
-        "PRIVACY_MODE": mode if mode in {"local_only", "balanced", "full_cloud"} else "full_cloud",
+        "PRIVACY_MODE": mode,
     }
 
-    if talk_mode in {"text", "text only"}:
+    if talk_mode == "text":
         env_updates.update(
             {
                 "NOVA_VOICE_MODE": "text",
@@ -121,7 +148,7 @@ def _apply_onboarding_config(data: dict[str, str | list[str]]) -> None:
                 "AMBIENT_MONITOR_ENABLED": "false",
             }
         )
-    elif talk_mode in {"voice with wake word", "voice_wake", "wakeword"}:
+    elif talk_mode == "wakeword":
         env_updates.update(
             {
                 "NOVA_VOICE_MODE": "wakeword",
@@ -129,7 +156,7 @@ def _apply_onboarding_config(data: dict[str, str | list[str]]) -> None:
                 "AMBIENT_MONITOR_ENABLED": "false",
             }
         )
-    elif talk_mode in {"voice always-on", "voice_always", "always_on", "always-on"}:
+    elif talk_mode == "always_on":
         env_updates.update(
             {
                 "NOVA_VOICE_MODE": "always_on",
@@ -177,7 +204,9 @@ def _print_profile_summary(profile: dict) -> None:
     print(f"  ✓ Profile saved -> config/pc_profile.json")
 
 
-def _should_use_gui() -> bool:
+def _should_use_gui(force_gui: bool = False) -> bool:
+    if force_gui:
+        return True
     if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return False
     return True
@@ -359,7 +388,7 @@ def _run_cli_onboarding() -> dict[str, str | list[str]]:
     }
 
 
-def run_onboarding(force: bool = False) -> dict:
+def run_onboarding(force: bool = False, force_gui: bool = False) -> dict:
     if not force and _FLAG_PATH.exists():
         return {}
 
@@ -374,7 +403,7 @@ def run_onboarding(force: bool = False) -> dict:
         return {}
 
     data: dict[str, str | list[str]] | None = None
-    if _should_use_gui():
+    if _should_use_gui(force_gui=force_gui):
         data = _run_gui_wizard()
     if data is None:
         data = _run_cli_onboarding()
@@ -422,4 +451,5 @@ You are direct, efficient, and genuinely helpful. You don't waste words.
 
 if __name__ == "__main__":
     force = "--reset" in sys.argv or "--force" in sys.argv
-    run_onboarding(force=force)
+    force_gui = "--gui" in sys.argv
+    run_onboarding(force=force, force_gui=force_gui)

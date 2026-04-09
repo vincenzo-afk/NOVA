@@ -79,3 +79,34 @@ def test_apply_onboarding_config_always_on_enables_ambient(monkeypatch, tmp_path
     assert env["VOICE_BARGEIN_ENABLED"] == "true"
     assert env["AMBIENT_MONITOR_ENABLED"] == "true"
     assert env["DEFAULT_LANG"] == "ta"
+
+
+def test_apply_onboarding_config_normalizes_invalid_modes(monkeypatch, tmp_path):
+    env_example = tmp_path / ".env.example"
+    env_file = tmp_path / ".env"
+    soul_file = tmp_path / "SOUL.md"
+    flag_file = tmp_path / "config/onboarding_complete"
+    profile_file = tmp_path / "config/pc_profile.json"
+    env_example.write_text("DEFAULT_LANG=en\nWHISPER_MODEL=base\n", encoding="utf-8")
+
+    monkeypatch.setattr(onboarding, "_ENV_EXAMPLE_PATH", env_example)
+    monkeypatch.setattr(onboarding, "_ENV_PATH", env_file)
+    monkeypatch.setattr(onboarding, "_SOUL_PATH", soul_file)
+    monkeypatch.setattr(onboarding, "_FLAG_PATH", flag_file)
+    monkeypatch.setattr(onboarding, "_PROFILE_PATH", profile_file)
+
+    onboarding._apply_onboarding_config(
+        {
+            "name": "Alex",
+            "context": "Engineer",
+            "timezone": "",
+            "talk_mode": "???",
+            "language": "English",
+            "privacy_mode": "unknown_mode",
+            "apps": [],
+        }
+    )
+
+    env = _read_env(env_file)
+    assert env["NOVA_VOICE_MODE"] == "text"
+    assert env["PRIVACY_MODE"] == "full_cloud"

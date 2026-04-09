@@ -46,7 +46,13 @@ class PatternShortcutCompiler:
         for n in range(2, n_max + 1):
             for i in range(0, len(events) - n + 1):
                 window = events[i : i + n]
-                steps = [{"tool": e["tool"], "args": e.get("args", {})} for e in window]
+                steps = [
+                    {
+                        "tool": e["tool"],
+                        "args": self._generalize_args(e.get("args", {})),
+                    }
+                    for e in window
+                ]
                 key = json.dumps(steps, sort_keys=True, ensure_ascii=False)
                 seq_counter[key] += 1
                 seq_values[key] = steps
@@ -172,6 +178,14 @@ class PatternShortcutCompiler:
     def _describe(steps: list[dict[str, Any]]) -> str:
         tools = [str(s.get("tool", "")).strip() for s in steps if str(s.get("tool", "")).strip()]
         return " -> ".join(tools[:6])
+
+    def _generalize_args(self, args: Any) -> Any:
+        if isinstance(args, dict):
+            # Preserve shape, not values, so repeated logical workflows can match.
+            return {k: self._generalize_args(v) for k, v in sorted(args.items())}
+        if isinstance(args, list):
+            return [self._generalize_args(v) for v in args[:5]]
+        return "<value>"
 
 
 def _parse_ts(value: Any) -> datetime | None:

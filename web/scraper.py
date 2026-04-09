@@ -37,16 +37,14 @@ atexit.register(lambda: _DNS_RESOLVER_POOL.shutdown(wait=False, cancel_futures=T
 def _is_private_ip(ip: str) -> bool:
     try:
         addr = ipaddress.ip_address(ip)
-        mapped = getattr(addr, "ipv4_mapped", None)
-        if mapped is not None:
-            addr = mapped
+        # Handle IPv4-mapped IPv6 addresses (e.g. ::ffff:192.168.1.1)
+        if hasattr(addr, "ipv4_mapped") and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
 
-        # Reject if family mismatches ever occur; do not silently allow.
         for net in _PRIVATE_NETWORKS:
-            if addr.version != net.version:
-                continue
-            if addr in net:
-                return True
+            if addr.version == net.version:
+                if addr in net:
+                    return True
         return False
     except ValueError:
         return False
@@ -105,10 +103,14 @@ def _format_host_for_netloc(host: str) -> str:
 def scrape_text(url: str) -> str:
     current_url = url
     response = None
-    for _ in range(5):
+    redirect_count = 0
+    max_redirects = 5
+
+    while redirect_count <= max_redirects:
         scheme, hostname, resolved_ip = _validate_url(current_url)
         headers = {"User-Agent": "Mozilla/5.0 (NOVA/1.0)"}
         request_url = current_url
+
         if scheme == "http":
             parsed = urlparse(current_url)
             safe_host = _format_host_for_netloc(resolved_ip)
@@ -117,20 +119,22 @@ def scrape_text(url: str) -> str:
                 netloc = f"{safe_host}:{parsed.port}"
             request_url = parsed._replace(netloc=netloc).geturl()
             headers["Host"] = hostname
-        else:
-            _validate_url(current_url)
+
         response = requests.get(request_url, timeout=20, headers=headers, allow_redirects=False)
+
         if response.is_redirect or response.is_permanent_redirect:
+            redirect_count += 1
+            if redirect_count > max_redirects:
+                raise ValueError(f"Too many redirects (limit={max_redirects})")
             location = response.headers.get("Location")
             if not location:
                 break
             current_url = urljoin(current_url, location)
             continue
         break
+
     if response is None:
         raise ValueError("Failed to fetch URL")
-    if response.is_redirect or response.is_permanent_redirect:
-        raise ValueError("Too many redirects (limit=5)")
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
     for tag in soup(["script", "style", "noscript"]):

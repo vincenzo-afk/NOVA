@@ -74,6 +74,7 @@ class InsightExtractor:
         week_num = now.isocalendar()[1]
 
         with self._lock:
+            self._load_state()
             if self._last_insight_week == week_num:
                 return None  # already ran this week
             self._last_insight_week = week_num

@@ -24,6 +24,7 @@ _PROVIDERS = [
     "porcupine",
     "virustotal",
 ]
+_MAX_KEYS_PER_PROVIDER = 25
 
 
 def _mask_key(key: str) -> str:
@@ -31,6 +32,28 @@ def _mask_key(key: str) -> str:
     if len(cleaned) <= 10:
         return "*" * max(4, len(cleaned))
     return f"{cleaned[:4]}...{cleaned[-6:]}"
+
+
+def looks_like_valid_key(provider: str, key: str) -> bool:
+    p = (provider or "").strip().lower()
+    token = (key or "").strip()
+    if not token:
+        return False
+    if p == "openai":
+        return token.startswith("sk-") and len(token) >= 10
+    if p == "gemini":
+        return token.startswith("AIza") and len(token) >= 20
+    if p == "groq":
+        return token.startswith("gsk_") and len(token) >= 20
+    if p == "cerebras":
+        return token.startswith("csk_") and len(token) >= 20
+    if p == "telegram":
+        return ":" in token and len(token) >= 10
+    if p == "virustotal":
+        return len(token) >= 16
+    if p in {"mem0", "porcupine", "anthropic"}:
+        return len(token) >= 16
+    return len(token) >= 8
 
 
 def _build_fernet(password: str, salt: bytes):
@@ -270,7 +293,21 @@ def open_key_manager_dialog(settings_obj: Any, parent: Any = None) -> None:
         value = key_input.text().strip()
         if not provider or not value:
             return
-        data.setdefault(provider, []).append(value)
+        if not looks_like_valid_key(provider, value):
+            QMessageBox.warning(dlg, "Key Manager", f"Invalid key format for provider '{provider}'.")
+            return
+        keys = data.setdefault(provider, [])
+        if value in keys:
+            QMessageBox.information(dlg, "Key Manager", "That key already exists for this provider.")
+            return
+        if len(keys) >= _MAX_KEYS_PER_PROVIDER:
+            QMessageBox.warning(
+                dlg,
+                "Key Manager",
+                f"Key limit reached for {provider} (max {_MAX_KEYS_PER_PROVIDER}).",
+            )
+            return
+        keys.append(value)
         key_input.clear()
         refresh_list()
 

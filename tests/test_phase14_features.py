@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from config.settings import Settings
 from core.memory.memory_router import MemoryRouter
 from safety.virus_scanner import VirusScanner
@@ -68,3 +70,12 @@ def test_virus_scanner_flags_obvious_suspicious_buffer():
 def test_theme_engine_urgent_wins():
     decision = choose_theme(hour=11, topic="reading", emotion="urgent", locked_theme="")
     assert decision.name == "urgent"
+
+
+def test_virus_scanner_rejects_oversized_file(tmp_path: Path):
+    target = tmp_path / "huge.bin"
+    target.write_bytes(b"x" * 64)
+    scanner = VirusScanner(api_key="", max_scan_bytes=32)
+    result = scanner.scan_file(str(target))
+    assert result["status"] == "error"
+    assert result["reason"] == "file_too_large"

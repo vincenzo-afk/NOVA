@@ -33,6 +33,7 @@ def chunk_text(text: str, size: int = 512, overlap: int = 64) -> list[str]:
 
     out: list[str] = []
     current: list[str] = []
+    current_word_buffer: list[str] = []
     current_words = 0
 
     for sentence in sentences:
@@ -55,17 +56,20 @@ def chunk_text(text: str, size: int = 512, overlap: int = 64) -> list[str]:
 
         if current_words + sent_words <= size:
             current.append(sentence)
+            current_word_buffer.extend(sentence.split())
             current_words += sent_words
             continue
 
         out.append(" ".join(current).strip())
 
-        tail_words = " ".join(current).split()[-overlap:] if overlap > 0 else []
+        tail_words = current_word_buffer[-overlap:] if overlap > 0 else []
         current = [" ".join(tail_words).strip()] if tail_words else []
         current = [c for c in current if c]
-        current_words = _word_count(current[0]) if current else 0
+        current_word_buffer = list(tail_words)
+        current_words = len(current_word_buffer)
 
         current.append(sentence)
+        current_word_buffer.extend(sentence.split())
         current_words += sent_words
 
     if current:
