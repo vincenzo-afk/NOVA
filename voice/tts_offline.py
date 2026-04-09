@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 import os
+from typing import Any
 
 _QUEUE: queue.Queue | None = None
 _WORKER_THREAD: threading.Thread | None = None
@@ -52,6 +53,8 @@ def _tts_worker() -> None:
 
 def _ensure_worker() -> None:
     global _QUEUE, _WORKER_THREAD, _WORKER_DISABLED, _IS_STOPPED
+    if _WORKER_DISABLED:
+        return
     with _WORKER_LOCK:
         if _WORKER_DISABLED:
             return

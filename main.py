@@ -3965,6 +3965,12 @@ class NOVAApp:
                         day_anchor=today,
                         session_id=current_session_id,
                     )
+                    if settings.DAILY_TOKEN_HARD_CAP > 0:
+                        with self._usage_lock:
+                            new_total = self.usage.total_tokens_for_day(today, session_id=current_session_id)
+                            if new_total >= settings.DAILY_TOKEN_HARD_CAP:
+                                self._hard_cap_hit = True
+                                self._hard_cap_hit_date = today
                     usage_tracked = True
                     self._commit_memory_async(user_text, assistant_text, session_id=current_session_id)
                     self._schedule_self_eval(
@@ -3995,6 +4001,12 @@ class NOVAApp:
                                 day_anchor=today,
                                 session_id=current_session_id,
                             )
+                            if settings.DAILY_TOKEN_HARD_CAP > 0:
+                                with self._usage_lock:
+                                    new_total = self.usage.total_tokens_for_day(today, session_id=current_session_id)
+                                    if new_total >= settings.DAILY_TOKEN_HARD_CAP:
+                                        self._hard_cap_hit = True
+                                        self._hard_cap_hit_date = today
                     except Exception:
                         pass
                     if user_added:

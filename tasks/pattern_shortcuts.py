@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import re
+import tempfile
 from typing import Any
 
 from core.tools.dispatcher import ToolCall
@@ -156,7 +157,16 @@ class PatternShortcutCompiler:
 
     def _write_payload(self, payload: dict[str, Any]) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(self.output_path.parent),
+            delete=False,
+            suffix=".tmp",
+        ) as tmp:
+            tmp.write(json.dumps(payload, indent=2, ensure_ascii=False))
+            tmp_path = Path(tmp.name)
+        tmp_path.replace(self.output_path)
 
     def _build_name(self, steps: list[dict[str, Any]], used_names: set[str]) -> str:
         parts: list[str] = []

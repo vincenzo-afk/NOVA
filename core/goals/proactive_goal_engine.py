@@ -138,6 +138,9 @@ class ProactiveGoalEngine:
             self._propose(goal)
         except Exception as exc:
             log.warning("[proactive_goal_engine] propose_fn failed: %s", exc)
+            with self._lock:
+                self._proposed = [g for g in self._proposed if g.get("id") != goal.get("id")]
+            return None
 
         return goal
 
