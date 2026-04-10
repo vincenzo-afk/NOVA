@@ -245,12 +245,18 @@ class AutomationFactory:
         self._worker_thread.start()
 
     def _worker_loop(self) -> None:
+        # Never allow a stray exception to kill the worker thread; otherwise queued jobs
+        # can get stuck forever until another enqueue happens to restart it.
         while not self._stop_event.is_set():
-            job = self._next_job()
-            if job is None:
-                time.sleep(1.0)
+            try:
+                job = self._next_job()
+                if job is None:
+                    time.sleep(1.0)
+                    continue
+                self._run_job(job)
+            except Exception:
+                time.sleep(0.5)
                 continue
-            self._run_job(job)
 
     def _next_job(self) -> BatchJob | None:
         with self._lock:

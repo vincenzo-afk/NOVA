@@ -113,7 +113,11 @@ def speak(text: str, stop_event: threading.Event | None = None) -> None:
     if q is None or worker is None or not worker.is_alive():
         return
     done_event = threading.Event()
-    q.put((text, done_event))
+    try:
+        q.put((text, done_event))
+    except Exception:
+        # If the queue is broken for any reason, don't block the caller.
+        done_event.set()
     started = time.monotonic()
     while not done_event.is_set():
         if stop_event is not None and stop_event.is_set():
@@ -131,6 +135,7 @@ def speak(text: str, stop_event: threading.Event | None = None) -> None:
                         _ENGINE.stop()
                     except Exception:
                         pass
+            done_event.set()
             break
         time.sleep(0.05)
 

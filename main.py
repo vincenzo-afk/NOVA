@@ -1847,7 +1847,9 @@ class NOVAApp:
                         netloc = f"{netloc}:{parsed.port}"
                     endpoint_to_connect = urlunparse(parsed._replace(netloc=netloc))
                     host_header = parsed_host if parsed.port is None else f"{parsed_host}:{parsed.port}"
-                    merged_headers.setdefault("Host", host_header)
+                    # Security: do not allow caller-provided headers to override the pinned Host header,
+                    # otherwise an attacker can re-introduce SSRF via Host header injection.
+                    merged_headers["Host"] = host_header
                 except Exception:
                     endpoint_to_connect = endpoint
             if key and "Authorization" not in merged_headers:
@@ -3678,7 +3680,35 @@ class NOVAApp:
                 return "Usage: Nova, play <game>"
             return json.dumps(self._learn_game_bot(game), ensure_ascii=False, indent=2)
         if text.startswith("nova, learn this app") or text.startswith("nova learn this app"):
-            return json.dumps(self._learn_app("current_app"), ensure_ascii=False, indent=2)
+            # Best-effort foreground app detection to avoid a stubbed "current_app" label.
+            app_name = ""
+            try:
+                import platform
+                system = platform.system()
+                if system == "Windows":
+                    import win32gui  # type: ignore
+
+                    hwnd = win32gui.GetForegroundWindow()
+                    app_name = (win32gui.GetWindowText(hwnd) or "").strip()
+                elif system == "Darwin":
+                    import subprocess
+
+                    out = subprocess.check_output(
+                        ["osascript", "-e", 'tell application "System Events" to get name of first application process whose frontmost is true'],
+                        text=True,
+                        timeout=2.0,
+                    )
+                    app_name = (out or "").strip()
+                else:
+                    import subprocess
+
+                    out = subprocess.check_output(
+                        ["xdotool", "getactivewindow", "getwindowname"], text=True, timeout=2.0
+                    )
+                    app_name = (out or "").strip()
+            except Exception:
+                app_name = ""
+            return json.dumps(self._learn_app(app_name or "current_app"), ensure_ascii=False, indent=2)
         if text.startswith("nova, live ") or text.startswith("nova live "):
             topic = user_text.split("live", 1)[1].strip()
             if not topic:
@@ -3812,9 +3842,11 @@ class NOVAApp:
             current_history = list(current_session.history)
 
         def _append_turn(role: str, content: str) -> bool:
-            if self.session.current.session_id != current_session_id:
-                return False
             with current_session._lock:
+                # Re-check under lock to avoid a race with switch_session between the outer check
+                # and the append, which could otherwise write a turn into the wrong session.
+                if self.session.current.session_id != current_session_id:
+                    return False
                 current_session.history.append({"role": role, "content": content})
                 max_turns = getattr(self.session, "_max_history_turns", 500)
                 if len(current_session.history) > max_turns:
@@ -4335,9 +4367,19 @@ class NOVAApp:
 
         try:
             self._sync_executor.submit(_job)
-        except BaseException:
+        except BaseException as exc:
             with self._sync_all_lock:
                 self._sync_all_inflight = False
+            try:
+                self.record_event("health", f"sync_all_submit_failed:{exc}")
+            except Exception:
+                pass
+            # Best-effort retry soon if the executor is temporarily unavailable.
+            try:
+                if not self._shutting_down.is_set():
+                    threading.Timer(2.0, self._schedule_sync_all_pending).start()
+            except Exception:
+                pass
             return
 
     def _interactive_confirm(self, prompt: str) -> bool:

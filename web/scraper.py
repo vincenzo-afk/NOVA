@@ -31,7 +31,14 @@ _PRIVATE_NETWORKS = [
     ipaddress.ip_network("fe80::/10"),
 ]
 _DNS_RESOLVER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="dns_resolver")
-atexit.register(lambda: _DNS_RESOLVER_POOL.shutdown(wait=False, cancel_futures=True))
+def _shutdown_dns_pool() -> None:
+    # cancel_futures was added in Python 3.9.
+    try:
+        _DNS_RESOLVER_POOL.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        _DNS_RESOLVER_POOL.shutdown(wait=False)
+
+atexit.register(_shutdown_dns_pool)
 
 
 def _is_private_ip(ip: str) -> bool:

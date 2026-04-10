@@ -121,9 +121,11 @@ class MemoryRouter:
             def _item_key(item: dict) -> str:
                 text = str(item.get("text", ""))
                 meta = item.get("metadata", {}) or {}
-                return hashlib.sha256(
-                    f"{session_id}:{text}:{json.dumps(meta, sort_keys=True, ensure_ascii=False)}".encode("utf-8")
-                ).hexdigest()
+                try:
+                    meta_json = json.dumps(meta, sort_keys=True, ensure_ascii=False, default=str)
+                except Exception:
+                    meta_json = repr(meta)
+                return hashlib.sha256(f"{session_id}:{text}:{meta_json}".encode("utf-8")).hexdigest()
 
             synced_keys = {_item_key(item) for item in synced}
             retained = [item for item in current_items if _item_key(item) not in synced_keys]
