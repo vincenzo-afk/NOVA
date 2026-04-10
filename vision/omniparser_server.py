@@ -38,13 +38,19 @@ def _is_safe_pythonpath_entry(entry: str) -> bool:
         return False
     if not resolved.exists():
         return False
-    safe_roots = [
-        Path.cwd().resolve(),
-        Path.home().resolve(),
+    cwd_root = Path.cwd().resolve()
+    prefix_roots = [
         Path(sys.prefix).resolve(),
         Path(getattr(sys, "base_prefix", sys.prefix)).resolve(),
     ]
-    return any(str(resolved).startswith(str(root)) for root in safe_roots)
+    try:
+        import site
+
+        site_roots = [Path(p).resolve() for p in site.getsitepackages() if p]
+    except Exception:
+        site_roots = []
+    safe_roots = [cwd_root, *prefix_roots, *site_roots]
+    return any(resolved == root or root in resolved.parents for root in safe_roots)
 
 
 def _safe_env(extra_pythonpath: str = "", auth_token: str = "") -> dict[str, str]:

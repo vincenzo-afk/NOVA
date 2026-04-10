@@ -108,10 +108,10 @@ class RoundRobinPool:
             self._recover_due_keys()
             return sum(1 for k in self._keys if k.status == "active")
 
-    def snapshot(self) -> list[dict]:
+    def snapshot(self) -> dict[str, object]:
         with self._lock:
             self._recover_due_keys()
-            return [
+            cloud = [
                 {
                     "key": self.key_label(k.key),
                     "status": k.status,
@@ -120,6 +120,7 @@ class RoundRobinPool:
                 }
                 for k in self._keys
             ]
+            return {"cloud": cloud, "active_count": sum(1 for k in self._keys if k.status == "active")}
 
     def _find(self, key: str) -> KeyState:
         for record in self._keys:

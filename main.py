@@ -3958,7 +3958,12 @@ class NOVAApp:
                                 self._hard_cap_hit = True
                                 self._hard_cap_hit_date = today
                     usage_tracked = True
-                    self._commit_memory_async(user_text, assistant_text, session_id=current_session_id)
+                    self._commit_memory_async(
+                        user_text,
+                        assistant_text,
+                        session_id=current_session_id,
+                        allow_during_shutdown=True,
+                    )
                     self._schedule_self_eval(
                         user_text=user_text,
                         assistant_text=assistant_text,
@@ -3994,9 +3999,14 @@ class NOVAApp:
                                         self._hard_cap_hit_date = today
                     except Exception:
                         pass
-                    if user_added:
+                    if user_added and not committed:
                         _append_turn("assistant", partial)
-                        self._commit_memory_async(user_text, partial, session_id=current_session_id)
+                        self._commit_memory_async(
+                            user_text,
+                            partial,
+                            session_id=current_session_id,
+                            allow_during_shutdown=True,
+                        )
                         self._schedule_self_eval(user_text=user_text, assistant_text=partial, session_id=current_session_id)
 
     def _schedule_self_eval(self, *, user_text: str, assistant_text: str, session_id: str) -> None:
@@ -4058,8 +4068,15 @@ class NOVAApp:
         except Exception:
             pass
 
-    def _commit_memory_async(self, user_text: str, assistant_text: str, session_id: str | None = None) -> None:
-        if self._shutting_down.is_set():
+    def _commit_memory_async(
+        self,
+        user_text: str,
+        assistant_text: str,
+        session_id: str | None = None,
+        *,
+        allow_during_shutdown: bool = False,
+    ) -> None:
+        if self._shutting_down.is_set() and not allow_during_shutdown:
             return
         session_id = session_id or self.session.current.session_id
         self._a2a_publish_context_sync(

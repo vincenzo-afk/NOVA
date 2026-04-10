@@ -68,13 +68,11 @@ def _check_ast(source: str):
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in restricted:
             raise ValueError(f"Restricted identifier used: {node.id}")
-        if isinstance(node, ast.Attribute) and node.attr in restricted:
-            raise ValueError(f"Restricted attribute used: {node.attr}")
         if isinstance(node, ast.Attribute):
             cur = node
             while isinstance(cur, ast.Attribute):
-                if cur.attr in restricted:
-                    raise ValueError(f"Restricted attribute chain used: {cur.attr}")
+                if cur.attr in restricted or cur.attr in {"__bases__", "__class__", "__subclasses__"}:
+                    raise ValueError(f"Restricted attribute: {cur.attr}")
                 cur = cur.value
         if (
             isinstance(node, ast.Call)

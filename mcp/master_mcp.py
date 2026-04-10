@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import time
 from typing import Any, Callable
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -234,7 +235,27 @@ class MasterMCP:
 
         for attempt in range(self.max_retries + 1):
             try:
-                response = requests.request(method=method, url=url, **kwargs)
+                request_kwargs = dict(kwargs)
+                request_kwargs.setdefault("allow_redirects", False)
+                headers = dict(request_kwargs.get("headers") or {})
+                current_url = url
+                response = None
+                for _ in range(6):
+                    request_kwargs["headers"] = headers
+                    response = requests.request(method=method, url=current_url, **request_kwargs)
+                    is_redirect = bool(getattr(response, "is_redirect", False))
+                    is_permanent_redirect = bool(getattr(response, "is_permanent_redirect", False))
+                    if not is_redirect and not is_permanent_redirect:
+                        break
+                    location = getattr(response, "headers", {}).get("location")
+                    if not location:
+                        break
+                    next_url = urljoin(current_url, location)
+                    if urlparse(next_url).netloc != urlparse(current_url).netloc:
+                        headers.pop("Authorization", None)
+                    current_url = next_url
+                if response is None:
+                    raise RuntimeError("request_failed_without_response")
                 if response.status_code in retryable_codes:
                     if attempt < self.max_retries:
                         delay = self.backoff_base_seconds * (2 ** attempt)

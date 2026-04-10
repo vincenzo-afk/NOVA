@@ -62,12 +62,12 @@ class EmbeddingBackend:
         threading.Thread(target=_job, daemon=True).start()
 
     def encode(self, texts: Iterable[str]) -> List[list[float]]:
-        # Fix 3.1: Release lock after model loading - SentenceTransformer.encode() is thread-safe
+        # Fix 3.1: capture model reference before releasing the lock.
         with self._lock:
             if self._model is None:
                 self._load()
-        # Model is now loaded, encode without holding the lock
-        embeddings = self._model.encode(
+            model = self._model
+        embeddings = model.encode(
             list(texts),
             normalize_embeddings=True,
         )

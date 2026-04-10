@@ -32,11 +32,8 @@ _MAX_MEMORY_TEXT_LEN = 4000  # cap memory entries to prevent runaway growth
 def _sanitize_memory_text(text: str) -> str:
     """Strip or truncate suspicious injection content before persisting."""
     truncated = text[:_MAX_MEMORY_TEXT_LEN]
-    detected = detect_prompt_injection(truncated)
-    if isinstance(detected, tuple):
-        is_injected, reason = bool(detected[0]), str(detected[1] or "injection_detected")
-    else:
-        is_injected, reason = bool(detected), "injection_detected"
+    is_injected = bool(detect_prompt_injection(truncated))
+    reason = "injection_detected"
     if is_injected:
         return f"[filtered] memory injection: {reason}"
     return truncated

@@ -126,7 +126,7 @@ class SessionManager:
                 # written successfully. If the write failed (disk full, permissions, etc.)
                 # the .bak is our only copy — never delete it unconditionally.
                 expected_size = len(payload.encode("utf-8"))
-                if path.exists() and path.stat().st_size == expected_size and expected_size > 0:
+                if path.exists() and path.stat().st_size >= expected_size and expected_size > 0:
                     try:
                         import json as _json
                         verify = _json.loads(path.read_text(encoding="utf-8"))

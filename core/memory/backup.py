@@ -125,8 +125,8 @@ def restore_chromadb(snapshot_path: str, chroma_dir: str = ".jarvis_chroma") -> 
             docs = payload.get("documents") or []
             metas = payload.get("metadatas") or []
             embeddings = payload.get("embeddings") or []
-            valid_embeddings = isinstance(embeddings, list) and len(embeddings) == len(ids)
-            if not ids or (not docs and not valid_embeddings):
+            has_embeddings = isinstance(embeddings, list) and len(embeddings) > 0
+            if not ids or (not docs and not has_embeddings):
                 continue
             collection = client.get_or_create_collection(name)
             upsert_kwargs = {"ids": ids}
@@ -134,7 +134,7 @@ def restore_chromadb(snapshot_path: str, chroma_dir: str = ".jarvis_chroma") -> 
                 upsert_kwargs["documents"] = docs
             if metas:
                 upsert_kwargs["metadatas"] = metas
-            if valid_embeddings:
+            if has_embeddings:
                 upsert_kwargs["embeddings"] = embeddings
             collection.upsert(**upsert_kwargs)
             restored += 1

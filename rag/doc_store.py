@@ -36,6 +36,7 @@ class DocumentStore:
         self._client = None
         self._collection = None
         self._embedder: EmbeddingBackend | None = None
+        self._chroma_retry_time = 0.0
         self._use_chroma = self._init_chroma()
 
     def _init_chroma(self) -> bool:
@@ -65,6 +66,12 @@ class DocumentStore:
         return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
     def ingest(self, filepath: str) -> dict:
+        import time
+
+        if not self._use_chroma and time.time() > self._chroma_retry_time:
+            self._use_chroma = self._init_chroma()
+            if not self._use_chroma:
+                self._chroma_retry_time = time.time() + 60.0
         doc = self.loader.load(filepath)
         chunks = chunk_text(doc["text"])
         filename = doc["filename"]
@@ -125,6 +132,7 @@ class DocumentStore:
                 except Exception:
                     pass
                 self._use_chroma = False
+                self._chroma_retry_time = time.time() + 60.0
         return {"filename": filename, "chunks": len(chunks), **self._doc_meta[filename]}
 
     def query(self, question: str, filename: str | None = None, top_k: int = 5) -> list[str]:
