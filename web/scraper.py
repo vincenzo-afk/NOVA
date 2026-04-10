@@ -120,7 +120,13 @@ def scrape_text(url: str) -> str:
             request_url = parsed._replace(netloc=netloc).geturl()
             headers["Host"] = hostname
 
-        response = requests.get(request_url, timeout=20, headers=headers, allow_redirects=False)
+        response = requests.get(
+            request_url,
+            timeout=20,
+            headers=headers,
+            allow_redirects=False,
+            stream=True,
+        )
 
         if response.is_redirect or response.is_permanent_redirect:
             redirect_count += 1
@@ -136,12 +142,27 @@ def scrape_text(url: str) -> str:
     if response is None:
         raise ValueError("Failed to fetch URL")
     response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
+    from core.think.reasoning import detect_prompt_injection
+    raw_chunks: list[str] = []
+    try:
+        for chunk in response.iter_content(chunk_size=8192, decode_unicode=True):
+            if not chunk:
+                continue
+            if detect_prompt_injection(chunk):
+                response.close()
+                return "[Content from web (untrusted) - BLOCKED due to prompt injection: injection_detected]"
+            raw_chunks.append(chunk)
+    finally:
+        response.close()
+
+    raw_text = "".join(raw_chunks)
+    if detect_prompt_injection(raw_text):
+        return "[Content from web (untrusted) - BLOCKED due to prompt injection: injection_detected]"
+    soup = BeautifulSoup(raw_text, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     
     import re
-    from core.think.reasoning import detect_prompt_injection
     
     text = soup.get_text("\n", strip=True)
     

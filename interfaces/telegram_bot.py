@@ -61,11 +61,14 @@ def is_whitelisted(user_id: str | int, allowed_chat_id: str | None = None) -> bo
         return False
 
 
-def format_status_message(status_text: str) -> str:
-    try:
-        payload = json.loads(status_text)
-    except Exception:
-        return status_text
+def format_status_message(status_text: Any) -> str:
+    if isinstance(status_text, dict):
+        payload = status_text
+    else:
+        try:
+            payload = json.loads(str(status_text))
+        except Exception:
+            return str(status_text)
 
     health_summary = payload.get("health_summary") or {}
     lines = [

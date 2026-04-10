@@ -38,7 +38,7 @@ class ContextTrimmer:
                 if turn.get("content")
             )
             if session_id in self._summary_inflight:
-                return summary, recent
+                return self.summaries.get(session_id, summary), recent
             self._summary_inflight.add(session_id)
 
         try:

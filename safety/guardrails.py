@@ -18,6 +18,10 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, Callable
+try:
+    import fcntl  # type: ignore
+except Exception:  # pragma: no cover
+    fcntl = None
 
 from config.settings import settings
 
@@ -64,6 +68,43 @@ def _emergency_stop_paths(base_path: Path | None = None) -> tuple[Path, Path]:
 # Initialize with current CWD, but Guardrails calls this again during __init__.
 _EMERGENCY_STOP_FILE, _EMERGENCY_STOP_FILE_FALLBACK = _emergency_stop_paths()
 _EMERGENCY_STOP_INIT_LOCK = threading.Lock()
+_EMERGENCY_STOP_FILE_LOCK = threading.Lock()
+
+
+def _write_stop_file(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                pass
+        handle.write(value)
+        handle.flush()
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+
+
+def _delete_stop_file(path: Path) -> None:
+    if not path.exists():
+        return
+    with path.open("a+", encoding="utf-8") as handle:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                pass
+        try:
+            path.unlink(missing_ok=True)
+        finally:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -321,32 +362,40 @@ class Guardrails:
         """Activate emergency stop and persist to disk so it survives restarts (fix 1.9)."""
         self._emergency_stop.set()
         primary, fallback = self._resolve_emergency_stop_files()
-        try:
-            primary.parent.mkdir(parents=True, exist_ok=True)
-            primary.write_text("1", encoding="utf-8")
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("Failed to write to primary emergency stop file: %s", exc)
+        with _EMERGENCY_STOP_FILE_LOCK:
             try:
-                fallback.parent.mkdir(parents=True, exist_ok=True)
-                fallback.write_text("1", encoding="utf-8")
-            except Exception:
-                pass
+                _write_stop_file(primary, "1")
+                try:
+                    primary.chmod(0o600)
+                except Exception:
+                    pass
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("Failed to write to primary emergency stop file: %s", exc)
+                try:
+                    _write_stop_file(fallback, "1")
+                    try:
+                        fallback.chmod(0o600)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
     def clear_emergency_stop(self) -> None:
         """Clear the emergency stop and remove the persistence file (fix 1.9)."""
         self._emergency_stop.clear()
         primary, fallback = self._resolve_emergency_stop_files()
-        try:
-            primary.unlink(missing_ok=True)
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("Failed to delete primary emergency stop file %s: %s", primary, exc)
-        try:
-            fallback.unlink(missing_ok=True)
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("Failed to delete fallback emergency stop file %s: %s", fallback, exc)
+        with _EMERGENCY_STOP_FILE_LOCK:
+            try:
+                _delete_stop_file(primary)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("Failed to delete primary emergency stop file %s: %s", primary, exc)
+            try:
+                _delete_stop_file(fallback)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("Failed to delete fallback emergency stop file %s: %s", fallback, exc)
 
     def is_emergency_stopped(self) -> bool:
         return self._emergency_stop.is_set()

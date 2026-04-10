@@ -47,16 +47,24 @@ class PatternShortcutCompiler:
         for n in range(2, n_max + 1):
             for i in range(0, len(events) - n + 1):
                 window = events[i : i + n]
-                steps = [
+                raw_steps = [
+                    {
+                        "tool": e["tool"],
+                        "args": e.get("args", {}) or {},
+                    }
+                    for e in window
+                ]
+                pattern_steps = [
                     {
                         "tool": e["tool"],
                         "args": self._generalize_args(e.get("args", {})),
                     }
                     for e in window
                 ]
-                key = json.dumps(steps, sort_keys=True, ensure_ascii=False)
+                key = json.dumps(pattern_steps, sort_keys=True, ensure_ascii=False)
                 seq_counter[key] += 1
-                seq_values[key] = steps
+                if key not in seq_values:
+                    seq_values[key] = raw_steps
 
         compiled: list[dict[str, Any]] = []
         used_names: set[str] = set()
@@ -87,7 +95,14 @@ class PatternShortcutCompiler:
         payload = self._read_payload()
         return list(payload.get("shortcuts", []))
 
-    def run_shortcut(self, *, name: str, dispatcher, dry_run: bool = False) -> dict[str, Any]:
+    def run_shortcut(
+        self,
+        *,
+        name: str,
+        dispatcher,
+        dry_run: bool = False,
+        live_args: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload = self._read_payload()
         shortcuts = payload.get("shortcuts", [])
         target = None
@@ -102,13 +117,8 @@ class PatternShortcutCompiler:
         results: list[dict[str, Any]] = []
         for idx, step in enumerate(steps):
             raw_args = dict(step.get("args", {}) or {})
-            if self._contains_placeholder(raw_args):
-                return {
-                    "status": "error",
-                    "reason": "shortcut_contains_generalized_placeholders",
-                    "name": target.get("name"),
-                    "step_index": idx,
-                }
+            if live_args:
+                raw_args.update(live_args)
             call = ToolCall(tool=str(step.get("tool", "")), args=raw_args)
             result = dispatcher.execute(tool_call=call, dry_run=bool(dry_run))
             results.append({"step_index": idx, "tool": call.tool, "result": result})
@@ -205,12 +215,6 @@ class PatternShortcutCompiler:
             return [self._generalize_args(v) for v in args[:5]]
         return "<value>"
 
-    def _contains_placeholder(self, value: Any) -> bool:
-        if isinstance(value, dict):
-            return any(self._contains_placeholder(v) for v in value.values())
-        if isinstance(value, list):
-            return any(self._contains_placeholder(v) for v in value)
-        return value == "<value>"
 
 
 def _parse_ts(value: Any) -> datetime | None:

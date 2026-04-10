@@ -9,6 +9,7 @@ Fixes applied:
 from __future__ import annotations
 
 from collections import defaultdict
+from collections import deque
 import hashlib
 import json
 import re
@@ -42,6 +43,8 @@ def _sanitize_memory_text(text: str) -> str:
 
 
 class MemoryRouter:
+    _MAX_SEEN_HASHES = 200_000
+
     def __init__(self, mem0: Mem0Client, local: LocalMemoryStore):
         self.mem0 = mem0
         self.local = local
@@ -49,6 +52,7 @@ class MemoryRouter:
         self._remote_sync_enabled = True
         self._pending_sync: dict[str, list[dict]] = defaultdict(list)
         self._seen_hashes: set[str] = set()
+        self._seen_hash_order: deque[str] = deque()
         self._sync_lock = threading.Lock()  # fix 2.2
 
     @property
@@ -71,11 +75,19 @@ class MemoryRouter:
                 return {"status": "duplicate", "id": hash_id}
             # Reserve the hash before local I/O to avoid TOCTOU duplicates.
             self._seen_hashes.add(hash_id)
+            self._seen_hash_order.append(hash_id)
+            while len(self._seen_hash_order) > self._MAX_SEEN_HASHES:
+                old = self._seen_hash_order.popleft()
+                self._seen_hashes.discard(old)
 
         local_result = self.local.add(safe_text, session_id, metadata)
         if local_result.get("status") not in {"ok", "duplicate"}:
             with self._sync_lock:
                 self._seen_hashes.discard(hash_id)
+                try:
+                    self._seen_hash_order.remove(hash_id)
+                except ValueError:
+                    pass
             return local_result
 
         if self._online and self._remote_sync_enabled:

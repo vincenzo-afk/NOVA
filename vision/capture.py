@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import io
 import logging
+import os
+from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import time
 from typing import Generator
 
@@ -85,7 +88,6 @@ def _capture_region_pil(x: int, y: int, width: int, height: int) -> bytes:
 
 
 def _capture_full_scrot() -> bytes:
-    import tempfile, os
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         path = f.name
     try:
@@ -147,7 +149,3 @@ def capture_periodic_png(
     while True:
         yield capture_screen_png()
         time.sleep(max(0.1, interval_seconds))
-
-
-# needed by _capture_full_scrot
-from pathlib import Path  # noqa: E402 (must be at bottom due to scrot fn reference)
