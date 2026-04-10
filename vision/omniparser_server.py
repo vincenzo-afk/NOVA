@@ -107,6 +107,7 @@ class OmniParserServer:
         self.proc: subprocess.Popen | None = None
         self.log_file = None
         self._proc_lock = threading.Lock()
+        self._starting = False
         # Fix 7.3: Generate random auth token for API security
         self.auth_token = secrets.token_urlsafe(32)
         if not self.command:
@@ -136,13 +137,18 @@ class OmniParserServer:
                 except Exception:
                     pass
                 self.proc = None
+                self._starting = False
 
             if self.is_running():
                 return
-            if self.proc and self.proc.poll() is None:
+            if self._starting:
+                # Another thread is already in the spawn path; wait below.
+                pass
+            elif self.proc and self.proc.poll() is None:
                 # Process is alive but not responding yet — wait below
                 pass
             else:
+                self._starting = True
                 project_root = Path.cwd().resolve()
                 pythonpath = str(project_root)
                 if self.repo_dir:
@@ -167,12 +173,16 @@ class OmniParserServer:
                         cwd=str(project_root),
                     )
                 except Exception:
+                    self._starting = False
                     try:
                         self.log_file.close()
                     except Exception:
                         pass
                     self.log_file = None
                     raise
+                finally:
+                    # Spawn is complete (successfully started a process); health polling continues outside lock.
+                    self._starting = False
 
         # Poll with exponential backoff up to startup_timeout
         delay = 1.0

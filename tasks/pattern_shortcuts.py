@@ -184,7 +184,17 @@ class PatternShortcutCompiler:
         ) as tmp:
             tmp.write(json.dumps(payload, indent=2, ensure_ascii=False))
             tmp_path = Path(tmp.name)
-        tmp_path.replace(self.output_path)
+        try:
+            tmp_path.replace(self.output_path)
+        except OSError:
+            # Cross-device moves (EXDEV) and some Windows setups can fail here. Fallback to copy+unlink.
+            import shutil
+
+            shutil.copy2(tmp_path, self.output_path)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def _build_name(self, steps: list[dict[str, Any]], used_names: set[str]) -> str:
         parts: list[str] = []

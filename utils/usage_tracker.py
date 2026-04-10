@@ -49,23 +49,24 @@ class UsageTracker:
 
     def _persist(self) -> None:
         try:
-            if self._persist_path is None:
-                return
-            if not self._dirty:
-                return
-            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
-            payload: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
-            for day_key, sessions in self._daily.items():
-                payload[day_key.isoformat()] = {}
-                for session_id, providers in sessions.items():
-                    payload[day_key.isoformat()][session_id] = {}
-                    for provider, entry in providers.items():
-                        payload[day_key.isoformat()][session_id][provider] = {
-                            "input_tokens": entry.input_tokens,
-                            "output_tokens": entry.output_tokens,
-                        }
-            self._persist_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            self._dirty = False
+            with self._lock:
+                if self._persist_path is None:
+                    return
+                if not self._dirty:
+                    return
+                self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+                payload: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
+                for day_key, sessions in self._daily.items():
+                    payload[day_key.isoformat()] = {}
+                    for session_id, providers in sessions.items():
+                        payload[day_key.isoformat()][session_id] = {}
+                        for provider, entry in providers.items():
+                            payload[day_key.isoformat()][session_id][provider] = {
+                                "input_tokens": entry.input_tokens,
+                                "output_tokens": entry.output_tokens,
+                            }
+                self._persist_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                self._dirty = False
         except Exception:
             pass
 
