@@ -26,8 +26,10 @@ class LocalMemoryStore:
         self._client = None
         self._collection = None
         self._embedder: EmbeddingBackend | None = None
-        self._chroma_init_lock = threading.Lock()
-        self._insert_lock = threading.Lock()
+        self._chroma_init_lock = threading.RLock()
+        # Re-entrant so helper methods can enforce a consistent lock ordering:
+        # always acquire _insert_lock -> _chroma_init_lock when touching Chroma init state.
+        self._insert_lock = threading.RLock()
         self._use_chroma = self._init_chroma()
         self._chroma_retry_time = 0.0
 
@@ -65,7 +67,7 @@ class LocalMemoryStore:
 
     def _dedup_exists(self, hash_id: str) -> bool:
         import time
-        with self._chroma_init_lock:
+        with self._insert_lock, self._chroma_init_lock:
             if not self._use_chroma and time.time() > self._chroma_retry_time:
                 self._use_chroma = self._init_chroma()
                 if not self._use_chroma:
@@ -79,7 +81,7 @@ class LocalMemoryStore:
                 return True
             return hash_id in self._item_hashes
         except Exception:
-            with self._chroma_init_lock:
+            with self._insert_lock, self._chroma_init_lock:
                 self._use_chroma = False
                 self._chroma_retry_time = time.time() + 60.0
             return hash_id in self._item_hashes
@@ -87,7 +89,7 @@ class LocalMemoryStore:
     def add(self, text: str, session_id: str, metadata: dict | None = None) -> dict:
         import time
         if not self._use_chroma and time.time() > self._chroma_retry_time:
-            with self._chroma_init_lock:
+            with self._insert_lock, self._chroma_init_lock:
                 if not self._use_chroma and time.time() > self._chroma_retry_time:
                     self._use_chroma = self._init_chroma()
 
@@ -110,7 +112,7 @@ class LocalMemoryStore:
             except Exception:
                 pass
 
-        with self._insert_lock:
+        with self._insert_lock, self._chroma_init_lock:
             if self._dedup_exists(hash_id):
                 return {"status": "duplicate", "id": hash_id}
             payload = metadata or {}

@@ -219,6 +219,13 @@ class GoalRunner:
                         self._executor.shutdown(wait=False, cancel_futures=True)
                     except TypeError:
                         self._executor.shutdown(wait=False)
+                    if self._closed:
+                        return GoalResult(
+                            status="failed",
+                            reason="runner_closed",
+                            results=results,
+                            next_index=idx,
+                        )
                     self._executor = ThreadPoolExecutor(max_workers=1)
                 return GoalResult(
                     status="failed",

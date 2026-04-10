@@ -77,6 +77,8 @@ def format_usage_line(snapshot: dict[str, Any]) -> str:
 
 
 def launch_gui(agent: Any, notify_fn: Any | None = None) -> None:
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("launch_gui must be called from the main thread")
     try:
         from PyQt6.QtCore import QTimer
         from PyQt6.QtWidgets import (
