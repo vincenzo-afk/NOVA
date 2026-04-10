@@ -114,7 +114,9 @@ def speak(text: str, stop_event: threading.Event | None = None) -> None:
         return
     done_event = threading.Event()
     try:
-        q.put((text, done_event))
+        # Never block the caller on enqueue; if the worker died and the queue is wedged,
+        # fail open and let the caller proceed.
+        q.put_nowait((text, done_event))
     except Exception:
         # If the queue is broken for any reason, don't block the caller.
         done_event.set()
@@ -143,23 +145,26 @@ def speak(text: str, stop_event: threading.Event | None = None) -> None:
 def shutdown(drain: bool = True) -> None:
     """Best-effort worker stop for app shutdown paths."""
     global _QUEUE, _WORKER_THREAD
-    if _QUEUE is None:
+    with _WORKER_LOCK:
+        q = _QUEUE
+        t = _WORKER_THREAD
+    if q is None:
         return
     if drain:
         while True:
             try:
-                _QUEUE.get_nowait()
-                _QUEUE.task_done()
+                q.get_nowait()
+                q.task_done()
             except queue.Empty:
                 break
             except Exception:
                 break
     try:
-        _QUEUE.put_nowait(None)
+        q.put_nowait(None)
     except Exception:
         pass
     try:
-        if _WORKER_THREAD is not None and _WORKER_THREAD.is_alive():
-            _WORKER_THREAD.join(timeout=1.0)
+        if t is not None and t.is_alive():
+            t.join(timeout=1.0)
     except Exception:
         pass

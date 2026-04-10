@@ -1446,9 +1446,20 @@ class NOVAApp:
 
         if not steps:
             return {"goal": goal, "status": "failed", "reason": "no_steps_parsed", "raw": raw}
+        truncated = False
+        original_count = len(steps)
         if len(steps) > max_steps:
+            truncated = True
             steps = steps[:max_steps]
-        return {"goal": goal, "status": "ok", "steps": steps, "raw": raw}
+        return {
+            "goal": goal,
+            "status": "ok",
+            "steps": steps,
+            "raw": raw,
+            "truncated": truncated,
+            "original_step_count": original_count,
+            "max_steps": max_steps,
+        }
         
     def _add_goal(self, goal: str, max_steps: int = 20) -> dict:
         goal = re.sub(r"\s+", " ", goal).strip()
@@ -3925,22 +3936,20 @@ class NOVAApp:
             stream = self.engine.ask_stream(prompt=user_text, system=system_prompt, history=history)
             try:
                 try:
-                    first_token = next(stream)
+                    # Persist the user turn before pulling the first token so an abandoned generator
+                    # (consumer stops early) doesn't drop the user message on the floor.
                     user_added = _append_turn("user", user_text)
+                    first_token = next(stream)
                     output_chunks.append(first_token)
                     yield first_token
                     for token in stream:
                         output_chunks.append(token)
                         yield token
                 except StopIteration:
-                    if not user_added:
-                        user_added = _append_turn("user", user_text)
                     assistant_text = "(no response)"
                 except RuntimeError as exc:
                     # PEP 479: inner StopIteration may surface as RuntimeError.
                     if "StopIteration" in str(exc):
-                        if not user_added:
-                            user_added = _append_turn("user", user_text)
                         assistant_text = "(no response)"
                     else:
                         raise
