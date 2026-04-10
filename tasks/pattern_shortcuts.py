@@ -24,8 +24,13 @@ class PatternShortcutCompiler:
         log_path: str = "logs/guardrails_actions.jsonl",
         output_path: str = ".jarvis/pattern_shortcuts.json",
     ) -> None:
-        self.log_path = Path(log_path)
-        self.output_path = Path(output_path)
+        # Resolve relative paths against the construction-time CWD so callers changing CWD later
+        # don't silently read/write the wrong files.
+        base = Path.cwd().resolve()
+        lp = Path(log_path).expanduser()
+        op = Path(output_path).expanduser()
+        self.log_path = lp if lp.is_absolute() else (base / lp).resolve()
+        self.output_path = op if op.is_absolute() else (base / op).resolve()
 
     def compile(
         self,
@@ -191,6 +196,11 @@ class PatternShortcutCompiler:
             import shutil
 
             shutil.copy2(tmp_path, self.output_path)
+            # Verify the written file is readable JSON before deleting the temp.
+            try:
+                json.loads(self.output_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise OSError(f"pattern shortcuts write verification failed: {exc}") from exc
             try:
                 tmp_path.unlink(missing_ok=True)
             except Exception:

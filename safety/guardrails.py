@@ -59,8 +59,25 @@ def _emergency_stop_paths(base_path: Path | None = None) -> tuple[Path, Path]:
     if not primary.is_absolute():
         primary = (base_cwd / primary).resolve()
     home = Path.home().resolve()
-    # Ensure the path is within a reasonable boundary (home or CWD)
-    if not str(primary).startswith(str(home)) and not str(primary).startswith(str(base_cwd)):
+    # Ensure the path is within a reasonable boundary (home or CWD).
+    # Use resolved path semantics rather than string prefix checks to avoid symlink escapes.
+    try:
+        resolved = primary.resolve(strict=False)
+    except Exception:
+        resolved = primary
+    inside_home = False
+    inside_cwd = False
+    try:
+        resolved.relative_to(home)
+        inside_home = True
+    except Exception:
+        pass
+    try:
+        resolved.relative_to(base_cwd)
+        inside_cwd = True
+    except Exception:
+        pass
+    if not (inside_home or inside_cwd):
         primary = (base_cwd / ".jarvis" / "emergency_stop").resolve()
     fallback = (base_cwd / ".jarvis" / "emergency_stop").resolve()
     return primary, fallback

@@ -128,7 +128,25 @@ class EncryptedKeyStore:
             tmp.write(payload)
             tmp.flush()
             tmp_path = Path(tmp.name)
-        tmp_path.replace(self.path)
+        try:
+            tmp_path.replace(self.path)
+        except PermissionError:
+            # Windows AV/indexers can transiently lock the destination file.
+            time.sleep(0.1)
+            try:
+                tmp_path.replace(self.path)
+            except Exception as exc:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise RuntimeError(f"keystore save failed (destination locked): {exc}") from exc
+        except Exception as exc:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise RuntimeError(f"keystore save failed: {exc}") from exc
         try:
             self.path.chmod(0o600)
         except Exception:

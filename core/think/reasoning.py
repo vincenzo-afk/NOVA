@@ -113,9 +113,16 @@ def ambiguity_score(user_text: str) -> float:
         return 1.0
 
     tokens = re.findall(r"[a-zA-Z0-9_]+", text)
-    token_count = len(tokens)
-    ambiguous_hits = sum(1 for t in tokens if t in _AMBIGUOUS_TERMS)
-    action_hits = sum(1 for t in tokens if t in _ACTION_VERBS)
+    # Ignore common filler/polite terms so "please delete this" behaves like "delete this".
+    _FILLER = {
+        "please", "pls", "plz", "kindly",
+        "could", "would", "can", "will",
+        "you", "me", "my",
+    }
+    core_tokens = [t for t in tokens if t not in _FILLER]
+    token_count = len(core_tokens)
+    ambiguous_hits = sum(1 for t in core_tokens if t in _AMBIGUOUS_TERMS)
+    action_hits = sum(1 for t in core_tokens if t in _ACTION_VERBS)
 
     score = 0.0
     # Only treat short messages as highly ambiguous when they combine an action

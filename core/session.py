@@ -125,11 +125,15 @@ class SessionManager:
                 # Bug 4 fix: only remove the backup AFTER confirming the new file was
                 # written successfully. If the write failed (disk full, permissions, etc.)
                 # the .bak is our only copy — never delete it unconditionally.
-                expected_size = len(payload.encode("utf-8"))
-                if path.exists() and path.stat().st_size >= expected_size and expected_size > 0:
+                expected_bytes = payload.encode("utf-8")
+                expected_size = len(expected_bytes)
+                if path.exists() and path.stat().st_size == expected_size and expected_size > 0:
                     try:
                         import json as _json
-                        verify = _json.loads(path.read_text(encoding="utf-8"))
+                        on_disk = path.read_bytes()
+                        if on_disk != expected_bytes:
+                            raise ValueError("session persist verification mismatch")
+                        verify = _json.loads(on_disk.decode("utf-8"))
                         if (
                             verify.get("name") == session_name
                             and verify.get("session_id") == session_id
