@@ -25,16 +25,27 @@ def _tts_worker() -> None:
     except Exception:
         return
         
-    while not _IS_STOPPED:
+    while True:
+        with _WORKER_LOCK:
+            if _IS_STOPPED:
+                break
         try:
-            item = _QUEUE.get(timeout=1.0)
+            with _WORKER_LOCK:
+                q = _QUEUE
+            if q is None:
+                time.sleep(0.05)
+                continue
+            item = q.get(timeout=1.0)
         except queue.Empty:
             continue
         except Exception:
             continue
             
         if item is None:
-            _QUEUE.task_done()
+            try:
+                q.task_done()
+            except Exception:
+                pass
             break
             
         text, done_event = item
@@ -45,7 +56,10 @@ def _tts_worker() -> None:
             pass
         finally:
             done_event.set()
-            _QUEUE.task_done()
+            try:
+                q.task_done()
+            except Exception:
+                pass
     
     with _WORKER_LOCK:
         _ENGINE = None
@@ -93,8 +107,9 @@ def speak(text: str, stop_event: threading.Event | None = None) -> None:
         return
     
     _ensure_worker()
-    q = _QUEUE
-    worker = _WORKER_THREAD
+    with _WORKER_LOCK:
+        q = _QUEUE
+        worker = _WORKER_THREAD
     if q is None or worker is None or not worker.is_alive():
         return
     done_event = threading.Event()

@@ -127,7 +127,17 @@ class SessionManager:
                 # the .bak is our only copy — never delete it unconditionally.
                 expected_size = len(payload.encode("utf-8"))
                 if path.exists() and path.stat().st_size == expected_size and expected_size > 0:
-                    backup_path.unlink(missing_ok=True)
+                    try:
+                        import json as _json
+                        verify = _json.loads(path.read_text(encoding="utf-8"))
+                        if (
+                            verify.get("name") == session_name
+                            and verify.get("session_id") == session_id
+                            and isinstance(verify.get("history"), list)
+                        ):
+                            backup_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
             except Exception:
                 pass
         except Exception as exc:

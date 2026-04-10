@@ -44,9 +44,12 @@ class QRPairing:
 
     def generate(self, out_path: str = "assets/adb_qr.png", prefer_remote: bool = False) -> str:
         uri = self.adb_uri(prefer_remote=prefer_remote)
-        img = qrcode.make(uri)
-        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        img.save(out_path)
+        try:
+            img = qrcode.make(uri)
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+            img.save(out_path)
+        except Exception as exc:
+            raise RuntimeError("QR image generation requires Pillow support in qrcode runtime") from exc
         return out_path
 
     def print_terminal_qr(self, prefer_remote: bool = False) -> str:

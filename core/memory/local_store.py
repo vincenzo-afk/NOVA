@@ -117,7 +117,7 @@ class LocalMemoryStore:
             if self._use_chroma and self._collection and self._embedder:
                 try:
                     embedding = self._embedder.encode([text])[0]
-                    self._collection.add(
+                    self._collection.upsert(
                         ids=[hash_id],
                         documents=[text],
                         metadatas=[{"session_id": session_id, **payload}],
