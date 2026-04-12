@@ -1,0 +1,112 @@
+{
+  "version": 1,
+  "groups": [
+    {
+      "id": "llm",
+      "label": "Language Models",
+      "settings": [
+        {"key": "OLLAMA_BASE_URL", "type": "str", "default": "http://localhost:11434", "label": "Ollama Base URL", "description": "Local Ollama endpoint"},
+        {"key": "OLLAMA_MODEL", "type": "str", "default": "llama3", "label": "Ollama Model", "description": "Model to use for local inference"},
+        {"key": "OPENAI_BASE_URL", "type": "str", "default": "", "label": "OpenAI Compatible Base URL", "description": "OpenAI-compatible API endpoint (leave blank to disable cloud)"},
+        {"key": "OPENAI_API_KEYS", "type": "csv", "default": "", "label": "OpenAI API Keys", "description": "Comma-separated list of API keys for round-robin"},
+        {"key": "GEMINI_API_KEYS", "type": "csv", "default": "", "label": "Gemini API Keys", "description": "Comma-separated Gemini keys"},
+        {"key": "GEMINI_TTS_MODEL", "type": "str", "default": "gemini-2.5-flash-preview-tts", "label": "Gemini TTS Model", "description": "Cloud TTS model name"},
+        {"key": "GEMINI_TTS_VOICE", "type": "str", "default": "Kore", "label": "Gemini TTS Voice", "description": "Voice name for cloud TTS"},
+        {"key": "GEMINI_TTS_TIMEOUT_SECONDS", "type": "int", "default": 45, "min": 5, "max": 120, "label": "Gemini TTS Timeout (s)", "description": "Max seconds to wait for cloud TTS"}
+      ]
+    },
+    {
+      "id": "voice",
+      "label": "Voice & Audio",
+      "settings": [
+        {"key": "DEFAULT_LANG", "type": "str", "default": "en", "label": "Default Language", "description": "BCP-47 language code"},
+        {"key": "VAD_SILENCE_MS", "type": "int", "default": 800, "min": 100, "max": 5000, "label": "VAD Silence (ms)", "description": "Trailing silence before voice turn ends"},
+        {"key": "WHISPER_MODEL", "type": "choice", "default": "base", "choices": ["tiny", "base", "small", "medium", "large"], "label": "Whisper Model", "description": "Local STT model size"},
+        {"key": "TTS_OFFLINE_WATCHDOG_SECONDS", "type": "int", "default": 10, "min": 1, "max": 60, "label": "TTS Watchdog (s)", "description": "Hard timeout for offline TTS"},
+        {"key": "VOICE_BARGEIN_ENABLED", "type": "bool", "default": true, "label": "Voice Barge-In", "description": "Allow interrupting NOVA mid-speech"},
+        {"key": "VOICE_BARGEIN_HOTKEY", "type": "str", "default": "ctrl+shift+x", "label": "Barge-In Hotkey", "description": "Keyboard shortcut to interrupt speech"},
+        {"key": "PORCUPINE_ACCESS_KEY", "type": "str", "default": "", "secret": true, "label": "Porcupine Access Key", "description": "Picovoice wake-word API key"},
+        {"key": "PORCUPINE_KEYWORD_PATH", "type": "str", "default": "./assets/Hey-Nova_en_windows_v3_0_0.ppn", "label": "Wake Word Model Path", "description": "Path to .ppn wake word file"},
+        {"key": "PORCUPINE_SENSITIVITY", "type": "float", "default": 0.6, "min": 0.0, "max": 1.0, "label": "Wake Word Sensitivity", "description": "0=low false positives, 1=high recall"}
+      ]
+    },
+    {
+      "id": "memory",
+      "label": "Memory & Privacy",
+      "settings": [
+        {"key": "MEM0_API_KEY", "type": "str", "default": "", "secret": true, "label": "Mem0 API Key", "description": "Cloud memory store key (leave blank to use local only)"},
+        {"key": "PRIVACY_MODE", "type": "choice", "default": "full_cloud", "choices": ["local_only", "balanced", "full_cloud"], "label": "Privacy Mode", "description": "Controls what is sent to cloud services"},
+        {"key": "INCLUDE_CLIPBOARD_IN_CONTEXT", "type": "bool", "default": false, "label": "Include Clipboard in Context", "description": "Inject clipboard content into the AI context"},
+        {"key": "DEFAULT_SESSION", "type": "str", "default": "nova_personal", "label": "Default Session Name", "description": "Session loaded on startup"},
+        {"key": "MAX_SESSION_HISTORY_TURNS", "type": "int", "default": 500, "min": 50, "max": 5000, "label": "Max History Turns", "description": "How many turns to keep in memory"}
+      ]
+    },
+    {
+      "id": "autonomy",
+      "label": "Autonomy & Goals",
+      "settings": [
+        {"key": "AUTONOMY_ENABLED", "type": "bool", "default": false, "label": "Enable Autonomy Loop", "description": "Allow NOVA to execute goals in the background"},
+        {"key": "AUTONOMY_POLL_SECONDS", "type": "float", "default": 20.0, "min": 5.0, "max": 300.0, "label": "Autonomy Poll Interval (s)", "description": "How often to check for pending goals"},
+        {"key": "AUTONOMY_MAX_STEPS", "type": "int", "default": 20, "min": 1, "max": 100, "label": "Max Steps Per Goal", "description": "Maximum tool calls per goal execution"},
+        {"key": "AUTONOMY_STEP_DELAY_SECONDS", "type": "float", "default": 0.5, "min": 0.0, "max": 10.0, "label": "Step Delay (s)", "description": "Pause between tool executions"},
+        {"key": "GOAL_STEP_TIMEOUT_SECONDS", "type": "float", "default": 60.0, "min": 5.0, "max": 600.0, "label": "Step Timeout (s)", "description": "Hard timeout per individual step"},
+        {"key": "AUTONOMY_NOTIFY_TELEGRAM", "type": "bool", "default": true, "label": "Notify via Telegram", "description": "Send goal completion updates to Telegram"},
+        {"key": "AUTONOMY_NOTIFY_TTS", "type": "bool", "default": false, "label": "Notify via TTS", "description": "Speak goal completion updates aloud"}
+      ]
+    },
+    {
+      "id": "integrations",
+      "label": "Integrations",
+      "settings": [
+        {"key": "TELEGRAM_BOT_TOKEN", "type": "str", "default": "", "secret": true, "label": "Telegram Bot Token", "description": "BotFather token for Telegram notifications"},
+        {"key": "TELEGRAM_CHAT_ID", "type": "str", "default": "", "label": "Telegram Chat ID", "description": "Target chat for Telegram notifications"},
+        {"key": "TAILSCALE_PHONE_IP", "type": "str", "default": "", "label": "Tailscale Phone IP", "description": "Phone IP over Tailscale for ADB"},
+        {"key": "ADB_PORT", "type": "int", "default": 5555, "min": 1024, "max": 65535, "label": "ADB Port", "description": "Android debug bridge port"},
+        {"key": "ALLOWED_PHONE_NUMBERS", "type": "csv", "default": "", "label": "Allowed Phone Numbers", "description": "Whitelist for SMS sending (E.164 format)"},
+        {"key": "OMNIPARSER_SERVER_URL", "type": "str", "default": "http://localhost:8000", "label": "OmniParser URL", "description": "OmniParser UI element detection endpoint"},
+        {"key": "OMNIPARSER_REPO_DIR", "type": "str", "default": "", "label": "OmniParser Repo Dir", "description": "Local directory to auto-start OmniParser from"},
+        {"key": "VIRUSTOTAL_API_KEY", "type": "str", "default": "", "secret": true, "label": "VirusTotal API Key", "description": "For file scanning before execution"},
+        {"key": "VIRUSTOTAL_SCAN_WRITES", "type": "bool", "default": false, "label": "Scan All File Writes", "description": "Scan every file write with VirusTotal"}
+      ]
+    },
+    {
+      "id": "safety",
+      "label": "Safety & Security",
+      "settings": [
+        {"key": "RISK_CONFIRM_THRESHOLD", "type": "int", "default": 7, "min": 1, "max": 10, "label": "Risk Confirm Threshold", "description": "Risk score that requires explicit confirmation"},
+        {"key": "EMERGENCY_STOP_FILE", "type": "str", "default": ".jarvis/emergency_stop", "label": "Emergency Stop File", "description": "Touch this file to halt all autonomy at once"},
+        {"key": "PLUGINS_ENABLED", "type": "bool", "default": false, "label": "Enable Plugins", "description": "Load Python plugins from the ./plugins directory"}
+      ]
+    },
+    {
+      "id": "proactive",
+      "label": "Proactive Intelligence",
+      "settings": [
+        {"key": "PROACTIVE_WATCHER_ENABLED", "type": "bool", "default": true, "label": "Screen Watcher Enabled", "description": "Watch screen for context-aware proactive alerts"},
+        {"key": "PROACTIVE_WATCHER_INTERVAL", "type": "float", "default": 30.0, "min": 5.0, "max": 300.0, "label": "Screen Watch Interval (s)", "description": "How often to analyse the screen"},
+        {"key": "PROACTIVE_WATCHER_COOLDOWN", "type": "float", "default": 120.0, "min": 10.0, "max": 600.0, "label": "Alert Cooldown (s)", "description": "Minimum seconds between proactive alerts"},
+        {"key": "PHONE_WATCHER_ENABLED", "type": "bool", "default": false, "label": "Phone Watcher Enabled", "description": "Monitor phone notifications via ADB"},
+        {"key": "SELF_EVAL_ENABLED", "type": "bool", "default": true, "label": "Self-Evaluation Enabled", "description": "Post-response quality scoring loop"},
+        {"key": "SELF_EVAL_MIN_RESPONSE_TOKENS", "type": "int", "default": 50, "min": 1, "max": 500, "label": "Min Tokens to Evaluate", "description": "Skip eval for shorter responses"},
+        {"key": "NUDGE_ENGINE_ENABLED", "type": "bool", "default": true, "label": "Nudge Engine Enabled", "description": "Pattern-based context-aware suggestions"},
+        {"key": "NUDGE_CHECK_SECONDS", "type": "int", "default": 300, "min": 30, "max": 3600, "label": "Nudge Check Interval (s)", "description": "How often to check for applicable nudges"},
+        {"key": "AMBIENT_MONITOR_ENABLED", "type": "bool", "default": false, "label": "Ambient Monitor Enabled", "description": "Listen for sound events in background"},
+        {"key": "AMBIENT_KEYWORDS", "type": "csv", "default": "doorbell,alarm,phone", "label": "Ambient Keywords", "description": "Keywords that trigger ambient alerts"}
+      ]
+    },
+    {
+      "id": "system",
+      "label": "System",
+      "settings": [
+        {"key": "NOVA_HEALTH_PORT", "type": "int", "default": 8765, "min": 1024, "max": 65535, "label": "Health Probe Port", "description": "HTTP port for /health and /ready probes"},
+        {"key": "NOVA_HEALTH_BIND_HOST", "type": "str", "default": "127.0.0.1", "label": "Health Probe Bind Host", "description": "Address to bind the health probe server"},
+        {"key": "NOVA_STARTUP_DELAY_SECONDS", "type": "float", "default": 0.0, "min": 0.0, "max": 30.0, "label": "Startup Delay (s)", "description": "Delay before NOVA starts subsystems"},
+        {"key": "HEALTH_MONITOR_INTERVAL", "type": "float", "default": 60.0, "min": 5.0, "max": 600.0, "label": "Health Monitor Interval (s)", "description": "How often health checks run"},
+        {"key": "DATA_DIR", "type": "str", "default": "~/.jarvis/data", "label": "Data Directory", "description": "Root directory for persistent data"},
+        {"key": "DAILY_TOKEN_ALERT_THRESHOLD", "type": "int", "default": 100000, "min": 0, "label": "Token Alert Threshold", "description": "Warn when daily tokens exceed this"},
+        {"key": "DAILY_TOKEN_HARD_CAP", "type": "int", "default": 500000, "min": 0, "label": "Daily Token Hard Cap", "description": "Block all LLM calls above this (0=disabled)"},
+        {"key": "AMBIGUITY_THRESHOLD", "type": "float", "default": 0.6, "min": 0.0, "max": 1.0, "label": "Ambiguity Threshold", "description": "Ask for clarification if confidence below this"}
+      ]
+    }
+  ]
+}

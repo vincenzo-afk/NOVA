@@ -952,6 +952,26 @@ class NOVAApp:
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Proactive system startup failed: %s", exc)
+        # Replay persisted settings overlay (live mutations from previous sessions)
+        try:
+            from config.nova_settings_manager import apply_overlay_on_boot
+            applied = apply_overlay_on_boot()
+            if applied:
+                import logging
+                logging.getLogger(__name__).info("Replayed %d settings overrides from overlay.", applied)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Settings overlay replay failed: %s", exc)
+        # Auto-start Ollama if not running
+        try:
+            from utils.service_health import ensure_ollama_running
+            msg = ensure_ollama_running(settings.OLLAMA_BASE_URL)
+            if msg != "ok":
+                import logging
+                logging.getLogger(__name__).info("Ollama auto-start: %s", msg)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Ollama health check failed: %s", exc)
         # Start TTS worker after core subsystems are initialized.
         self._tts_thread.start()
 
