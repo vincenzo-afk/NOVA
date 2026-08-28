@@ -38,6 +38,9 @@ vendor/
 # macOS metadata
 .DS_Store
 
+# Editable HTML video dependencies
+node_modules/
+
 # Editor tempfiles
 *.swp
 *.swo

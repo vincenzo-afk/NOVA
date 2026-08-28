@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <title>NOVA — Local-first personal AI assistant</title>
+    <script src="./node_modules/gsap/dist/gsap.min.js"></script>
+    <style>
+      :root {
+        --ink: #f3f7ff;
+        --muted: #9aa9c2;
+        --canvas: #07111f;
+        --panel: rgba(17, 31, 52, 0.84);
+        --line: rgba(148, 179, 222, 0.22);
+        --cyan: #55e6ff;
+        --violet: #9d8cff;
+        --lime: #b9f27c;
+        --orange: #ffb86b;
+      }
+
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: var(--canvas);
+        color: var(--ink);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body { position: relative; }
+      #root {
+        position: relative;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: var(--canvas);
+      }
+      .clip {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+      }
+      .scene-ground {
+        position: absolute;
+        inset: 0;
+        display: block;
+        width: 100%;
+        height: 100%;
+        background:
+          radial-gradient(circle at 76% 22%, rgba(85, 230, 255, 0.14), transparent 28%),
+          radial-gradient(circle at 20% 80%, rgba(157, 140, 255, 0.12), transparent 32%),
+          linear-gradient(135deg, #06101d 0%, #0b1628 55%, #10152d 100%);
+      }
+      .scene-grid {
+        position: absolute;
+        inset: 0;
+        display: block;
+        width: 100%;
+        height: 100%;
+        opacity: 0.34;
+        background-image: linear-gradient(rgba(136, 176, 222, 0.08) 1px, transparent 1px), linear-gradient(90deg, rgba(136, 176, 222, 0.08) 1px, transparent 1px);
+        background-size: 72px 72px;
+        mask-image: linear-gradient(to bottom, black 0%, transparent 88%);
+      }
+      .safe {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        padding: 106px 132px;
+      }
+      .eyebrow {
+        display: block;
+        margin: 0 0 28px;
+        color: var(--cyan);
+        font-size: 24px;
+        font-weight: 700;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+      }
+      .title {
+        max-width: 1130px;
+        margin: 0;
+        font-size: 112px;
+        line-height: 0.96;
+        letter-spacing: -0.06em;
+      }
+      .subtitle {
+        max-width: 840px;
+        margin: 34px 0 0;
+        color: var(--muted);
+        font-size: 32px;
+        line-height: 1.35;
+      }
+      .signature {
+        position: absolute;
+        right: 132px;
+        bottom: 104px;
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        color: var(--muted);
+        font-size: 22px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .mark {
+        display: block;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: var(--cyan);
+        box-shadow: 0 0 0 8px rgba(85, 230, 255, 0.1), 0 0 34px rgba(85, 230, 255, 0.62);
+      }
+      .line {
+        display: block;
+        width: 120px;
+        height: 1px;
+        background: var(--line);
+      }
+      .section-title {
+        max-width: 860px;
+        margin: 0;
+        font-size: 76px;
+        line-height: 1.02;
+        letter-spacing: -0.05em;
+      }
+      .section-copy {
+        max-width: 670px;
+        margin: 24px 0 0;
+        color: var(--muted);
+        font-size: 28px;
+        line-height: 1.38;
+      }
+      .architecture {
+        position: absolute;
+        right: 116px;
+        top: 160px;
+        width: 740px;
+        height: 720px;
+      }
+      .node {
+        position: absolute;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        width: 260px;
+        min-height: 116px;
+        padding: 24px 28px;
+        border: 1px solid var(--line);
+        border-radius: 22px;
+        background: var(--panel);
+        box-shadow: 0 22px 60px rgba(0, 0, 0, 0.2);
+      }
+      .node strong { font-size: 26px; letter-spacing: -0.03em; }
+      .node span { margin-top: 8px; color: var(--muted); font-size: 18px; }
+      .node-a { left: 0; top: 240px; border-color: rgba(85, 230, 255, 0.55); }
+      .node-b { right: 0; top: 92px; border-color: rgba(157, 140, 255, 0.58); }
+      .node-c { right: 0; top: 388px; border-color: rgba(185, 242, 124, 0.58); }
+      .node-d { left: 240px; bottom: 0; border-color: rgba(255, 184, 107, 0.58); }
+      .connector {
+        position: absolute;
+        display: block;
+        height: 2px;
+        transform-origin: left center;
+        background: linear-gradient(90deg, rgba(85, 230, 255, 0.7), rgba(157, 140, 255, 0.18));
+      }
+      .connector-a { left: 252px; top: 300px; width: 258px; transform: rotate(-26deg); }
+      .connector-b { left: 252px; top: 330px; width: 284px; transform: rotate(12deg); background: linear-gradient(90deg, rgba(85, 230, 255, 0.7), rgba(185, 242, 124, 0.18)); }
+      .connector-c { left: 350px; top: 572px; width: 164px; transform: rotate(59deg); background: linear-gradient(90deg, rgba(185, 242, 124, 0.7), rgba(255, 184, 107, 0.18)); }
+      .pulse {
+        position: absolute;
+        display: block;
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        background: var(--cyan);
+        box-shadow: 0 0 0 10px rgba(85, 230, 255, 0.1), 0 0 26px rgba(85, 230, 255, 0.9);
+      }
+      .pulse-a { left: 274px; top: 314px; }
+      .pulse-b { left: 388px; top: 344px; background: var(--lime); box-shadow: 0 0 0 10px rgba(185, 242, 124, 0.1), 0 0 26px rgba(185, 242, 124, 0.9); }
+      .panel-row {
+        display: flex;
+        gap: 20px;
+        margin-top: 60px;
+      }
+      .feature-card {
+        width: 290px;
+        min-height: 218px;
+        padding: 28px;
+        border: 1px solid var(--line);
+        border-radius: 22px;
+        background: linear-gradient(145deg, rgba(18, 35, 58, 0.92), rgba(8, 19, 34, 0.72));
+      }
+      .feature-icon {
+        display: block;
+        width: 48px;
+        height: 48px;
+        margin-bottom: 42px;
+        border: 1px solid currentColor;
+        border-radius: 14px;
+      }
+      .feature-card h3 { margin: 0; font-size: 25px; letter-spacing: -0.03em; }
+      .feature-card p { margin: 10px 0 0; color: var(--muted); font-size: 18px; line-height: 1.35; }
+      .cyan { color: var(--cyan); }
+      .violet { color: var(--violet); }
+      .lime { color: var(--lime); }
+      .orange { color: var(--orange); }
+      .status-board {
+        position: absolute;
+        right: 124px;
+        top: 162px;
+        width: 664px;
+        padding: 34px;
+        border: 1px solid var(--line);
+        border-radius: 28px;
+        background: rgba(7, 17, 31, 0.82);
+        box-shadow: 0 30px 80px rgba(0, 0, 0, 0.24);
+      }
+      .status-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding-bottom: 26px;
+        border-bottom: 1px solid var(--line);
+      }
+      .status-header strong { font-size: 24px; }
+      .online { color: var(--lime); font-size: 18px; }
+      .status-item {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 20px;
+        align-items: center;
+        padding: 26px 0;
+        border-bottom: 1px solid rgba(148, 179, 222, 0.12);
+      }
+      .status-item:last-child { border-bottom: 0; }
+      .status-label { color: var(--muted); font-size: 20px; }
+      .status-value { font-size: 20px; font-weight: 700; }
+      .status-dot { display: inline-block; width: 12px; height: 12px; margin-right: 10px; border-radius: 50%; background: var(--lime); box-shadow: 0 0 18px rgba(185, 242, 124, 0.8); }
+      .progress {
+        position: relative;
+        display: block;
+        width: 244px;
+        height: 10px;
+        margin-top: 10px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: rgba(148, 179, 222, 0.14);
+      }
+      .progress-fill { display: block; width: 78%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--cyan), var(--violet)); }
+      .close-line { width: 280px; height: 1px; margin-top: 46px; background: linear-gradient(90deg, var(--cyan), transparent); }
+      .close-title { max-width: 980px; margin: 0; font-size: 88px; line-height: 1.02; letter-spacing: -0.06em; }
+      .close-copy { max-width: 700px; margin: 28px 0 0; color: var(--muted); font-size: 30px; line-height: 1.4; }
+      .code-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 14px;
+        margin-top: 46px;
+        padding: 18px 24px;
+        border: 1px solid rgba(85, 230, 255, 0.32);
+        border-radius: 999px;
+        background: rgba(85, 230, 255, 0.08);
+        color: var(--cyan);
+        font-family: monospace;
+        font-size: 22px;
+      }
+      .code-pill::before { content: "$"; color: var(--lime); }
+    </style>
+  </head>
+  <body>
+    <div id="root" data-composition-id="nova-overview" data-start="0" data-width="1920" data-height="1080" data-duration="36">
+      <section id="scene-title" class="clip" data-start="0" data-duration="6" data-track-index="1">
+        <div class="scene-ground"></div>
+        <div class="scene-grid"></div>
+        <div class="safe">
+          <span id="title-eyebrow" class="eyebrow">Local-first personal AI</span>
+          <h1 id="title-heading" class="title">NOVA makes complex work feel close.</h1>
+          <p id="title-subtitle" class="subtitle">A Python assistant that can reason, remember, see, speak, and act across your computer and Android devices.</p>
+          <div id="title-signature" class="signature"><span class="mark"></span><span>NOVA / autonomous by design</span></div>
+        </div>
+      </section>
+
+      <section id="scene-intelligence" class="clip" data-start="6" data-duration="8" data-track-index="2">
+        <div class="scene-ground"></div>
+        <div class="scene-grid"></div>
+        <div class="safe">
+          <span id="intel-eyebrow" class="eyebrow">01 / Intelligence layer</span>
+          <h2 id="intel-title" class="section-title">One assistant. Multiple ways to think.</h2>
+          <p id="intel-copy" class="section-copy">NOVA routes requests across configured LLM providers, falls back to Ollama when needed, and keeps context useful with persistent memory.</p>
+          <div class="architecture" aria-label="NOVA architecture overview">
+            <span id="connector-a" class="connector connector-a"></span>
+            <span id="connector-b" class="connector connector-b"></span>
+            <span id="connector-c" class="connector connector-c"></span>
+            <span id="pulse-a" class="pulse pulse-a"></span>
+            <span id="pulse-b" class="pulse pulse-b"></span>
+            <div id="node-a" class="node node-a"><strong>Conversation</strong><span>CLI · GUI · Telegram</span></div>
+            <div id="node-b" class="node node-b"><strong>LLM routing</strong><span>Cloud keys + Ollama fallback</span></div>
+            <div id="node-c" class="node node-c"><strong>Memory</strong><span>mem0 + ChromaDB + hybrid search</span></div>
+            <div id="node-d" class="node node-d"><strong>Context</strong><span>Sessions · summaries · world state</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-capabilities" class="clip" data-start="14" data-duration="9" data-track-index="3">
+        <div class="scene-ground"></div>
+        <div class="scene-grid"></div>
+        <div class="safe">
+          <span id="cap-eyebrow" class="eyebrow">02 / See · speak · act</span>
+          <h2 id="cap-title" class="section-title">From a voice request to a real-world workflow.</h2>
+          <p id="cap-copy" class="section-copy">NOVA connects voice, vision, automation, documents, and devices behind one safety-aware dispatcher.</p>
+          <div class="panel-row">
+            <article id="card-voice" class="feature-card"><span class="feature-icon cyan"></span><h3>Voice</h3><p>Wake word, VAD, STT, TTS, and multilingual fallbacks.</p></article>
+            <article id="card-vision" class="feature-card"><span class="feature-icon violet"></span><h3>Vision</h3><p>Screen capture, Gemini Vision, and OmniParser UI maps.</p></article>
+            <article id="card-control" class="feature-card"><span class="feature-icon lime"></span><h3>Control</h3><p>Desktop, browser, documents, plugins, and Android ADB.</p></article>
+            <article id="card-safety" class="feature-card"><span class="feature-icon orange"></span><h3>Safety</h3><p>Risk scoring, confirmation gates, action logs, and stop controls.</p></article>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-continuity" class="clip" data-start="23" data-duration="7" data-track-index="4">
+        <div class="scene-ground"></div>
+        <div class="scene-grid"></div>
+        <div class="safe">
+          <span id="cont-eyebrow" class="eyebrow">03 / Built to keep going</span>
+          <h2 id="cont-title" class="section-title">Health checks. Goals. Schedules. Signals.</h2>
+          <p id="cont-copy" class="section-copy">The runtime brings together proactive monitoring, background goals, scheduled tasks, usage tracking, and a local health endpoint.</p>
+          <div id="status-board" class="status-board">
+            <div class="status-header"><strong>NOVA subsystem status</strong><span class="online"><span class="status-dot"></span>Operational</span></div>
+            <div class="status-item"><span class="status-label">LLM fallback</span><span class="status-value">Ollama ready</span></div>
+            <div class="status-item"><span class="status-label">Memory store</span><span class="status-value">ChromaDB synced</span></div>
+            <div class="status-item"><span class="status-label">Autonomy budget</span><span class="status-value"><span class="progress"><span class="progress-fill"></span></span></span></div>
+            <div class="status-item"><span class="status-label">Health endpoint</span><span class="status-value">/health</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="scene-close" class="clip" data-start="30" data-duration="6" data-track-index="5">
+        <div class="scene-ground"></div>
+        <div class="scene-grid"></div>
+        <div class="safe">
+          <span id="close-eyebrow" class="eyebrow">NOVA / open source assistant</span>
+          <h2 id="close-title" class="close-title">Start with the repository. Shape the assistant around your life.</h2>
+          <p id="close-copy" class="close-copy">Run the installer, configure your providers, and keep the system transparent, extensible, and yours.</p>
+          <div id="close-pill" class="code-pill">python3 setup.py</div>
+          <div id="close-line" class="close-line"></div>
+        </div>
+      </section>
+    </div>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      const enter = (selector, vars, at) => tl.from(selector, { ...vars, duration: vars.duration || 0.7, ease: vars.ease || "power3.out" }, at);
+
+      enter("#title-eyebrow", { y: 24, opacity: 0 }, 0.15);
+      enter("#title-heading", { y: 56, opacity: 0 }, 0.35);
+      enter("#title-subtitle", { y: 32, opacity: 0 }, 0.95);
+      enter("#title-signature", { y: 20, opacity: 0 }, 1.6);
+
+      enter("#intel-eyebrow", { y: 24, opacity: 0 }, 6.15);
+      enter("#intel-title", { y: 42, opacity: 0 }, 6.35);
+      enter("#intel-copy", { y: 28, opacity: 0 }, 6.8);
+      enter("#node-a", { x: -42, opacity: 0 }, 7.25);
+      enter("#node-b", { x: 42, opacity: 0 }, 7.45);
+      enter("#node-c", { x: 42, opacity: 0 }, 7.7);
+      enter("#node-d", { y: 42, opacity: 0 }, 7.95);
+      enter("#connector-a, #connector-b, #connector-c", { scaleX: 0, opacity: 0 }, 8.2);
+      enter("#pulse-a, #pulse-b", { scale: 0, opacity: 0 }, 8.5);
+      tl.to("#pulse-a", { scale: 1.25, opacity: 0.78, duration: 0.38, repeat: 3, yoyo: true, ease: "sine.inOut" }, 9.0);
+      tl.to("#pulse-b", { scale: 1.25, opacity: 0.78, duration: 0.38, repeat: 3, yoyo: true, ease: "sine.inOut" }, 9.3);
+
+      enter("#cap-eyebrow", { y: 24, opacity: 0 }, 14.15);
+      enter("#cap-title", { y: 42, opacity: 0 }, 14.35);
+      enter("#cap-copy", { y: 24, opacity: 0 }, 14.75);
+      enter("#card-voice", { y: 48, opacity: 0 }, 15.25);
+      enter("#card-vision", { y: 48, opacity: 0 }, 15.45);
+      enter("#card-control", { y: 48, opacity: 0 }, 15.65);
+      enter("#card-safety", { y: 48, opacity: 0 }, 15.85);
+      tl.to("#card-voice", { y: -8, duration: 0.35, repeat: 2, yoyo: true, ease: "sine.inOut" }, 18.0);
+      tl.to("#card-safety", { y: -8, duration: 0.35, repeat: 2, yoyo: true, ease: "sine.inOut" }, 18.35);
+
+      enter("#cont-eyebrow", { y: 24, opacity: 0 }, 23.15);
+      enter("#cont-title", { y: 42, opacity: 0 }, 23.35);
+      enter("#cont-copy", { y: 24, opacity: 0 }, 23.7);
+      enter("#status-board", { x: 64, opacity: 0 }, 24.15);
+      enter("#status-board .status-item", { x: 20, opacity: 0, stagger: 0.12 }, 24.55);
+      enter("#status-board .progress-fill", { scaleX: 0, transformOrigin: "left center" }, 25.1);
+
+      enter("#close-eyebrow", { y: 24, opacity: 0 }, 30.15);
+      enter("#close-title", { y: 52, opacity: 0 }, 30.4);
+      enter("#close-copy", { y: 28, opacity: 0 }, 31.1);
+      enter("#close-pill", { y: 24, opacity: 0 }, 31.75);
+      enter("#close-line", { scaleX: 0, opacity: 0, transformOrigin: "left center" }, 32.2);
+
+      window.__timelines["nova-overview"] = tl;
+    </script>
+  </body>
+</html>

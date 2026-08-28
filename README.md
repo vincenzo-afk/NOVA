@@ -1,1064 +1,329 @@
-# NOVA — Autonomous AI Agent · Build Roadmap v4
+<div align="center">
 
-> One Python project. Every feature. Every gap filled. All fixes integrated. Built phase by phase, always testable.
+```text
+███╗   ██╗ ██████╗ ██╗   ██╗ █████╗
+████╗  ██║██╔═══██╗██║   ██║██╔══██╗
+██╔██╗ ██║██║   ██║██║   ██║███████║
+██║╚██╗██║██║   ██║╚██╗ ██╔╝██╔══██║
+██║ ╚████║╚██████╔╝ ╚████╔╝ ██║  ██║
+╚═╝  ╚═══╝ ╚═════╝   ╚═══╝  ╚═╝  ╚═╝
+```
+
+# NOVA
+
+**A local-first personal AI assistant for reasoning, memory, voice, vision, and action.**
+
+[![Python 3.11](https://img.shields.io/badge/python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Docker Compose](https://img.shields.io/badge/docker-compose-2496ED?logo=docker&logoColor=white)](./docker-compose.yml)
+[![Tests](https://img.shields.io/badge/tests-pytest-0A9EDC)](./tests)
+[![Repository](https://img.shields.io/badge/repository-vincenzo--afk%2FNOVA-111827?logo=github)](https://github.com/vincenzo-afk/NOVA)
+
+[Demo video](./media/nova-overview/renders/nova-overview.mp4) · [Source composition](./media/nova-overview/index.html) · [Report a bug](https://github.com/vincenzo-afk/NOVA/issues/new) · [Request a feature](https://github.com/vincenzo-afk/NOVA/issues/new)
+
+</div>
 
 ---
 
-## Tech Stack Reference
+## <a name="table-of-contents"></a>Table of Contents
 
-| Tool | Role |
+- [About the Project](#about-the-project)
+- [Tech Stack](#tech-stack)
+- [Getting Started](#getting-started)
+- [Usage](#usage)
+- [API Reference](#api-reference)
+- [Project Structure](#project-structure)
+- [Features and Roadmap](#features-and-roadmap)
+- [Testing](#testing)
+- [Deployment](#deployment)
+- [Contributing](#contributing)
+- [Security](#security)
+- [License](#license)
+- [Acknowledgments](#acknowledgments)
+- [References](#references)
+
+---
+
+## <a name="about-the-project"></a>About the Project
+
+NOVA is a Python desktop assistant that places a single orchestration layer over language models, persistent memory, voice I/O, screen understanding, browser and desktop controls, document retrieval, Android Debug Bridge (ADB) tooling, scheduled work, and user-facing interfaces. The application boots through [`main.py`](./main.py), while [`setup.py`](./setup.py) provides the repository’s one-command installation path.
+
+NOVA is designed for workflows that need more than a chat window. It can route requests across configured cloud providers and Ollama, preserve context across named sessions, inspect local screen state, call validated tools, ingest documents, run scheduled goals, and expose a local health endpoint. External integrations remain configurable: cloud services, Telegram, mem0, Gemini, Ollama, OmniParser, ADB, and Tailscale are enabled through environment variables rather than hard-coded credentials.
+
+### Project video
+
+The following overview is an editable HyperFrames composition built specifically from NOVA’s current repository structure and capabilities. The rendered MP4 is committed beside its source so the README remains both a showcase and a reproducible starting point.
+
+<video controls poster="./media/nova-overview/poster.png" width="100%" src="./media/nova-overview/renders/nova-overview.mp4">
+  Your browser does not support embedded video. [Open the NOVA overview video](./media/nova-overview/renders/nova-overview.mp4).
+</video>
+
+The source lives in [`media/nova-overview/`](./media/nova-overview/). Re-render it with `npx hyperframes check` followed by `npx hyperframes render --quality high --output renders/nova-overview.mp4` from that directory.
+
+### Core capabilities
+
+| Capability | What the repository provides |
 |---|---|
-| GPT OSS 120B (API) | Primary LLM |
-| Ollama | Offline / Local fallback LLM |
-| RoundRobin | Load balancing across LLM providers |
-| Gemini Vision | Screen understanding, image analysis |
-| Gemini STT | Speech to text (online) |
-| faster-whisper | Speech to text (offline + Tamil support) |
-| Gemini TTS | Text to speech (online) |
-| pyttsx3 | TTS offline fallback |
-| gTTS / IndicTTS | Tamil TTS fallback |
-| silero-VAD | Voice activity detection (start/stop recording) |
-| OmniParser V2 | OCR + UI element detection (runs as local HTTP server) |
-| PyAutoGUI | Mouse & keyboard control |
-| Win32 API | Deep PC / file system access |
-| Porcupine | Wake word detection |
-| mem0 | Persistent cloud memory layer |
-| ChromaDB | Offline local vector memory + document RAG store |
-| sentence-transformers | Local embeddings for ChromaDB |
-| Tailscale | Remote ADB tunnel to Android |
-| ADB | Android phone control |
-| adb-wifi-py | QR-based ADB pairing |
+| LLM orchestration | Unified request and streaming interfaces, multi-key rotation, network-aware fallback, and Ollama support. |
+| Memory and context | mem0 integration, ChromaDB local storage, hybrid retrieval, session isolation, and context trimming. |
+| Voice | Wake-word support, voice activity detection, online/offline speech-to-text, text-to-speech, barge-in, and Indic-language fallback paths. |
+| Vision and control | Screen capture, Gemini Vision analysis, OmniParser UI mapping, browser automation, keyboard/mouse control, and platform-specific OS access. |
+| Documents and web | PDF/DOCX/TXT ingestion, chunking, embeddings, retrieval, search, scraping, crawling, and hybrid ranking. |
+| Autonomy | Scheduled tasks, goal execution, step limits, cycle detection, proactive monitoring, usage tracking, and background notifications. |
+| Safety and extensibility | Risk scoring, confirmation gates, emergency-stop handling, action logging, plugin loading, Master API, and Master MCP integration. |
 
----
+### Architecture overview
 
-## Project Structure
-
-```
-jarvis/
-├── main.py                            # Entry point, bootstraps everything
-├── assets/
-│   └── Hey-Nova_en_windows_v3_0_0.ppn  # Download from console.picovoice.ai
-├── config/
-│   ├── settings.py                    # .env loader + startup validation (fail fast on missing keys)
-│   └── constants.py
-├── core/
-│   ├── llm/
-│   │   ├── engine.py                  # ask() + ask_stream() unified interface
-│   │   ├── roundrobin.py              # Multi-key rotation + exponential backoff + TTL recovery
-│   │   └── fallback.py                # Cloud → Ollama fallback
-│   ├── think/
-│   │   └── reasoning.py               # Chain-of-thought + ambiguity detection + Ask Questions
-│   ├── memory/
-│   │   ├── mem0_client.py             # mem0 cloud read/write/search
-│   │   ├── local_store.py             # ChromaDB offline vector store
-│   │   ├── memory_router.py           # Online→mem0, Offline→ChromaDB, dedup on write
-│   │   └── context_trimmer.py         # Sliding window + LLM summary compression
-│   ├── context/
-│   │   └── environment.py             # OS state, foreground app, clipboard, etc.
-│   ├── emotion/
-│   │   └── engine.py                  # Emotional state machine
-│   ├── session.py                     # Session ID, context reset, multi-session
-│   ├── health.py                      # Heartbeat monitor for all subsystems + auto-restart
-│   ├── plugin_loader.py               # Scans plugins/, registers tools into dispatcher
-│   └── tools/
-│       └── dispatcher.py              # LLM tool call parser + Pydantic validator + safety stub
-├── voice/
-│   ├── vad.py                         # silero-VAD: detect speech start/end
-│   ├── stt.py                         # Gemini STT (online) — transcribe(audio, lang="en")
-│   ├── stt_offline.py                 # faster-whisper (offline) — supports "ta" Tamil
-│   ├── tts.py                         # Gemini TTS (online)
-│   ├── tts_offline.py                 # pyttsx3 (offline fallback)
-│   ├── tts_indic.py                   # gTTS / IndicTTS for Tamil output
-│   └── wakeword.py                    # Porcupine wake word listener
-├── vision/
-│   ├── capture.py                     # Screenshot utilities
-│   ├── gemini_vision.py               # Gemini Vision calls
-│   ├── omniparser.py                  # OmniParser V2 HTTP client
-│   └── omniparser_server.py           # Subprocess launcher for OmniParser server
-├── control/
-│   ├── mouse_keyboard.py              # PyAutoGUI smart wrapper
-│   ├── win32_api.py                   # Deep Win32 access
-│   ├── browser.py                     # Playwright browser automation (sync API only)
-│   ├── os_layer.py                    # Cross-OS abstraction layer
-│   └── adb/
-│       ├── adb_client.py              # ADB commands
-│       ├── tailscale.py               # Tailscale tunnel management
-│       └── qr_pairing.py              # Auto QR-based ADB pairing (local + remote)
-├── interfaces/
-│   ├── cli.py                         # Rich terminal interface (streaming)
-│   ├── gui/
-│   │   └── app.py                     # PyQt6 GUI (streaming, image upload, session switcher)
-│   ├── telegram_bot.py                # Telegram interface (auth whitelist + edit-based streaming)
-│   ├── voice_interface.py             # Full voice loop (VAD → STT → LLM → TTS)
-│   └── tray.py                        # System tray app
-├── tasks/
-│   ├── scheduler.py                   # APScheduler persistent task runner
-│   └── goals.py                       # Goal decomposition + max_steps guard + cycle detection
-├── web/
-│   ├── search.py                      # Web search
-│   ├── scraper.py                     # HTML scraping
-│   ├── crawler.py                     # Multi-page crawling
-│   └── hybrid_ranker.py               # BM25 + Semantic + RRF fusion
-├── rag/
-│   ├── doc_loader.py                  # PDF (pypdf), DOCX (python-docx), TXT
-│   ├── chunker.py                     # Split docs into overlapping chunks
-│   └── doc_store.py                   # Embed + store in ChromaDB, query by filename
-├── mcp/
-│   ├── master_mcp.py                  # Dynamic MCP server orchestrator
-│   └── master_api.py                  # API key → service router
-├── plugins/
-│   └── (drop .py files here)          # Auto-loaded custom capability plugins
-├── safety/
-│   └── guardrails.py                  # Risk scoring, action confirmation, emergency stop
-├── utils/
-│   ├── logger.py                      # Structured logging (loguru)
-│   ├── usage_tracker.py               # Token/cost tracker per provider/session
-│   ├── exporter.py                    # Export session as JSON / Markdown backup
-│   └── helpers.py
-├── tests/
-│   ├── test_llm_engine.py
-│   ├── test_memory_router.py
-│   ├── test_dispatcher.py
-│   ├── test_hybrid_ranker.py
-│   ├── test_guardrails.py
-│   └── test_context_trimmer.py
-├── setup.py                           # One-command installer
-├── .env
-└── requirements.txt
+```mermaid
+flowchart LR
+    U[User] --> I[CLI / GUI / Telegram / Voice]
+    I --> A[NOVAApp in main.py]
+    A --> R[LLM Engine and RoundRobin]
+    R --> C[Cloud providers]
+    R --> O[Ollama fallback]
+    A --> M[Memory Router]
+    M --> V[ChromaDB]
+    M --> P[mem0]
+    A --> D[Validated Tool Dispatcher]
+    D --> X[Vision / Browser / OS / ADB / RAG]
+    A --> G[Goals and Scheduler]
+    A --> H[Health Monitor and /health]
 ```
 
 ---
 
-## Environment Variables (.env)
+## <a name="tech-stack"></a>Tech Stack
 
-```env
-# LLM — comma-separated keys for RoundRobin pool
-OPENAI_API_KEYS=key1,key2,key3
-OPENAI_BASE_URL=                       # your 120B endpoint
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=llama3
+The versions below are taken from [`requirements.txt`](./requirements.txt), [`requirements.lock`](./requirements.lock), [`Dockerfile`](./Dockerfile), and the repository configuration files.
 
-# Gemini — comma-separated keys
-GEMINI_API_KEYS=key_a,key_b
+| Area | Technologies |
+|---|---|
+| Runtime | Python 3.11 container base; Python 3.10+ is the intended language family. |
+| Language-model layer | `openai==1.3.5`, `google-generativeai==0.3.0`, Ollama, and the internal RoundRobin/fallback layer. |
+| Voice and audio | Porcupine, PyAudio, sounddevice, Silero VAD, faster-whisper, pyttsx3, gTTS, and pynput. |
+| Vision and automation | Pillow, OpenCV, PyAutoGUI, Playwright `1.40.0`, Win32 APIs, Quartz/xdotool-compatible platform layers, and OmniParser. |
+| Memory and retrieval | mem0ai `0.1.0`, ChromaDB `0.5.0`, sentence-transformers `3.0.0`, rank-bm25 `0.2.2`, and SQLAlchemy `2.0.29`. |
+| Documents and web | pypdf `4.0.0`, python-docx `1.1.2`, Requests `2.32.5`, Beautiful Soup `4.12.3`, DuckDuckGo Search, and the internal crawler/ranker. |
+| Interfaces | Rich `14.3.3`, PyQt6, python-telegram-bot, pystray, and the voice interface. |
+| Scheduling and reliability | APScheduler `3.10.4`, watchdog `4.0.1`, Pydantic `2.12.5`, Loguru `0.7.2`, and pytest `8.4.2`. |
+| Infrastructure | Docker Compose, Ollama, ChromaDB, OmniParser, FFmpeg, ADB, and optional Tailscale networking. |
 
-# Memory
-MEM0_API_KEY=
+---
 
-# Wakeword
-PORCUPINE_ACCESS_KEY=
-PORCUPINE_KEYWORD_PATH=./assets/Hey-Nova_en_windows_v3_0_0.ppn  # download from console.picovoice.ai
-PORCUPINE_SENSITIVITY=0.6
+## <a name="getting-started"></a>Getting Started
 
-# Telegram
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=                      # whitelist — only this ID can message NOVA
+### Prerequisites
 
-# ADB
-TAILSCALE_PHONE_IP=
-ADB_PORT=5555
+For a bare-metal installation, use Python 3.11 or a compatible Python 3.x environment, Git, FFmpeg/`ffplay`, `mpg123`, and Android Platform Tools when Android control is required. Playwright installs Chromium during setup. Ollama is required only for local-model fallback, while cloud providers and integrations require the corresponding accounts or API keys.
 
-# OmniParser
-OMNIPARSER_SERVER_URL=http://localhost:8000
+For containerized execution, use Docker Engine with the Docker Compose plugin. The supplied [`Dockerfile`](./Dockerfile) is based on Python 3.11 and installs the pinned dependency set from `requirements.lock`; [`docker-compose.yml`](./docker-compose.yml) provisions Ollama, ChromaDB, OmniParser, and NOVA.
 
-# Safety
-RISK_CONFIRM_THRESHOLD=7               # 0–10, above this needs explicit confirm
+### Bare-metal installation
 
-# Sessions
-DEFAULT_SESSION=nova_personal
-
-# Usage
-DAILY_TOKEN_ALERT_THRESHOLD=100000
-
-# Voice
-DEFAULT_LANG=en                        # "ta" for Tamil, "hi" for Hindi
-VAD_SILENCE_MS=800                     # ms of silence before STT fires
-WHISPER_MODEL=base                     # options: tiny / base / small / medium / large
+```bash
+git clone https://github.com/vincenzo-afk/NOVA.git
+cd NOVA
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+cp .env.example .env
+python3 setup.py
 ```
 
----
+`setup.py` creates or preserves `.env`, installs Python dependencies, checks system commands, installs Playwright Chromium when available, prepares the OmniParser checkout, warms the configured Whisper model, optionally pulls the configured Ollama model, checks the wake-word asset, and runs post-install health checks. Review the installer before running it on a machine where package installation or startup registration is restricted.
 
-## Build Phases
+### Configuration
 
-Each phase produces something **fully working and testable** before you move on.
+Copy `.env.example` to `.env` and add only the credentials and services you intend to use. `.env` is ignored by Git. The main configuration groups are summarized below; the complete inventory is maintained in [`config/settings.py`](./config/settings.py), [`config/settings_schema.json`](./config/settings_schema.json), and [`.env.example`](./.env.example).
 
----
+| Group | Important variables |
+|---|---|
+| LLM | `OPENAI_API_KEYS`, `OPENAI_BASE_URL`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `GEMINI_API_KEYS` |
+| Memory and storage | `MEM0_API_KEY`, `DATA_DIR`, `PRIVACY_MODE`, `DEFAULT_SESSION` |
+| Voice | `PORCUPINE_ACCESS_KEY`, `PORCUPINE_KEYWORD_PATH`, `DEFAULT_LANG`, `VAD_SILENCE_MS`, `WHISPER_MODEL`, `GEMINI_TTS_MODEL`, `GEMINI_TTS_VOICE` |
+| Telegram and Android | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TAILSCALE_PHONE_IP`, `ADB_PORT` |
+| Vision and services | `OMNIPARSER_SERVER_URL`, `OMNIPARSER_REPO_DIR`, `NOVA_STARTUP_DELAY_SECONDS` |
+| Safety and usage | `RISK_CONFIRM_THRESHOLD`, `DAILY_TOKEN_ALERT_THRESHOLD`, `DAILY_TOKEN_HARD_CAP`, `VOICE_BARGEIN_HOTKEY` |
+| Proactivity and autonomy | `PROACTIVE_WATCHER_ENABLED`, `PROACTIVE_WATCHER_INTERVAL`, `PHONE_WATCHER_ENABLED`, `AUTONOMY_ENABLED`, `AUTONOMY_POLL_SECONDS`, `AUTONOMY_MAX_STEPS` |
+| Optional extensions | `VIRUSTOTAL_API_KEY`, `VIRUSTOTAL_SCAN_WRITES`, `SELF_EVAL_ENABLED`, `NUDGE_ENGINE_ENABLED`, `AMBIENT_MONITOR_ENABLED`, `A2A_ENABLED` |
 
-### ✅ PHASE 1 — Core Engine (The Brain)
-**Goal:** A working streaming CLI chatbot backed by your full LLM stack.
-
-**Features built:**
-- `[8]` Chat
-- `[1]` Think (CoT reasoning)
-- `[2]` Ask Questions (ambiguity detection)
-- `[3]` Fallback (cloud → local)
-- RoundRobin with multi-key support + exponential backoff
-- Streaming output
-- Config validation on startup
-
-**What you build:**
-
-1. **Project scaffolding** — all folders, `__init__.py` in every package, `assets/` directory
-
-2. **`config/settings.py`** — `.env` loader with **startup validation**:
-   - On boot, check every required key is present
-   - If any required key missing → print clear error and exit immediately (no silent crashes)
-   - Parse `OPENAI_API_KEYS` as comma-separated list → pass to RoundRobin pool
-   - Same for `GEMINI_API_KEYS`
-
-3. **`core/llm/engine.py`** — unified interface:
-   ```python
-   def ask(prompt, system, history) -> str
-   def ask_stream(prompt, system, history) -> Generator[str, None, None]
-   ```
-
-4. **`core/llm/roundrobin.py`** — multi-key rotation:
-   - Reads key pool from config (comma-separated, N keys)
-   - Per-key state: `active`, `rate_limited (with TTL)`, `dead`
-   - `mark_rate_limited(key, retry_after=60)` — TTL cooldown, **auto-recovers**, not permanently banned
-   - Exponential backoff on repeated failures: 60s → 120s → 240s
-   - `get_next()` — skips cooldown/dead keys, returns next active key
-
-5. **`core/llm/fallback.py`** — if all cloud keys exhausted or offline → Ollama
-
-6. **`core/think/reasoning.py`**:
-   - CoT wrapper: silent step-by-step prefix on every LLM call
-   - Ambiguity detector: score 0–1. Above 0.6 → return clarifying question instead of executing
-   - Ask Questions: *"Did you mean X or Y?"* before any ambiguous action
-   - **Tool schema injection point** — from Phase 5, append `dispatcher.get_tool_schema_prompt()` to every system prompt:
-     ```python
-     # reasoning.py — build_system_prompt()
-     def build_system_prompt(base: str, dispatcher=None) -> str:
-         prompt = base
-         if dispatcher:
-             prompt += "\n\n" + dispatcher.get_tool_schema_prompt()
-         return prompt
-     ```
-     Wire this from day one with `dispatcher=None` — Phase 5 passes the real dispatcher in.
-
-7. **`interfaces/cli.py`** — Rich streaming terminal:
-   - Tokens print live as generator yields
-   - Shows which provider answered (e.g., `[cloud • key_2]` or `[local • ollama]`)
-
-**Testable milestone:** Tokens stream live. Ambiguous command → NOVA asks before acting. Kill internet → Ollama takes over. Rate-limit a key → recovers after TTL without restart. Missing `.env` key → clear startup error, not a mysterious crash 10 minutes in.
+Never commit API keys, tokens, device identifiers, session exports, logs, or local vector stores. The repository’s ignore rules cover `.env`, `.jarvis*` state, logs, exports, and vendor checkouts.
 
 ---
 
-### ✅ PHASE 2 — Memory Layer
-**Goal:** NOVA remembers everything and never overflows its context window.
+## <a name="usage"></a>Usage
 
-**Features built:**
-- `[9]` Memory (mem0 + ChromaDB)
-- Context window management
-- Hybrid memory search (BM25 + Semantic + RRF)
-- Multi-session support
+The default entrypoint starts the Rich command-line interface:
 
-**What you build:**
-
-1. **`core/memory/mem0_client.py`** — mem0 wrapper: `add()`, `search()`, `get_all()`
-
-2. **`core/memory/local_store.py`** — ChromaDB with `sentence-transformers` local embeddings:
-   - Identical interface to mem0_client
-   - Works fully offline, zero internet
-
-3. **`core/memory/memory_router.py`** — smart router:
-   - Online → write to **both** mem0 + ChromaDB simultaneously
-   - Offline → ChromaDB only
-   - On reconnect → sync offline-written memories up to mem0
-   - **Deduplication on write**: hash-check before adding — never store same memory twice
-
-4. **`core/memory/context_trimmer.py`**:
-   - Keep last N raw turns (default: 10)
-   - Older turns → compress via LLM into a rolling summary paragraph
-   - Final prompt structure every time:
-     ```
-     [system prompt]
-     [world state JSON]
-     [relevant memories top-5]
-     [summary of older turns]
-     [last N raw turns]
-     ```
-   - Never sends raw full history to LLM
-
-5. **Hybrid memory search** in `memory_router.search()`:
-   - Vector search → top-20 candidates
-   - BM25 keyword re-rank those 20
-   - RRF merge → final top-5 returned
-   - Result: exact-term recall + semantic fuzzy recall together
-
-6. **`core/context/environment.py`** — world state snapshot:
-   - Foreground app, window title, clipboard, time/date, battery %, network status, last active file
-
-7. **`core/session.py`**:
-   - Every conversation has a `session_id` (UUID)
-   - `reset_context()` — clear turn history, keep memories
-   - Named sessions: `nova_work`, `nova_personal` — separate mem0 user IDs
-   - Switch: *"switch to work mode"* → loads correct session memories
-
-**Testable milestone:** Tell NOVA your name → close and reopen → remembered. 100-turn conversation → no crash, no silent truncation. Search for something from turn 50 → exact recall via BM25 hybrid. Two sessions → memories properly isolated.
-
----
-
-### ✅ PHASE 3 — Voice Layer
-**Goal:** Talk to NOVA hands-free. Works fully offline. Supports Tamil.
-
-**Features built:**
-- `[11]` STT (online + offline + multilingual)
-- `[10]` TTS (online + offline + Tamil)
-- `[12]` Wakeword
-- `[13]` Voice interface
-- VAD (voice activity detection)
-
-**What you build:**
-
-1. **`voice/vad.py`** — silero-VAD:
-   - Listens to mic audio stream continuously
-   - Detects **speech start** → begin buffering audio
-   - Detects **silence >800ms** → stop buffering → return audio clip for STT
-   - Without this, STT has no idea when you finished speaking
-
-2. **`voice/wakeword.py`** — Porcupine background thread:
-   - Wake word: *"Hey NOVA"* loaded from `PORCUPINE_KEYWORD_PATH` in `.env`
-   - **"Hey NOVA" is NOT a built-in keyword** — requires a `.ppn` file downloaded from console.picovoice.ai
-   - `setup.py` will remind you to download it; the file goes in `assets/`
-   - On detection → fires callback to VAD → begin voice capture
-   - Sensitivity controlled by `PORCUPINE_SENSITIVITY` (default: 0.6)
-   ```python
-   import pvporcupine, os
-   from config.settings import settings
-
-   porcupine = pvporcupine.create(
-       access_key=settings.PORCUPINE_ACCESS_KEY,
-       keyword_paths=[settings.PORCUPINE_KEYWORD_PATH],
-       sensitivities=[settings.PORCUPINE_SENSITIVITY],
-   )
-   ```
-
-3. **`voice/stt.py`** — Gemini STT (online):
-   ```python
-   def transcribe(audio_bytes, lang="en") -> str
-   # lang="ta" for Tamil, "hi" for Hindi, etc.
-   ```
-
-4. **`voice/stt_offline.py`** — faster-whisper (offline):
-   - Same interface: `transcribe(audio_bytes, lang="en")`
-   - Model size read from `WHISPER_MODEL` env var (tiny/base/small/medium/large)
-   - faster-whisper natively supports Tamil (`lang="ta"`) — no extra model needed
-   ```python
-   from faster_whisper import WhisperModel
-   from config.settings import settings
-
-   model = WhisperModel(settings.WHISPER_MODEL, device="cpu", compute_type="int8")
-   ```
-
-5. **`voice/tts.py`** — Gemini TTS (online):
-   ```python
-   def speak(text, emotion="neutral", lang="en")
-   ```
-
-6. **`voice/tts_offline.py`** — pyttsx3 (offline English fallback)
-
-7. **`voice/tts_indic.py`** — Tamil TTS:
-   - gTTS with `lang="ta"` for basic Tamil output
-   - Upgrade path: IndicTTS API for higher quality
-   - Auto-selected when `lang="ta"` and online; gTTS when offline
-
-8. **`interfaces/voice_interface.py`** — full loop:
-   - Wakeword → VAD captures until silence → STT (auto online/offline) → LLM stream → TTS (auto online/offline/Tamil)
-   - Barge-in: hotkey mid-speech stops NOVA and re-listens
-   - Self-mute: wakeword disabled while NOVA is speaking
-
-**Testable milestone:** Say *"Hey NOVA"* → speak freely → it waits for silence before responding. Speak Tamil → responds in Tamil. Offline → full voice loop on local models. Never cuts you off mid-sentence, never records forever.
-
----
-
-### ✅ PHASE 4 — Eyes (Screen Vision + Prediction)
-**Goal:** NOVA sees your screen and acts proactively. OmniParser managed automatically.
-
-**Features built:**
-- `[14]` Screen access
-- `[16]` Context & environment understanding (full)
-- `[4]` Prediction + proactive behavior
-- Multi-modal image input
-
-**What you build:**
-
-1. **`vision/omniparser_server.py`** — OmniParser lifecycle manager:
-   - On NOVA boot → check if OmniParser server is running
-   - If not → launch as subprocess automatically
-   - Configured via `OMNIPARSER_SERVER_URL=http://localhost:8000`
-   - `core/health.py` pings it every 60s → auto-restarts if down
-   - `setup.py` downloads OmniParser weights and registers it
-
-2. **`vision/capture.py`** — full screen, active window, custom region, periodic loop
-
-3. **`vision/gemini_vision.py`** — structured screen analysis:
-   - Returns JSON: `{scene_type, detected_errors, active_app, notable_elements, suggested_actions}`
-
-4. **`vision/omniparser.py`** — HTTP client to OmniParser server:
-   - OCR: extract all visible text
-   - UI element map: buttons/inputs with bounding box coordinates
-   - Element map fed to `mouse_keyboard.py` for name-based clicking
-
-5. **Proactive watcher loop** (background thread):
-   - Runs every N seconds, analyzes screen
-   - Detects: error dialogs, stuck loading spinners, login screens, crash reports
-   - Rate-limited: max 1 unsolicited interrupt per 2 minutes
-   - *"I see a Python error — want me to fix it?"*
-
-6. **Multi-modal user input** (GUI + Telegram):
-   - User can send/upload an image → Gemini Vision analyzes it → enters conversation context
-   - *"Here's a screenshot of the bug"* → NOVA reasons about it
-
-**Testable milestone:** Boot NOVA → OmniParser starts automatically. Kill its process → health monitor restarts it. Open an error dialog → NOVA proactively speaks up. Send a screenshot in Telegram → NOVA analyzes it.
-
----
-
-### ✅ PHASE 5 — Hands + Documents (PC Control + RAG)
-**Goal:** NOVA operates your PC and reads your documents intelligently.
-
-**Features built:**
-- `[17]` Mouse & keyboard
-- `[19]` File & PC access
-- `[25]` Deep Win32 API
-- `[26]` Browser control
-- `[22]` Web access
-- Tool call dispatcher (Pydantic validated)
-- Document RAG
-
-**What you build:**
-
-1. **`core/tools/dispatcher.py`** — critical glue layer:
-
-   **Tool schema injection** (fixes Gap #2 — LLM must know what tools exist):
-   ```python
-   import json
-   from pydantic import BaseModel
-
-   class Dispatcher:
-       def __init__(self):
-           self.registry: dict[str, callable] = {}
-           self.schemas: dict[str, type[BaseModel]] = {}
-
-       def register(self, name: str, fn: callable, schema: type[BaseModel]):
-           self.registry[name] = fn
-           self.schemas[name] = schema
-
-       def get_tool_schema_prompt(self) -> str:
-           """Injected into every LLM system prompt so it knows available tools."""
-           tools = [
-               {"tool": name, "args": model.schema()}
-               for name, model in self.schemas.items()
-           ]
-           return f"""To use a tool, output ONLY valid JSON in this exact format:
-   {{"tool": "<tool_name>", "args": {{...}}}}
-
-   Available tools:
-   {json.dumps(tools, indent=2)}
-
-   For regular responses, output plain text. Never mix JSON and text in one response."""
-   ```
-
-   **Safety stub** (fixes Gap #5 — blocks destructive calls before Phase 11):
-   ```python
-   ALWAYS_CONFIRM = {
-       "win32_api.delete",
-       "win32_api.registry_write",
-       "win32_api.kill_process",
-       "adb.send_sms",
-       "adb.delete_file",
-       "browser.fill",           # could submit forms
-   }
-
-   def execute(self, tool_call: ToolCall):
-       # Safety stub — replaced by full guardrails.py in Phase 11
-       if tool_call.tool in ALWAYS_CONFIRM:
-           print(f"\n⚠️  [SAFETY STUB] About to run: {tool_call.tool}")
-           print(f"   Args: {tool_call.args}")
-           confirm = input("   Confirm? (y/n): ").strip().lower()
-           if confirm != "y":
-               return {"status": "cancelled", "reason": "user declined"}
-
-       fn = self.registry.get(tool_call.tool)
-       if not fn:
-           return {"error": f"unknown tool: {tool_call.tool}"}
-
-       # Log before execution
-       logger.info(f"Executing tool: {tool_call.tool} | args: {tool_call.args}")
-       return fn(**tool_call.args)
-   ```
-
-   On Pydantic validation failure → return structured error to LLM, ask it to retry.
-
-2. **`control/mouse_keyboard.py`** — smart PyAutoGUI:
-   - `click_element(name)` — uses OmniParser element map, no hardcoded coords
-   - `type_text()`, `hotkey()`, `scroll()`, `drag()`
-
-3. **`control/win32_api.py`** — deep PC access:
-   - File: read, write, move, delete, search by name/content
-   - Process: list, kill, launch
-   - Window: focus, resize, close by title
-   - Registry: read/write
-   - Clipboard: get/set
-   - Notifications: Windows toast
-   - Disk: free space, connected drives
-
-4. **`control/browser.py`** — Playwright with **sync API only**:
-   - **Always use `sync_playwright`** — async variant causes silent failures inside non-async threads
-   ```python
-   from playwright.sync_api import sync_playwright  # ALWAYS this — never async_playwright
-
-   class Browser:
-       def __init__(self):
-           self._pw = sync_playwright().start()
-           self.browser = self._pw.chromium.launch(headless=True)
-           self.page = self.browser.new_page()
-
-       def open(self, url: str):
-           self.page.goto(url)
-
-       def click(self, selector: str):
-           self.page.click(selector)
-
-       def fill(self, selector: str, value: str):
-           self.page.fill(selector, value)
-
-       def extract_text(self) -> str:
-           return self.page.inner_text("body")
-
-       def get_links(self) -> list[str]:
-           return self.page.eval_on_selector_all("a", "els => els.map(e => e.href)")
-
-       def screenshot(self) -> bytes:
-           return self.page.screenshot()
-
-       def close(self):
-           self.browser.close()
-           self._pw.stop()
-   ```
-
-5. **`web/search.py`**, **`web/scraper.py`**, **`web/crawler.py`**, **`web/hybrid_ranker.py`**
-
-6. **`rag/doc_loader.py`** — document ingestion:
-   - PDF → `pypdf`
-   - DOCX → `python-docx`
-   - TXT → plain read
-   - Returns clean text + metadata (filename, page count, modification date)
-
-7. **`rag/chunker.py`** — smart splitting:
-   - Overlapping chunks (default: 512 tokens, 64 overlap)
-   - Respects sentence boundaries — never cuts mid-sentence
-
-8. **`rag/doc_store.py`** — ChromaDB document collection:
-   - `ingest(filepath)` — load → chunk → embed → store with filename metadata
-   - `query(question, filename=None)` — retrieve relevant chunks
-   - `list_docs()` — show all ingested documents
-   - *"Read this PDF and summarize section 3"* → fully handled end-to-end
-
-**Testable milestone:** *"Open Chrome and find the asyncio docs"* → fully autonomous. *"Read my project_brief.pdf and tell me the key requirements"* → NOVA ingests, queries, and answers. Dangerous command (e.g., delete a folder) → safety stub prompts for confirmation.
-
----
-
-### ✅ PHASE 6 — Interfaces, Tray & Startup
-**Goal:** NOVA on every surface, always running, with full visibility.
-
-**Features built:**
-- `[13]` GUI, CLI, Telegram, Voice interfaces
-- `[18]` System Tray
-- `[7]` 24/7 startup
-- Usage tracker
-- Session management UI
-- Conversation export
-
-**What you build:**
-
-1. **`interfaces/gui/app.py`** — PyQt6:
-   - Streaming output, image upload, mic button, session switcher
-   - Emotion + status indicator, today's token usage widget
-
-2. **`interfaces/telegram_bot.py`** — python-telegram-bot:
-   - **Auth whitelist**: every handler checks `update.effective_user.id` against `TELEGRAM_CHAT_ID` — reject anyone else with no response
-   - **Edit-based streaming** (Telegram has no real token streaming — this simulates it):
-     ```python
-     import time
-
-     async def handle_message(update, context):
-         # Guard: only respond to whitelisted chat ID
-         if str(update.effective_user.id) != settings.TELEGRAM_CHAT_ID:
-             return
-
-         msg = await update.message.reply_text("⏳")
-         buffer = ""
-         last_edit = 0
-
-         async for token in jarvis.ask_stream(update.message.text):
-             buffer += token
-             now = time.time()
-             if now - last_edit > 1.5:          # ~40 edits/min max — stays under Telegram rate limit
-                 await context.bot.edit_message_text(
-                     buffer + " ▌",
-                     chat_id=update.effective_chat.id,
-                     message_id=msg.message_id
-                 )
-                 last_edit = now
-
-         await context.bot.edit_message_text(   # final message without cursor
-             buffer,
-             chat_id=update.effective_chat.id,
-             message_id=msg.message_id
-         )
-     ```
-   - Supports: `/screenshot`, `/session work`, `/status`, `/export`, image input
-
-3. **`interfaces/tray.py`** — pystray:
-   - Tooltip: *"Today: 42k tokens · 3 keys active · Online"*
-   - Menu: Open GUI, Switch Session, Mute, Health, Export Session, Quit
-
-4. **`utils/usage_tracker.py`** — per provider/session:
-   - Daily/weekly summaries on request
-   - Alert if daily spend crosses `DAILY_TOKEN_ALERT_THRESHOLD`
-
-5. **`utils/exporter.py`** — session backup:
-   - Export as JSON (raw) or Markdown (human-readable)
-   - Triggered via Telegram `/export`, tray menu, or voice command
-
-6. **Startup**: Win32 registry + watchdog process
-
-**Testable milestone:** Boot PC → NOVA in tray. Telegram only responds to your chat ID. The "typing" cursor effect appears in Telegram as NOVA generates. Export conversation → readable Markdown file. Tray tooltip shows live usage.
-
----
-
-### ✅ PHASE 7 — Scheduler, Goals & Autonomy
-**Goal:** NOVA works while you're away.
-
-**Features built:**
-- `[20]` Scheduled tasks
-- `[21]` Goals & Tasks
-- `[23]` Personal Assistant autonomy loop
-
-**What you build:**
-
-1. **`tasks/scheduler.py`** — APScheduler (SQLite backend, survives restarts):
-   - Natural language → LLM → cron expression
-   - Register, list, cancel jobs
-
-2. **`tasks/goals.py`** — with hard loop guards:
-   - Goal → LLM decomposition → subtask list with dependencies
-   - **`max_steps` hard limit** (default: 20) per goal execution run
-   - Steps exhausted → pause + notify: *"Reached step limit on goal X — continue?"*
-   - **Cycle detection**: if same tool + same args appear twice in one run → abort immediately, report to user
-   - Re-planning on subtask failure
-
-3. **Autonomous agent loop**:
-   - Picks up pending goals without prompting
-   - Reports completion via TTS (local) or Telegram (away)
-   - Configurable max autonomy depth (how many steps before checking in)
-
-**Testable milestone:** *"Every morning at 8 summarize my emails"* → runs next morning unattended. Long-running goal hits step limit → NOVA pauses and asks, doesn't loop forever.
-
----
-
-### ✅ PHASE 8 — Android Control + QR Pairing
-**Goal:** NOVA controls your Android from anywhere. Pair with a single QR scan.
-
-**Features built:**
-- `[5]` ADB with Tailscale
-- QR-based auto-pairing (local + remote)
-
-**What you build:**
-
-1. **`control/adb/tailscale.py`** — tunnel management:
-   - Verify Tailscale is installed; if not → auto-download and install silently
-   - Get phone's Tailscale IP (`tailscale ip -4`)
-   - Reconnect if tunnel drops
-
-2. **`control/adb/qr_pairing.py`** — smart ADB pairing:
-   - Run `adb tcpip 5555` on NOVA PC
-   - **Mode detection**:
-     - Same network → use local DHCP IP (`socket.connect("8.8.8.8")`)
-     - Remote network → use Tailscale IP
-   - Generate QR code containing `adb_connect://<ip>:5555`
-   - Show QR in GUI + save as PNG + display in terminal
-   - You scan from Android (Termux or companion app) → ADB connects instantly
-   - **Background service mode**: runs on boot, always exposes itself, QR always available in tray
-
-3. **`control/adb/adb_client.py`** — full phone control:
-   - Screenshot → Gemini Vision analysis
-   - Tap, swipe, type
-   - Launch apps by package name
-   - SMS read/send via `content query` / `am start`
-   - Answer call: `KEYCODE_CALL`, reject: `KEYCODE_ENDCALL`
-   - Notification dump: `adb shell dumpsys notification`
-   - File pull/push
-
-4. **Proactive phone watcher**:
-   - Periodic phone screenshot → vision
-   - Incoming call detected → TTS: *"Incoming call from X — answer?"*
-   - New notifications → summarized proactively
-
-**Testable milestone:** Open tray → *"Show ADB QR"* → scan with phone → connected. *"Send WhatsApp to [contact] saying I'll be late"* → done. Incoming call → NOVA announces it.
-
----
-
-### ✅ PHASE 9 — Emotion Engine
-**Goal:** NOVA has a personality that feels alive.
-
-**Features built:**
-- `[15]` Engine with emotion
-
-**What you build:**
-
-1. **`core/emotion/engine.py`** — state machine:
-   - States: `neutral`, `focused`, `concerned`, `enthusiastic`, `cautious`, `empathetic`, `urgent`
-   - Transitions from: conversation tone, error detection, time of day, task urgency, user stress signals
-   - Emotion injected into every LLM system prompt
-
-2. Emotion affects: TTS prosody, response length/style, proactivity frequency, GUI status color
-
-**Testable milestone:** Error screen → tone goes urgent. Late night casual chat → warm and relaxed. Completing a long goal → genuinely enthusiastic.
-
----
-
-### ✅ PHASE 10 — Master MCP, Master API & Plugins
-**Goal:** Give NOVA any API key and it figures out the rest.
-
-**Features built:**
-- `[24]` Master MCP
-- `[29]` Master API
-- Plugin architecture
-
-**What you build:**
-
-1. **`mcp/master_api.py`** — API key registry with auto-detection
-
-2. **`mcp/master_mcp.py`** — dynamic MCP orchestrator:
-   - Connect to any MCP server by service name
-   - `mcp.list_tools()` → LLM discovers capabilities at runtime
-   - Built-in: GitHub, Notion, Slack, Linear, Google Drive, Jira
-
-3. **`core/plugin_loader.py`** — Python plugin system:
-   - Scans `plugins/` at startup
-   - Standard interface:
-     ```python
-     PLUGIN_NAME = "my_tool"
-     PLUGIN_TOOLS = [{"name": "...", "description": "...", "args": {...}}]
-     def my_tool_function(**kwargs): ...
-     ```
-   - Auto-registers into dispatcher — no core edits needed
-   - Security note: plugins are trusted local code; sandboxing is best-effort, not a complete isolation boundary
-
-**Testable milestone:** Give GitHub token → *"List my open PRs"* → done. Drop a custom plugin file → restart → new tool available automatically.
-
----
-
-### ✅ PHASE 11 — Safety Layer
-**Goal:** NOVA never acts destructively without explicit confirmation.
-
-**Features built:**
-- `[28]` Safety
-
-**What you build:**
-
-1. **`safety/guardrails.py`** — replaces the Phase 5 safety stub entirely:
-   - Risk scorer 0–10 on every tool call
-   - Low (0–3): silent execution
-   - Medium (4–6): show plan, 5s countdown, auto-confirm
-   - High (7–10): explicit confirmation, no timeout
-   - Destructive action list: always High regardless of context
-   - Dry-run mode: full plan explained without any execution
-   - Emergency stop: voice *"NOVA stop"* or `Ctrl+Shift+X`
-   - Full action log: timestamp, tool, args, risk, who confirmed, result
-
-2. **Retrofit**: remove the safety stub from `dispatcher.py` and replace with:
-   ```python
-   from safety.guardrails import guardrails
-
-   def execute(self, tool_call: ToolCall):
-       risk = guardrails.check(tool_call)    # scores 0–10, may block or prompt
-       if risk.blocked:
-           return {"status": "blocked", "reason": risk.reason}
-       logger.info(f"Executing tool: {tool_call.tool} | risk: {risk.score}")
-       fn = self.registry.get(tool_call.tool)
-       result = fn(**tool_call.args)
-       guardrails.log(tool_call, risk, result)
-       return result
-   ```
-
-**Testable milestone:** *"Delete Downloads folder"* → reads back full list, waits for *"confirm"*. Emergency stop mid-execution → immediate halt.
-
----
-
-### ✅ PHASE 12 — Offline Polish & Health Monitor
-**Goal:** Nothing silently breaks. Full parity offline.
-
-**Features built:**
-- `[6]` Offline (complete)
-- Self-diagnostic health monitor
-
-**What you build:**
-
-1. **Network monitor** — detects loss → switches all services:
-   - LLM → Ollama
-   - STT → faster-whisper
-   - TTS → pyttsx3 / gTTS
-   - Memory → ChromaDB (dedup-checked)
-   - Vision → OmniParser-only
-   - On reconnect → sync offline memories to mem0 (dedup before upload)
-   - Tray icon reflects current mode
-
-2. **`core/health.py`** — watchdog:
-   - Heartbeats every 60s: Porcupine thread, mem0, OmniParser server, Ollama, scheduler, watcher, ADB, VAD
-   - Dead thread → auto-restart
-   - Critical failure → Telegram alert: *"⚠️ OmniParser is down. Restarting..."*
-   - `/status` command returns full subsystem health table
-
-**Testable milestone:** Kill any subsystem manually → health monitor restarts it in <60s. Unplug ethernet → all features continue on local models. Reconnect → syncs without duplicates.
-
----
-
-### ✅ PHASE 13 — Cross-OS, Tests & Final Hardening
-**Goal:** Linux/Mac-ready foundation. One-command install. Full test coverage.
-
-**Features built:**
-- `[27]` All OS Support (foundation)
-
-**What you build:**
-
-1. **`control/os_layer.py`** — OS abstraction:
-   - `get_foreground_app()`, `send_notification()`, `register_startup()` — each with Win32 / xdotool / AppKit implementations
-
-2. **Cross-platform startup**: Task Scheduler (Win) / systemd (Linux) / launchd (Mac)
-
-3. **`setup.py`** — one-command installer:
-   ```python
-   # Key steps in setup.py
-
-   # 1. Install Python deps
-   subprocess.run(["pip", "install", "-r", "requirements.txt"])
-
-   # 2. Prompt for API keys → write .env
-   # ...
-
-   # 3. Install Playwright browser
-   subprocess.run(["playwright", "install", "chromium"])
-
-   # 4. Download OmniParser weights
-   # ...
-
-   # 5. Download Ollama + pull default model
-   # ...
-
-   # 6. Download Whisper model
-   from faster_whisper import WhisperModel
-   model_size = os.getenv("WHISPER_MODEL", "base")
-   print(f"Downloading Whisper model: {model_size} ...")
-   WhisperModel(model_size, device="cpu", compute_type="int8")
-   print("✓ Whisper ready")
-
-   # 7. Porcupine wake word reminder
-   print("\n⚠️  Wake word setup required:")
-   print("   1. Go to console.picovoice.ai")
-   print("   2. Create a custom 'Hey NOVA' keyword for your OS")
-   print("   3. Download the .ppn file")
-   print("   4. Place it at: assets/Hey-Nova_en_windows_v3_0_0.ppn")
-   print("   5. Confirm the path matches PORCUPINE_KEYWORD_PATH in your .env")
-
-   # 8. Register startup entry for current OS
-   # ...
-
-   # 9. Run health check
-   # ...
-   ```
-   - Total time target: <5 minutes on fresh machine
-
-4. **`tests/`** — full pytest suite:
-   - Unit: LLM engine, memory router, dispatcher, hybrid ranker, guardrails, context trimmer
-   - Integration: full conversation loop, tool call → validation → safety check → execution
-   - Run: `pytest tests/ -v`
-
-**Testable milestone:** `python setup.py` on fresh Windows machine → NOVA running in <5 minutes. Full test suite passes.
-
----
-
-### 🚧 PHASE 14 — Self-Learning Automation Expansion (Planned + In Progress)
-**Goal:** NOVA learns new tools/software patterns autonomously and turns repeated behavior into reusable automation.
-
-**Requested feature plan additions:**
-- Skill Learner: `"Nova, learn Figma"` -> crawl docs -> generate control plugin scaffold (for example `figma_control.py`) with human approval gate.
-- API Autodiscovery: `"Nova, use IRCTC API"` -> discover docs/endpoints -> generate client plugin quickly.
-- Game Bot Generator: `"Nova, play 2048"` -> vision board reading + strategy plugin loop.
-- App Reverse Engineer: `"Nova, learn this app"` -> infer repeatable UI workflows from observed sessions and propose control plugin.
-- Pattern Shortcut Compiler: weekly job (Sunday 11:00 PM) mines repeated action sequences and compiles one-command shortcuts.
-- Live Data Feed Builder: `"Nova, live cricket scores"` -> discover data source -> generate polling job (for example every 5 minutes) + announcement hooks.
-- Smart Home Discoverer: boot-time LAN scan + device fingerprinting + generated home-control plugins.
-- Batch Plugin Factory: queue many API/plugin generation jobs and process overnight with progress tracking.
-- Failure Recovery Writer: when same step fails twice, analyze failure context and propose targeted fix plugin.
-- Context-Aware Mode Writer: detect context (meeting/streaming/coding) and propose mode plugins with tailored behavior.
-
-**Implementation kickoff (completed in this update):**
-- Added `tasks/pattern_shortcuts.py` compiler to mine repeated successful tool sequences from `logs/guardrails_actions.jsonl`.
-- Added compiled shortcut store at `.jarvis/pattern_shortcuts.json`.
-- Added dispatcher tools:
-  - `shortcut.compile`
-  - `shortcut.list`
-  - `shortcut.run`
-- Added CLI text shortcuts:
-  - `/shortcut list`
-  - `/shortcut compile`
-  - `/shortcut run <name>`
-- Added scheduler job: every Sunday at 11:00 PM (`pattern_shortcuts_weekly`) to auto-compile shortcuts.
-- Added `tasks/automation_factory.py` self-learning manager with initial implementations for:
-  - Skill learning (`learn.skill`)
-  - API autodiscovery (`learn.api`)
-  - Game bot scaffold (`learn.game_bot`)
-  - App reverse-engineer scaffold (`learn.app`)
-  - Live feed builder + mission scheduling (`live.feed`)
-  - Smart home LAN discovery + plugin stubs (`home.discover`)
-  - Batch API plugin queue (`batch.api_plugins`, `batch.status`)
-  - Failure recovery writer trigger (`recovery.write`)
-  - Context-aware mode writer (`mode.write`)
-- Added natural command triggers:
-  - `Nova, learn <software>`
-  - `Nova, use <api> API`
-  - `Nova, play <game>`
-  - `Nova, live <topic>`
-  - `support these <api1, api2, ...> APIs`
-  - `/batch api ...`, `/batch status`, `/recover ...`, `/mode ...`
-- Added deterministic scaffold file writers for:
-  - `plugins/<skill>_control.py` (for example `plugins/figma_control.py`)
-  - `plugins/<api>_api_client.py`
-  - `plugins/<game>_bot.py`
-  - `plugins/<app>_control.py`
-  - `plugins/<topic>_live_feed.py`
-  - `plugins/recovery_<step>.py`
-  - `plugins/mode_<context>.py`
-
-**Testable milestone:** run `/shortcut compile` -> `/shortcut list` shows generated sequences -> `/shortcut run <name>` replays the learned sequence.
-
----
-
-## Complete Build Order
-
-```
-Phase 1  →  Core Engine + CLI + Streaming + Ask Questions + Multi-key RoundRobin + Config Validation
-             └─ Wire tool schema injection point in reasoning.py (dispatcher=None stub)
-Phase 2  →  Memory (mem0 + ChromaDB) + Context Trimmer + Hybrid Search + Sessions + Dedup
-Phase 3  →  Voice (VAD + STT + TTS) + Tamil Support + Offline Voice Fallback
-             └─ Porcupine: download .ppn from console.picovoice.ai → assets/ before testing
-Phase 4  →  Vision + OmniParser Lifecycle + Proactive Watcher + Multi-modal Input
-Phase 5  →  PC Control + Tool Dispatcher (with schema injection + safety stub) + Browser (sync) + Web + RAG
-Phase 6  →  GUI + Telegram (auth + edit-based streaming) + Tray + Startup + Usage Tracker + Exporter
-Phase 7  →  Scheduler + Goals + Autonomy (max_steps guard + cycle detection)
-Phase 8  →  Android (ADB + Tailscale + QR Pairing + Phone Watcher)
-Phase 9  →  Emotion Engine
-Phase 10 →  Master MCP + Master API + Plugin Architecture
-Phase 11 →  Full Safety Layer (replace dispatcher safety stub with guardrails.py)
-Phase 12 →  Offline Polish + Memory Sync + Health Monitor
-Phase 13 →  Cross-OS Abstraction + Full Test Suite + One-command Installer
-Phase 14 →  Self-Learning Automation Expansion (skill learning, API autodiscovery, game/app automation, pattern shortcuts)
+```bash
+python3 main.py
 ```
 
+The onboarding layer also recognizes the GUI switch:
+
+```bash
+python3 main.py --gui
+```
+
+Use the interface to interact with the configured model layer, switch sessions, inspect health, create goals, export conversations, and invoke enabled tools. High-risk actions are routed through the safety layer for confirmation rather than being executed silently.
+
+### Docker Compose
+
+```bash
+cp .env.example .env
+docker compose up -d
+docker compose logs -f nova
+```
+
+The compose stack publishes Ollama on port `11434`, OmniParser on port `8000`, ChromaDB on port `8001`, and NOVA’s health service on port `8765` by default. Change host exposure and credentials before using the stack outside a local development environment.
+
+### Rebuilding the README video
+
+```bash
+cd media/nova-overview
+npm install
+npx hyperframes check
+npx hyperframes render --quality high --output renders/nova-overview.mp4
+```
+
+The video is silent by design and uses inline CSS/GSAP motion so its source remains editable without external media files.
+
 ---
 
-## Integrated Fixes Summary
+## <a name="api-reference"></a>API Reference
 
-All 5 gaps from the v3 audit have been fixed directly into this plan:
+NOVA exposes a local health probe from `main.py` for process supervision and Docker health checks. The default bind address is `127.0.0.1` and the default port is `8765`; configure them through `NOVA_HEALTH_BIND_HOST` and `NOVA_HEALTH_PORT` in the settings layer.
 
-| Gap | Fix Location | When It Matters |
+| Method | Path | Description |
 |---|---|---|
-| Missing `PORCUPINE_KEYWORD_PATH` in `.env` | `.env` template + `voice/wakeword.py` + `setup.py` | Phase 3 |
-| Tool schema never injected into LLM prompt | `dispatcher.get_tool_schema_prompt()` + `reasoning.py` hook | Phase 1 (stub) / Phase 5 (live) |
-| Telegram "streaming" is architecturally impossible | `telegram_bot.py` edit-based batching | Phase 6 |
-| Playwright sync vs async not decided | `control/browser.py` locked to `sync_playwright` | Phase 5 |
-| No safety stub before Phase 11 safety layer | `dispatcher.execute()` `ALWAYS_CONFIRM` stub | Phase 5 |
+| `GET` | `/health` | Local liveness/health probe used by the container health check and runtime monitoring. |
 
-Minor fixes also integrated:
-- `WHISPER_MODEL=base` added to `.env` + downloaded in `setup.py`
-- `control/os_layer.py` added to project structure tree
-- `assets/` directory added to project structure tree
+Example:
 
----
-
-## Full Requirements
-
-```txt
-# LLM
-openai
-ollama
-google-generativeai
-
-# Voice
-pvporcupine
-pyaudio
-sounddevice
-silero-vad
-faster-whisper
-pyttsx3
-gTTS
-
-# Vision
-Pillow
-opencv-python
-numpy
-
-# Control
-pyautogui
-pywin32
-playwright
-
-# Web & Search
-requests
-beautifulsoup4
-duckduckgo-search
-rank-bm25
-
-# Memory
-mem0ai
-chromadb
-sentence-transformers
-
-# Documents (RAG)
-pypdf
-python-docx
-
-# ADB & Networking
-pure-python-adb
-adb-wifi-py
-qrcode[pil]
-
-# Interfaces
-rich
-pyqt6
-python-telegram-bot
-pystray
-
-# Tasks
-apscheduler
-
-# Validation
-pydantic
-
-# Utils
-python-dotenv
-loguru
-pytest
+```bash
+curl http://127.0.0.1:8765/health
 ```
 
----
-
-## The 6 Laws of Building NOVA
-
-1. **Never skip the test milestone** — if the milestone doesn't pass, the next phase breaks harder
-2. **LLM is the orchestrator, not the executor** — LLM decides what to do, modules do the actual work. Never execute raw LLM-generated Python
-3. **All tool calls go through dispatcher.py** — no module callable directly by LLM, only through validated dispatcher with schema injection
-4. **memory_router is always on from Phase 2** — every phase reads/writes memories from day one
-5. **World state is always in the prompt** — environment snapshot + session memories in every single LLM call
-6. **One engine, many interfaces** — CLI, GUI, Voice, Telegram all call the same `core/` modules. Zero logic duplication across interfaces
+This is an internal local endpoint, not a public authenticated API. Do not expose it to an untrusted network without adding an appropriate network boundary.
 
 ---
 
-*Phase 1 → smarter terminal chatbot than most people have ever built.*
-*Phase 5 → genuinely autonomous PC operator.*
-*Phase 8 → controls your phone from anywhere on Earth.*
-*Phase 10 → infinitely extensible with any service or custom capability.*
-*Phase 12 → production-reliable, self-healing, 24/7.*
-*All 13 → NOVA.*
+## <a name="project-structure"></a>Project Structure
+
+```text
+NOVA/
+├── main.py                  # Application bootstrap and NOVAApp orchestration
+├── setup.py                 # One-command installer and post-install checks
+├── config/                  # Settings, schemas, constants, capability discovery
+├── core/                    # LLM, memory, reasoning, goals, plugins, dispatcher
+├── voice/                   # VAD, wake word, STT, TTS, and voice loop components
+├── vision/                  # Screen capture, Gemini Vision, OmniParser, watchers
+├── control/                 # Desktop, browser, OS, window, and Android control
+├── interfaces/              # CLI, GUI, Telegram, voice, tray, onboarding
+├── tasks/                   # Scheduler, goals, maintenance, missions, shortcuts
+├── rag/                     # Document loading, chunking, storage, retrieval
+├── web/                     # Search, scraping, crawling, and hybrid ranking
+├── mcp/                     # Master MCP and API integration layers
+├── safety/                  # Guardrails, virus scanning, and emergency stop
+├── utils/                   # Logging, notifications, export, usage, health helpers
+├── tests/                   # Pytest modules for core behavior and integrations
+├── media/nova-overview/     # Editable HTML video source and rendered project video
+├── Dockerfile               # Python 3.11 container image
+├── docker-compose.yml       # Ollama, ChromaDB, OmniParser, and NOVA services
+├── requirements.txt         # Bare-metal dependency manifest
+└── requirements.lock        # Container dependency manifest
+```
+
+The application keeps runtime state outside the tracked source tree where possible. See `.env.example` and `.gitignore` before enabling persistence, exports, logs, or local vector stores.
+
+---
+
+## <a name="features-and-roadmap"></a>Features and Roadmap
+
+The current codebase includes the principal orchestration layers for LLM routing, persistent memory, context trimming, voice interfaces, screen understanding, desktop/browser control, ADB support, document retrieval, scheduling, goal execution, safety guardrails, plugins, MCP/API integration, health monitoring, and multiple user interfaces.
+
+The project’s next useful milestones are operational rather than cosmetic: keep platform-specific setup paths reliable, expand integration tests around optional services, document supported model/provider combinations, and maintain the local-first privacy controls as new capabilities are added. The repository intentionally keeps several integrations disabled by default, including autonomy, ambient monitoring, phone watching, and agent-to-agent features.
+
+For implementation history, use the repository’s [commit log](https://github.com/vincenzo-afk/NOVA/commits/main) and [issues](https://github.com/vincenzo-afk/NOVA/issues).
+
+---
+
+## <a name="testing"></a>Testing
+
+NOVA uses pytest modules under [`tests/`](./tests). Run the suite from an activated virtual environment:
+
+```bash
+python -m pytest tests -q
+```
+
+For a dependency-light syntax check across the Python source tree, run:
+
+```bash
+python -m compileall -q .
+```
+
+Tests that exercise optional integrations mock their external boundaries where appropriate. Full voice, GUI, browser, OmniParser, ADB, and model-provider behavior still depends on the local services and system permissions described in the configuration and installation sections.
+
+---
+
+## <a name="deployment"></a>Deployment
+
+### Local development
+
+Use the bare-metal installation path when you need direct access to the desktop, microphone, wake-word listener, Android Platform Tools, or platform-specific automation APIs. Run `python3 main.py` from the repository root after configuration.
+
+### Docker Compose
+
+Use `docker compose up -d` for a service-oriented deployment with Ollama, ChromaDB, OmniParser, and NOVA. The compose file mounts local assets, logs, exports, and runtime state as described in [`docker-compose.yml`](./docker-compose.yml). The Docker deployment disables several host-specific interactions by default and should be treated as a local/server deployment rather than a drop-in desktop-control environment.
+
+No cloud deployment manifest is included in this repository. Production hosting, public ingress, secret management, backups, and access control must be designed for the target environment instead of inferred from the local compose file.
+
+---
+
+## <a name="contributing"></a>Contributing
+
+Start by creating a branch from `main`, make one focused change, and add or update tests when behavior changes. Before opening a pull request, run the pytest suite, compileall check, and any relevant local integration checks. Keep secrets, device state, logs, exports, and generated vendor directories out of commits.
+
+Pull requests should explain the intent, affected modules, test commands and results, configuration changes, platform assumptions, and any security or privacy impact. Prefer clear, imperative commit subjects such as `fix: guard empty goal state` or `docs: clarify Docker configuration`.
+
+Because NOVA spans platform-specific runtimes and optional services, contributions should preserve graceful fallback behavior and should not make a cloud service, GUI toolkit, device, or operating-system API mandatory for unrelated workflows.
+
+---
+
+## <a name="security"></a>Security
+
+NOVA handles model credentials, local files, screen content, microphone input, device controls, conversation history, and action logs. Keep `.env` outside version control, use the repository’s privacy settings intentionally, and review the safety guardrails before enabling automation or autonomy.
+
+The codebase includes Pydantic validation, SSRF-oriented web checks, plugin restrictions, confirmation thresholds, emergency-stop persistence, secret redaction in exports, and configurable local-only behavior. These controls reduce risk but do not constitute a complete security boundary for untrusted plugins or host-level automation.
+
+For a sensitive vulnerability report, use GitHub’s private vulnerability-reporting option for the repository when it is enabled; otherwise contact the repository owner through the [NOVA GitHub profile](https://github.com/vincenzo-afk). Do not publish credentials, personal data, or exploit details in a public issue.
+
+---
+
+## <a name="license"></a>License
+
+This repository does not currently contain a `LICENSE` file or declare a license in GitHub metadata. Until the maintainer adds an explicit license, treat the source as **all rights reserved** and request permission before redistributing or using it beyond applicable legal exceptions.
+
+---
+
+## <a name="acknowledgments"></a>Acknowledgments
+
+NOVA builds on the Python ecosystem and several specialized open-source projects, including Ollama, ChromaDB, mem0, sentence-transformers, faster-whisper, Silero VAD, Playwright, PyAutoGUI, OmniParser, APScheduler, Pydantic, Rich, and the Python standard library. Their licenses and notices remain the responsibility of their respective upstream projects and should be reviewed before redistribution.
+
+The repository is maintained by [`vincenzo-afk`](https://github.com/vincenzo-afk).
+
+---
+
+## <a name="references"></a>References
+
+The README’s project facts are grounded in the repository’s source and configuration files: [`main.py`](./main.py), [`setup.py`](./setup.py), [`requirements.txt`](./requirements.txt), [`requirements.lock`](./requirements.lock), [`config/settings.py`](./config/settings.py), [`config/settings_schema.json`](./config/settings_schema.json), [`Dockerfile`](./Dockerfile), [`docker-compose.yml`](./docker-compose.yml), [`tests/`](./tests), and [`.env.example`](./.env.example).
+
+---
+
+<div align="center">
+
+[Back to top](#nova)
+
+**NOVA — transparent, extensible, and yours.**
+
+</div>
